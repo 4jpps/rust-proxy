@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig, PortRule, ProxyHost};
 
 /// One domain's live TLS material, ready for SNI dispatch.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CertEntry {
     pub cert_chain: Vec<rustls_pki_types::CertificateDer<'static>>,
     pub private_key: Arc<rustls_pki_types::PrivateKeyDer<'static>>,
