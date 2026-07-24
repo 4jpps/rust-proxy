@@ -1,0 +1,67 @@
+# Copy to /etc/rust-proxy/config.toml (root:rust-proxy, mode 640 -- it
+# holds admin.session_secret and acme.cloudflare_api_token).
+#
+# hosts/port_rules below only matter on first boot, to seed an empty
+# database -- after that, manage them from the admin UI at
+# http://<admin.bind_ip>:<admin.bind_port>/, not by re-editing this file.
+
+[network]
+# The LXC's assigned subnet. Every bind_ip used anywhere below must fall
+# inside this range.
+subnet = "10.0.0.0/29"
+
+[admin]
+bind_ip = "10.0.0.1"
+bind_port = 8080
+# Only these source IPs/CIDRs may reach the admin UI/API -- enforced by
+# nftables, not just the application. Leave empty to restrict to
+# loopback-only (see nftables::generator's fallback).
+allowed_ips = ["10.0.0.1/32"]
+# Generate with: openssl rand -hex 32
+session_secret = "change-me-generate-a-real-random-value"
+admin_username = "admin"
+# Generate with: rust-proxy hash-password 'your-real-password'
+admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE$WITHREALHASH"
+
+[acme]
+contact_email = "admin@example.com"
+cloudflare_api_token = "your-cloudflare-api-token-with-dns-edit-scope"
+# directory_url defaults to Let's Encrypt production -- point this at
+# https://acme-staging-v02.api.letsencrypt.org/directory while testing,
+# to avoid production rate limits.
+# renew_before_days = 30
+
+# Example host -- proxies https://app.example.com on 10.0.0.2:443 to a
+# local service on 127.0.0.1:8000, with a websocket toggle and an ACME
+# cert issued automatically.
+# [[hosts]]
+# domain = "app.example.com"
+# bind_ip = "10.0.0.2"
+# bind_port = 443
+# upstream = "127.0.0.1:8000"
+# websockets = true
+# force_https = true
+# acme_enabled = true
+# enabled = true
+
+# Example port rule -- RustDesk, forwarded from the /29 to a local
+# instance. Omit passthrough_target to just open the firewall for a
+# service that's already listening locally (e.g. sshd) instead of
+# proxying through this daemon.
+# [[port_rules]]
+# bind_ip = "10.0.0.4"
+# port_start = 21115
+# port_end = 21119
+# protocol = "tcp"
+# description = "rustdesk tcp"
+# passthrough_target = "127.0.0.1:21115"
+# enabled = true
+#
+# [[port_rules]]
+# bind_ip = "10.0.0.4"
+# port_start = 21116
+# port_end = 21116
+# protocol = "udp"
+# description = "rustdesk udp"
+# passthrough_target = "127.0.0.1:21116"
+# enabled = true

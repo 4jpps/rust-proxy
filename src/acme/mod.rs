@@ -82,7 +82,7 @@ pub async fn issue_certificate(
     // Everything from here on must still clean up the TXT record even on
     // failure -- run the rest of the flow and clean up unconditionally
     // afterward rather than threading `?` straight through.
-    let result = complete_order(client, &challenge.url, authz_url, &order_url, domain).await;
+    let result = complete_order(client, &challenge.url, authz_url, &order_url, &order.finalize, domain).await;
 
     if let Err(err) = dns01.delete_txt_record(&zone_id, &record_id).await {
         tracing::warn!(domain, error = %err, "failed to clean up ACME challenge TXT record (left dangling in Cloudflare)");
@@ -99,11 +99,17 @@ struct IssuedCert {
 
 /// Waits for the DNS-01 challenge to validate, then finalizes the order
 /// and downloads the full chain PEM.
+///
+/// `finalize_url` (the order's own `finalize` field) and `order_url` (its
+/// `Location`, used for polling) are two distinct RFC 8555 endpoints --
+/// conflating them is a real interop risk even though some servers are
+/// lenient about it.
 async fn complete_order(
     client: &AcmeClient,
     challenge_url: &str,
     authz_url: &str,
     order_url: &str,
+    finalize_url: &str,
     domain: &str,
 ) -> Result<IssuedCert, IssuanceError> {
     tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
@@ -120,7 +126,7 @@ async fn complete_order(
     }
 
     let csr = cert::generate_csr(&[domain.to_string()])?;
-    let order = client.finalize(order_url, &csr.der).await?;
+    let order = client.finalize(finalize_url, &csr.der).await?;
     let order = poll_until(
         || client.poll_order(order_url),
         |o| !matches!(o.status, OrderStatus::Processing),
