@@ -29,8 +29,10 @@ struct Inner {
     port_rules: ArcSwap<Vec<PortRule>>,
     certs: ArcSwap<HashMap<String, CertEntry>>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
-    /// can re-sync immediately instead of polling on a timer.
-    firewall_dirty: Notify,
+    /// and `proxy::run`'s listener supervisor can both re-sync immediately
+    /// instead of polling on a timer. `notify_waiters` (not `notify_one`)
+    /// since there are two independent long-lived waiters.
+    config_dirty: Notify,
 }
 
 #[derive(Clone)]
@@ -45,7 +47,7 @@ impl AppState {
             hosts: ArcSwap::from_pointee(cfg.hosts),
             port_rules: ArcSwap::from_pointee(cfg.port_rules),
             certs: ArcSwap::from_pointee(HashMap::new()),
-            firewall_dirty: Notify::new(),
+            config_dirty: Notify::new(),
         }))
     }
 
@@ -67,7 +69,7 @@ impl AppState {
 
     pub fn set_hosts(&self, hosts: Vec<ProxyHost>) {
         self.0.hosts.store(Arc::new(hosts));
-        self.0.firewall_dirty.notify_one();
+        self.0.config_dirty.notify_waiters();
     }
 
     pub fn port_rules(&self) -> Arc<Vec<PortRule>> {
@@ -76,15 +78,14 @@ impl AppState {
 
     pub fn set_port_rules(&self, rules: Vec<PortRule>) {
         self.0.port_rules.store(Arc::new(rules));
-        self.0.firewall_dirty.notify_one();
+        self.0.config_dirty.notify_waiters();
     }
 
-    /// Resolves the next time `hosts`/`port_rules` change (or immediately,
-    /// if a change happened since the last call and hasn't been consumed
-    /// yet). Used by `nftables::run_sync_loop` to re-sync in real time
-    /// instead of polling.
-    pub async fn wait_for_firewall_change(&self) {
-        self.0.firewall_dirty.notified().await;
+    /// Resolves the next time `hosts`/`port_rules` change. Used by both
+    /// `nftables::run_sync_loop` and the proxy listener supervisor to
+    /// re-sync in real time instead of polling.
+    pub async fn wait_for_change(&self) {
+        self.0.config_dirty.notified().await;
     }
 
     pub fn certs(&self) -> Arc<HashMap<String, CertEntry>> {

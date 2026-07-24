@@ -1,0 +1,205 @@
+//! HTTP request forwarding to an upstream, including WebSocket upgrade
+//! passthrough. One upstream TCP connection per proxied request (no
+//! pooling yet -- see the module-level TODO in `mod.rs` if this becomes
+//! a bottleneck) so there's no shared connection state to reason about
+//! under concurrent hot-reloads.
+
+use std::net::SocketAddr;
+
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use hyper::header::{CONNECTION, UPGRADE};
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
+    let has_upgrade_header = req
+        .headers()
+        .get(UPGRADE)
+        .map(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        .unwrap_or(false);
+    let has_connection_upgrade = req
+        .headers()
+        .get(CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("upgrade")))
+        .unwrap_or(false);
+    has_upgrade_header && has_connection_upgrade
+}
+
+/// Forwards `req` to `upstream`, streaming the response body back
+/// unmodified. If `websockets_enabled` and the request is a WebSocket
+/// upgrade, splices the client and upstream connections together after
+/// the 101 response instead of treating it as a normal request/response.
+pub async fn forward_http(
+    mut req: Request<Incoming>,
+    upstream: SocketAddr,
+    websockets_enabled: bool,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, BoxError> {
+    let want_upgrade = websockets_enabled && is_websocket_upgrade(&req);
+    let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));
+
+    let stream = TcpStream::connect(upstream).await?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::spawn(async move {
+        if let Err(err) = conn.with_upgrades().await {
+            tracing::debug!(error = %err, "upstream connection closed");
+        }
+    });
+
+    let mut resp = sender.send_request(req).await?;
+
+    if let (true, Some(client_upgrade)) = (resp.status() == hyper::StatusCode::SWITCHING_PROTOCOLS, client_upgrade) {
+        let upstream_upgrade = hyper::upgrade::on(&mut resp);
+        tokio::spawn(async move {
+            match (client_upgrade.await, upstream_upgrade.await) {
+                (Ok(client), Ok(upstream)) => {
+                    let mut client = TokioIo::new(client);
+                    let mut upstream = TokioIo::new(upstream);
+                    if let Err(err) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                        tracing::debug!(error = %err, "websocket passthrough ended");
+                    }
+                }
+                _ => tracing::warn!("websocket upgrade failed on client or upstream side"),
+            }
+        });
+        let (parts, _empty) = resp.into_parts();
+        return Ok(Response::from_parts(
+            parts,
+            http_body_util::Empty::new().map_err(|never: std::convert::Infallible| match never {}).boxed(),
+        ));
+    }
+
+    let (parts, body) = resp.into_parts();
+    Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
+}
+
+/// Plain 301 redirect from `http://<host><path>` to the same on `https`,
+/// used for `force_https` hosts' port-80 listener.
+pub fn https_redirect_response<B>(req: &Request<B>) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let location = format!("https://{host_no_port}{path_and_query}");
+
+    Response::builder()
+        .status(hyper::StatusCode::MOVED_PERMANENTLY)
+        .header(hyper::header::LOCATION, location)
+        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static redirect response is always valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::Empty;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn detects_websocket_upgrade_headers() {
+        let req = Request::builder()
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .body(())
+            .unwrap();
+        assert!(is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn plain_request_is_not_a_websocket_upgrade() {
+        let req = Request::builder().body(()).unwrap();
+        assert!(!is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn connection_header_with_multiple_tokens_still_detected() {
+        let req = Request::builder()
+            .header(CONNECTION, "keep-alive, Upgrade")
+            .header(UPGRADE, "websocket")
+            .body(())
+            .unwrap();
+        assert!(is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn redirect_response_preserves_host_and_path() {
+        let req = Request::builder()
+            .uri("/some/path?x=1")
+            .header(hyper::header::HOST, "example.com")
+            .body(())
+            .unwrap();
+        let resp = https_redirect_response(&req);
+        assert_eq!(resp.status(), hyper::StatusCode::MOVED_PERMANENTLY);
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(location, "https://example.com/some/path?x=1");
+    }
+
+    #[test]
+    fn redirect_strips_port_from_host_header() {
+        let req = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "example.com:80")
+            .body(())
+            .unwrap();
+        let resp = https_redirect_response(&req);
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(location, "https://example.com/");
+    }
+
+    /// End-to-end: a real fake upstream on loopback, our proxy server
+    /// (using `forward_http` in its service_fn) in front of it, and a
+    /// real client request driven all the way through -- proves the
+    /// forwarding path actually works, not just that it compiles.
+    #[tokio::test]
+    async fn forward_http_proxies_a_real_request_to_a_loopback_upstream() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(|_req: Request<Incoming>| async {
+                let body: BoxBody<Bytes, hyper::Error> =
+                    Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-upstream", "yes").body(body).unwrap())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                forward_http(req, upstream_addr, false).await.map_err(|e| e.to_string())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-upstream").unwrap(), "yes");
+    }
+}

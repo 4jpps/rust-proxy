@@ -28,7 +28,7 @@ pub async fn run_sync_loop(state: AppState) -> anyhow::Result<()> {
         }
 
         tokio::select! {
-            _ = state.wait_for_firewall_change() => {}
+            _ = state.wait_for_change() => {}
             _ = tokio::time::sleep(FALLBACK_RESYNC_INTERVAL) => {}
         }
     }
