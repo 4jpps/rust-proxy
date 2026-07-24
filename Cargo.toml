@@ -42,6 +42,8 @@ sha2 = "0.10"
 base64 = "0.22"
 subtle = "2"
 rand = "0.8"
+argon2 = "0.5"
+tower-cookies = "0.10"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

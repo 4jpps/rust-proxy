@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rust-proxy admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 2rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #8884; }
+  form.inline { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.6rem; align-items: center; }
+  input[type=text], input[type=number], input[type=password], select { padding: 0.3rem; }
+  button { padding: 0.3rem 0.7rem; cursor: pointer; }
+  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  .stat { border: 1px solid #8884; border-radius: 6px; padding: 0.6rem 1rem; }
+  .stat b { display: block; font-size: 1.4rem; }
+  .danger { color: #c33; }
+  #login-screen, #app { display: none; }
+  .error { color: #c33; font-size: 0.85rem; }
+  label.chk { display: inline-flex; gap: 0.25rem; align-items: center; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <h1>rust-proxy admin</h1>
+  <form id="login-form" class="inline">
+    <input type="text" name="username" placeholder="username" required>
+    <input type="password" name="password" placeholder="password" required>
+    <button type="submit">Sign in</button>
+    <span class="error" id="login-error"></span>
+  </form>
+</div>
+
+<div id="app">
+  <h1>rust-proxy admin <button id="logout-btn" style="float:right">Sign out</button></h1>
+
+  <div class="stats" id="stats"></div>
+
+  <h2>Proxy hosts</h2>
+  <table id="hosts-table"><thead><tr>
+    <th>Domain</th><th>Bind</th><th>Upstream</th><th>WS</th><th>HTTPS redir</th><th>ACME</th><th>Enabled</th><th></th>
+  </tr></thead><tbody></tbody></table>
+  <form class="inline" id="host-form">
+    <input type="text" name="domain" placeholder="domain" required>
+    <input type="text" name="bind_ip" placeholder="bind ip" required>
+    <input type="number" name="bind_port" placeholder="port" value="443" required>
+    <input type="text" name="upstream" placeholder="upstream host:port" required>
+    <label class="chk"><input type="checkbox" name="websockets"> WS</label>
+    <label class="chk"><input type="checkbox" name="force_https" checked> HTTPS redirect</label>
+    <label class="chk"><input type="checkbox" name="acme_enabled" checked> ACME</label>
+    <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
+    <button type="submit">Add host</button>
+    <span class="error" id="host-error"></span>
+  </form>
+
+  <h2>Firewall / port rules</h2>
+  <table id="rules-table"><thead><tr>
+    <th>Bind</th><th>Ports</th><th>Proto</th><th>Target</th><th>Description</th><th>Enabled</th><th></th>
+  </tr></thead><tbody></tbody></table>
+  <form class="inline" id="rule-form">
+    <input type="text" name="bind_ip" placeholder="bind ip" required>
+    <input type="number" name="port_start" placeholder="from port" required>
+    <input type="number" name="port_end" placeholder="to port" required>
+    <select name="protocol"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+    <input type="text" name="passthrough_target" placeholder="passthrough target (optional)">
+    <input type="text" name="description" placeholder="description">
+    <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
+    <button type="submit">Add rule</button>
+    <span class="error" id="rule-error"></span>
+  </form>
+
+  <h2>Certificates</h2>
+  <table id="certs-table"><thead><tr><th>Domain</th><th>Expires</th><th>Days left</th></tr></thead><tbody></tbody></table>
+</div>
+
+<script>
+async function api(path, opts) {
+  const resp = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  if (resp.status === 401) { showLogin(); throw new Error('unauthenticated'); }
+  return resp;
+}
+
+function showLogin() {
+  document.getElementById('login-screen').style.display = 'block';
+  document.getElementById('app').style.display = 'none';
+}
+function showApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  refreshAll();
+}
+
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const resp = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: fd.get('username'), password: fd.get('password') }),
+  });
+  if (resp.ok) { showApp(); }
+  else { document.getElementById('login-error').textContent = 'invalid credentials'; }
+});
+
+document.getElementById('logout-btn').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  showLogin();
+});
+
+async function refreshAll() {
+  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts()]);
+}
+
+async function refreshDashboard() {
+  const d = await (await api('/api/dashboard')).json();
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><b>${d.host_count}</b>hosts (${d.enabled_host_count} enabled)</div>
+    <div class="stat"><b>${d.port_rule_count}</b>firewall rules</div>
+    <div class="stat"><b>${d.cert_count}</b>certificates</div>
+    <div class="stat"><b>${d.subnet}</b>subnet</div>`;
+}
+
+async function refreshHosts() {
+  const hosts = await (await api('/api/hosts')).json();
+  const tbody = document.querySelector('#hosts-table tbody');
+  tbody.innerHTML = '';
+  for (const h of hosts) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${h.domain}</td><td>${h.bind_ip}:${h.bind_port}</td><td>${h.upstream}</td>
+      <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
+      <td>${h.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${h.id}">Delete</button></td>`;
+    tr.querySelector('button').addEventListener('click', async () => {
+      await api(`/api/hosts/${h.id}`, { method: 'DELETE' });
+      refreshAll();
+    });
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById('host-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    domain: fd.get('domain'), bind_ip: fd.get('bind_ip'), bind_port: Number(fd.get('bind_port')),
+    upstream: fd.get('upstream'), websockets: fd.get('websockets') === 'on',
+    force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
+    enabled: fd.get('enabled') === 'on',
+  };
+  const resp = await api('/api/hosts', { method: 'POST', body: JSON.stringify(body) });
+  if (resp.ok) { e.target.reset(); document.getElementById('host-error').textContent = ''; refreshAll(); }
+  else { document.getElementById('host-error').textContent = (await resp.json()).error || 'failed'; }
+});
+
+async function refreshRules() {
+  const rules = await (await api('/api/port-rules')).json();
+  const tbody = document.querySelector('#rules-table tbody');
+  tbody.innerHTML = '';
+  for (const r of rules) {
+    const ports = r.port_start === r.port_end ? r.port_start : `${r.port_start}-${r.port_end}`;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.bind_ip}</td><td>${ports}</td><td>${r.protocol}</td>
+      <td>${r.passthrough_target || '<em>firewall only</em>'}</td><td>${r.description}</td>
+      <td>${r.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${r.id}">Delete</button></td>`;
+    tr.querySelector('button').addEventListener('click', async () => {
+      await api(`/api/port-rules/${r.id}`, { method: 'DELETE' });
+      refreshAll();
+    });
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById('rule-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const target = fd.get('passthrough_target');
+  const body = {
+    bind_ip: fd.get('bind_ip'), port_start: Number(fd.get('port_start')), port_end: Number(fd.get('port_end')),
+    protocol: fd.get('protocol'), description: fd.get('description') || '',
+    passthrough_target: target ? target : null, enabled: fd.get('enabled') === 'on',
+  };
+  const resp = await api('/api/port-rules', { method: 'POST', body: JSON.stringify(body) });
+  if (resp.ok) { e.target.reset(); document.getElementById('rule-error').textContent = ''; refreshAll(); }
+  else { document.getElementById('rule-error').textContent = (await resp.json()).error || 'failed'; }
+});
+
+async function refreshCerts() {
+  const certs = await (await api('/api/certs')).json();
+  const tbody = document.querySelector('#certs-table tbody');
+  tbody.innerHTML = '';
+  for (const c of certs) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${c.domain}</td><td>${new Date(c.not_after).toLocaleDateString()}</td><td>${c.days_remaining}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+// Probe session state on load.
+api('/api/dashboard').then(() => showApp()).catch(() => showLogin());
+</script>
+</body>
+</html>

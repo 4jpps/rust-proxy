@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use tokio::sync::Notify;
+use sqlx::SqlitePool;
+use tokio::sync::{Mutex, Notify};
 
 use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig, PortRule, ProxyHost};
 
@@ -33,22 +34,48 @@ struct Inner {
     /// instead of polling on a timer. `notify_waiters` (not `notify_one`)
     /// since there are two independent long-lived waiters.
     config_dirty: Notify,
+    db: SqlitePool,
+    /// `ArcSwap` alone makes reads lock-free but a naive read-modify-write
+    /// (clone the Vec, mutate, store) from two concurrent admin API
+    /// requests can still race and silently drop one write. These serialize
+    /// the *write* path only -- readers (the proxy/nftables loops) are
+    /// never blocked by them, since they only ever call `.load_full()`.
+    hosts_write_lock: Mutex<()>,
+    port_rules_write_lock: Mutex<()>,
 }
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
 impl AppState {
-    pub fn new(cfg: Config) -> Self {
+    /// `db` is expected to already hold whichever `hosts`/`port_rules`
+    /// should be live at startup -- see `main.rs`'s "load from sqlite,
+    /// seeding from config.toml only if the DB was empty" bootstrap.
+    pub fn new(cfg: Config, db: SqlitePool, hosts: Vec<ProxyHost>, port_rules: Vec<PortRule>) -> Self {
         Self(Arc::new(Inner {
             network: cfg.network,
             admin: cfg.admin,
             acme: cfg.acme,
-            hosts: ArcSwap::from_pointee(cfg.hosts),
-            port_rules: ArcSwap::from_pointee(cfg.port_rules),
+            hosts: ArcSwap::from_pointee(hosts),
+            port_rules: ArcSwap::from_pointee(port_rules),
             certs: ArcSwap::from_pointee(HashMap::new()),
             config_dirty: Notify::new(),
+            db,
+            hosts_write_lock: Mutex::new(()),
+            port_rules_write_lock: Mutex::new(()),
         }))
+    }
+
+    pub fn db(&self) -> &SqlitePool {
+        &self.0.db
+    }
+
+    pub async fn lock_hosts_for_write(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.hosts_write_lock.lock().await
+    }
+
+    pub async fn lock_port_rules_for_write(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.port_rules_write_lock.lock().await
     }
 
     pub fn network(&self) -> &NetworkConfig {
@@ -118,6 +145,9 @@ mod tests {
                 bind_port: 8080,
                 allowed_ips: vec![],
                 session_secret: "test-secret".into(),
+                admin_username: "admin".into(),
+                admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -132,9 +162,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hot_reload_swaps_hosts_without_replacing_state_handle() {
-        let state = AppState::new(test_config());
+    async fn test_state() -> AppState {
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        AppState::new(test_config(), pool, vec![], vec![])
+    }
+
+    #[tokio::test]
+    async fn hot_reload_swaps_hosts_without_replacing_state_handle() {
+        let state = test_state().await;
         assert_eq!(state.hosts().len(), 0);
 
         state.set_hosts(vec![ProxyHost {
@@ -153,9 +188,9 @@ mod tests {
         assert_eq!(state.hosts()[0].domain, "example.com");
     }
 
-    #[test]
-    fn port_rules_are_isolated_from_hosts() {
-        let state = AppState::new(test_config());
+    #[tokio::test]
+    async fn port_rules_are_isolated_from_hosts() {
+        let state = test_state().await;
         state.set_port_rules(vec![PortRule {
             id: uuid::Uuid::new_v4(),
             bind_ip: "10.0.0.4".parse().unwrap(),
@@ -172,7 +207,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_reads_and_writes_never_panic_or_deadlock() {
-        let state = AppState::new(test_config());
+        let state = test_state().await;
         let mut handles = Vec::new();
 
         for i in 0..50 {

@@ -52,6 +52,16 @@ pub struct AdminConfig {
     /// same "refuse to start rather than guess a secret" stance as
     /// jpps-store's ACCOUNT_SECRET.
     pub session_secret: String,
+    pub admin_username: String,
+    /// Argon2 PHC hash string (`argon2::password_hash`), never a plaintext
+    /// password -- generate with `rust-proxy hash-password` (see main.rs).
+    pub admin_password_hash: String,
+    #[serde(default = "default_db_path")]
+    pub db_path: PathBuf,
+}
+
+fn default_db_path() -> PathBuf {
+    PathBuf::from("/etc/rust-proxy/rust-proxy.db")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +169,12 @@ impl Config {
         if self.admin.session_secret.trim().is_empty() {
             return Err(ConfigError::Validation("admin.session_secret must not be empty".into()));
         }
+        if self.admin.admin_username.trim().is_empty() {
+            return Err(ConfigError::Validation("admin.admin_username must not be empty".into()));
+        }
+        if self.admin.admin_password_hash.trim().is_empty() {
+            return Err(ConfigError::Validation("admin.admin_password_hash must not be empty".into()));
+        }
 
         let mut seen_binds: Vec<(Ipv4Addr, u16, Protocol)> = Vec::new();
 
@@ -239,6 +255,8 @@ subnet = "10.0.0.0/29"
 bind_ip = "10.0.0.1"
 bind_port = 8080
 session_secret = "test-secret-do-not-use-in-prod"
+admin_username = "admin"
+admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g"
 
 [acme]
 contact_email = "admin@example.com"
