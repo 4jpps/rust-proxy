@@ -30,8 +30,12 @@ pub fn dns01_txt_value(token: &str, account_key: &AccountKey) -> String {
     b64url(digest.as_ref())
 }
 
+/// For a wildcard identifier (`*.example.com`), RFC 8555 §8.4 validates
+/// dns-01 at `_acme-challenge.example.com` -- the wildcard label itself is
+/// never part of the record name.
 pub fn acme_challenge_record_name(domain: &str) -> String {
-    format!("_acme-challenge.{domain}")
+    let base = domain.strip_prefix("*.").unwrap_or(domain);
+    format!("_acme-challenge.{base}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +193,13 @@ mod tests {
             acme_challenge_record_name("foo.bar.example.com"),
             "_acme-challenge.foo.bar.example.com"
         );
+    }
+
+    #[test]
+    fn wildcard_record_name_strips_the_wildcard_label() {
+        // RFC 8555 8.4: dns-01 for `*.example.com` validates at
+        // `_acme-challenge.example.com`, not `_acme-challenge.*.example.com`.
+        assert_eq!(acme_challenge_record_name("*.pages.example.com"), "_acme-challenge.pages.example.com");
     }
 
     #[tokio::test]

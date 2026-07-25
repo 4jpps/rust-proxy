@@ -9,12 +9,20 @@ use crate::config::ProxyHost;
 
 /// Case-insensitive per RFC 4343 -- DNS names/SNI/Host headers aren't
 /// case-sensitive, and a client (or a misbehaving upstream) may send
-/// either case.
+/// either case. Tries an exact match first, then falls back to a
+/// `*.parent` wildcard host covering exactly one label under `parent` --
+/// the same single-level semantics as an X.509 wildcard cert (`*.a.com`
+/// matches `x.a.com`, never `x.y.a.com`).
 pub fn match_host<'a>(hosts: &'a [ProxyHost], bind_ip: Ipv4Addr, bind_port: u16, name: &str) -> Option<&'a ProxyHost> {
     let name = strip_port_suffix(name);
-    hosts
-        .iter()
-        .find(|h| h.enabled && h.bind_ip == bind_ip && h.bind_port == bind_port && h.domain.eq_ignore_ascii_case(name))
+    let is_candidate = |h: &&ProxyHost, domain: &str| h.enabled && h.bind_ip == bind_ip && h.bind_port == bind_port && h.domain.eq_ignore_ascii_case(domain);
+
+    if let Some(host) = hosts.iter().find(|h| is_candidate(h, name)) {
+        return Some(host);
+    }
+    let (_, parent) = name.split_once('.')?;
+    let wildcard = format!("*.{parent}");
+    hosts.iter().find(|h| is_candidate(h, &wildcard))
 }
 
 /// `Host:` headers (unlike SNI) may carry a `:port` suffix.
@@ -109,6 +117,39 @@ mod tests {
         let b = match_host(&hosts, "10.0.0.2".parse().unwrap(), 443, "b.example.com").unwrap();
         assert_eq!(a.domain, "a.example.com");
         assert_eq!(b.domain, "b.example.com");
+    }
+
+    #[test]
+    fn wildcard_host_matches_any_single_label_subdomain() {
+        let hosts = vec![host("*.pages.example.com", "10.0.0.2", 443, false, true)];
+        let bind_ip = "10.0.0.2".parse().unwrap();
+        assert!(match_host(&hosts, bind_ip, 443, "myproject.pages.example.com").is_some());
+        assert!(match_host(&hosts, bind_ip, 443, "other-project.pages.example.com").is_some());
+    }
+
+    #[test]
+    fn wildcard_host_does_not_match_two_levels_deep() {
+        let hosts = vec![host("*.pages.example.com", "10.0.0.2", 443, false, true)];
+        let bind_ip = "10.0.0.2".parse().unwrap();
+        assert!(match_host(&hosts, bind_ip, 443, "a.b.pages.example.com").is_none());
+    }
+
+    #[test]
+    fn wildcard_host_does_not_match_the_bare_parent_domain() {
+        let hosts = vec![host("*.pages.example.com", "10.0.0.2", 443, false, true)];
+        let bind_ip = "10.0.0.2".parse().unwrap();
+        assert!(match_host(&hosts, bind_ip, 443, "pages.example.com").is_none());
+    }
+
+    #[test]
+    fn exact_match_wins_over_wildcard_when_both_are_configured() {
+        let hosts = vec![
+            host("myproject.pages.example.com", "10.0.0.2", 443, false, true),
+            host("*.pages.example.com", "10.0.0.2", 443, false, true),
+        ];
+        let bind_ip = "10.0.0.2".parse().unwrap();
+        let found = match_host(&hosts, bind_ip, 443, "myproject.pages.example.com").unwrap();
+        assert_eq!(found.domain, "myproject.pages.example.com");
     }
 
     #[test]

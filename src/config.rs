@@ -176,28 +176,39 @@ impl Config {
             return Err(ConfigError::Validation("admin.admin_password_hash must not be empty".into()));
         }
 
-        let mut seen_binds: Vec<(Ipv4Addr, u16, Protocol)> = Vec::new();
+        // `seen_socket_binds` tracks exclusive claims on a raw (ip, port,
+        // protocol) socket -- a host implicitly claims one for TCP, and a
+        // port_rule claims one explicitly. Multiple *hosts* are allowed to
+        // share the same socket key (SNI-based virtual hosting on one
+        // listener), so that check is separate: `seen_host_domains` only
+        // rejects the same domain appearing twice on the same bind.
+        let mut seen_socket_binds: Vec<(Ipv4Addr, u16, Protocol)> = Vec::new();
+        let mut seen_host_domains: Vec<(Ipv4Addr, u16, String)> = Vec::new();
 
         for host in &self.hosts {
             validate_bind_ip(&self.network.subnet, host.bind_ip, "hosts")?;
             validate_port(host.bind_port, "hosts.bind_port")?;
-            if host.domain.trim().is_empty() {
-                return Err(ConfigError::Validation("hosts entry has an empty domain".into()));
-            }
+            validate_domain(&host.domain)?;
             if host.upstream.trim().is_empty() || !host.upstream.contains(':') {
                 return Err(ConfigError::Validation(format!(
                     "hosts entry for {} has an invalid upstream (expected host:port)",
                     host.domain
                 )));
             }
-            let key = (host.bind_ip, host.bind_port, Protocol::Tcp);
-            if seen_binds.contains(&key) {
+
+            let domain_key = (host.bind_ip, host.bind_port, host.domain.to_ascii_lowercase());
+            if seen_host_domains.contains(&domain_key) {
                 return Err(ConfigError::Validation(format!(
-                    "duplicate bind {}:{}/tcp across hosts/port_rules",
-                    host.bind_ip, host.bind_port
+                    "duplicate host {} on {}:{}",
+                    host.domain, host.bind_ip, host.bind_port
                 )));
             }
-            seen_binds.push(key);
+            seen_host_domains.push(domain_key);
+
+            let socket_key = (host.bind_ip, host.bind_port, Protocol::Tcp);
+            if !seen_socket_binds.contains(&socket_key) {
+                seen_socket_binds.push(socket_key);
+            }
         }
 
         for rule in &self.port_rules {
@@ -212,17 +223,37 @@ impl Config {
             }
             for port in rule.port_start..=rule.port_end {
                 let key = (rule.bind_ip, port, rule.protocol);
-                if seen_binds.contains(&key) {
+                if seen_socket_binds.contains(&key) {
                     return Err(ConfigError::Validation(format!(
-                        "duplicate bind {}:{}/{:?} across hosts/port_rules",
+                        "port_rules entry conflicts with an existing bind at {}:{}/{:?}",
                         rule.bind_ip, port, rule.protocol
                     )));
                 }
-                seen_binds.push(key);
+                seen_socket_binds.push(key);
             }
         }
 
         Ok(())
+    }
+}
+
+/// Empty domains are rejected outright; `*.` is only accepted as a single
+/// leading label (matching real X.509 wildcard cert semantics -- one
+/// level of subdomain, never `foo.*.bar` or `*foo.com`).
+pub(crate) fn validate_domain(domain: &str) -> Result<(), ConfigError> {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Validation("hosts entry has an empty domain".into()));
+    }
+    match trimmed.strip_prefix("*.") {
+        Some(rest) if rest.is_empty() || rest.contains('*') => Err(ConfigError::Validation(format!(
+            "invalid wildcard domain \"{domain}\" -- must be \"*.\" followed by a real domain"
+        ))),
+        Some(_) => Ok(()),
+        None if trimmed.contains('*') => Err(ConfigError::Validation(format!(
+            "invalid domain \"{domain}\" -- \"*\" is only allowed as a single leading \"*.\" label"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -405,5 +436,90 @@ cloudflare_api_token = "token-placeholder"
             });
         }
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn different_domains_may_share_one_bind_via_sni() {
+        // This is the whole point of SNI-based virtual hosting -- two
+        // *different* hostnames on the same ip:port must be allowed, only
+        // the exact same hostname twice should be rejected.
+        let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
+        for domain in ["a.example.com", "b.example.com"] {
+            cfg.hosts.push(ProxyHost {
+                id: Uuid::new_v4(),
+                domain: domain.into(),
+                bind_ip: "10.0.0.2".parse().unwrap(),
+                bind_port: 443,
+                upstream: "127.0.0.1:9000".into(),
+                websockets: false,
+                force_https: true,
+                acme_enabled: true,
+                enabled: true,
+            });
+        }
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn port_rule_conflicting_with_an_existing_host_bind_is_rejected() {
+        let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
+        cfg.hosts.push(ProxyHost {
+            id: Uuid::new_v4(),
+            domain: "example.com".into(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_port: 443,
+            upstream: "127.0.0.1:9000".into(),
+            websockets: false,
+            force_https: true,
+            acme_enabled: true,
+            enabled: true,
+        });
+        cfg.port_rules.push(PortRule {
+            id: Uuid::new_v4(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            port_start: 443,
+            port_end: 443,
+            protocol: Protocol::Tcp,
+            description: "conflicting raw passthrough".into(),
+            passthrough_target: Some("127.0.0.1:1".into()),
+            enabled: true,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_a_wildcard_domain() {
+        let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
+        cfg.hosts.push(ProxyHost {
+            id: Uuid::new_v4(),
+            domain: "*.pages.example.com".into(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_port: 443,
+            upstream: "127.0.0.1:9000".into(),
+            websockets: false,
+            force_https: true,
+            acme_enabled: true,
+            enabled: true,
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_a_bare_wildcard_with_nothing_after_it() {
+        assert!(validate_domain("*.").is_err());
+        assert!(validate_domain("*").is_err());
+    }
+
+    #[test]
+    fn rejects_a_wildcard_that_is_not_a_single_leading_label() {
+        assert!(validate_domain("foo.*.example.com").is_err());
+        assert!(validate_domain("*foo.example.com").is_err());
+        assert!(validate_domain("foo.*").is_err());
+    }
+
+    #[test]
+    fn accepts_an_ordinary_non_wildcard_domain() {
+        assert!(validate_domain("example.com").is_ok());
+        assert!(validate_domain("*.example.com").is_ok());
     }
 }

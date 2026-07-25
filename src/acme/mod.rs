@@ -76,7 +76,10 @@ pub async fn issue_certificate(
 
     let txt_value = dns01_txt_value(&challenge.token, client.account_key());
     let record_name = acme_challenge_record_name(domain);
-    let zone_id = dns01.find_zone_id(domain).await?;
+    // Zone lookup wants the real domain, not the wildcard label -- no
+    // Cloudflare zone is ever literally named "*.something".
+    let zone_lookup_domain = domain.strip_prefix("*.").unwrap_or(domain);
+    let zone_id = dns01.find_zone_id(zone_lookup_domain).await?;
     let record_id = dns01.create_txt_record(&zone_id, &record_name, &txt_value).await?;
 
     // Everything from here on must still clean up the TXT record even on

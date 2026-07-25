@@ -54,6 +54,13 @@ the file.
   non-HTTP port rules). A supervisor diffs the desired listener set
   against what's running on every state change and only starts/stops
   the delta -- editing a route's upstream never restarts its listener.
+  A host's `domain` may be a single leading wildcard label
+  (`*.pages.example.com`) to cover every one-level subdomain under one
+  route/cert -- e.g. a GitLab instance's Pages feature, which serves
+  each project at its own subdomain. Exact matches always win over a
+  wildcard when both are configured. dns-01 (required for wildcard
+  certs -- CAs never offer http-01 for them) already covers this; no
+  ACME changes were needed beyond record-name handling.
 - `api` -- Axum admin REST API (`routes`) behind argon2/HMAC session
   auth (`auth`), plus the embedded (`include_str!`) single-page web UI
   at `web/index.html`.

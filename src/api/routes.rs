@@ -149,9 +149,7 @@ fn default_true() -> bool {
 }
 
 fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiError> {
-    if req.domain.trim().is_empty() {
-        return Err(ApiError::BadRequest("domain must not be empty".into()));
-    }
+    crate::config::validate_domain(&req.domain).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if req.bind_port == 0 {
         return Err(ApiError::BadRequest("bind_port must not be 0".into()));
     }
