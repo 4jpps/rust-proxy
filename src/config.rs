@@ -140,7 +140,9 @@ pub struct ProxyHost {
     pub bind_ip: Ipv4Addr,
     #[serde(default = "default_https_port")]
     pub bind_port: u16,
-    /// `host:port` of the upstream this domain proxies to.
+    /// `host:port` of the upstream this domain proxies to. Ignored
+    /// (and may be left empty) when `redirect` is set.
+    #[serde(default)]
     pub upstream: String,
     #[serde(default)]
     pub websockets: bool,
@@ -170,8 +172,56 @@ pub struct ProxyHost {
     /// after the IP allow list, before the request reaches the upstream.
     #[serde(default)]
     pub access_login: Option<HostAuth>,
+    /// When set, this host answers every matched request with a redirect
+    /// to `RedirectTarget::target` instead of proxying to `upstream`.
+    /// Domain matching, TLS/ACME issuance, the firewall rule, and access
+    /// control (`access_allow_ips`/`access_login`) are all identical
+    /// either way -- a redirect host still gets its own real cert, same
+    /// as Nginx Proxy Manager's own Redirection Hosts. `None` (the
+    /// default) is a normal reverse-proxy host.
+    #[serde(default)]
+    pub redirect: Option<RedirectTarget>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// Where a `redirect` host sends visitors, and how.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedirectTarget {
+    /// Absolute `http://` or `https://` URL -- validated in
+    /// `validate_redirect_target`. Unlike `proxy::login`'s `return_to`
+    /// (which must never leave the site -- see the open-redirect fix in
+    /// `proxy::login::sanitize_return_to`), this one is *meant* to be an
+    /// arbitrary destination: it's an admin-configured value, not
+    /// something reflected from request input.
+    pub target: String,
+    /// When true (the default), the incoming request's own path and
+    /// query string are appended to `target` -- e.g. redirecting
+    /// `old.example.com/blog/post` straight to
+    /// `new.example.com/blog/post`. When false, every request goes to
+    /// `target` verbatim regardless of the path visited.
+    #[serde(default = "default_true")]
+    pub preserve_path: bool,
+    #[serde(default)]
+    pub status: RedirectStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RedirectStatus {
+    /// 301 -- browsers and search engines cache this redirect
+    /// indefinitely, same as `proxy::http::https_redirect_response`'s
+    /// own `force_https` redirect.
+    Permanent,
+    /// 302 -- for a redirect that might change later (a temporary
+    /// migration, an A/B test) and shouldn't be cached hard.
+    Temporary,
+}
+
+impl Default for RedirectStatus {
+    fn default() -> Self {
+        Self::Permanent
+    }
 }
 
 /// A single login credential gating one host behind `proxy::login`'s
@@ -282,11 +332,16 @@ impl Config {
             validate_bind_ip(&self.network.bind_ranges, host.bind_ip, "hosts")?;
             validate_port(host.bind_port, "hosts.bind_port")?;
             validate_domain(&host.domain)?;
-            if host.upstream.trim().is_empty() || !host.upstream.contains(':') {
-                return Err(ConfigError::Validation(format!(
-                    "hosts entry for {} has an invalid upstream (expected host:port)",
-                    host.domain
-                )));
+            match &host.redirect {
+                Some(redirect) => validate_redirect_target(&redirect.target)?,
+                None => {
+                    if host.upstream.trim().is_empty() || !host.upstream.contains(':') {
+                        return Err(ConfigError::Validation(format!(
+                            "hosts entry for {} has an invalid upstream (expected host:port)",
+                            host.domain
+                        )));
+                    }
+                }
             }
 
             let domain_key = (host.bind_ip, host.bind_port, host.domain.to_ascii_lowercase());
@@ -348,6 +403,20 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), ConfigError> {
         ))),
         None => Ok(()),
     }
+}
+
+/// Only requires an absolute `http://`/`https://` URL -- anything more
+/// (a real `Uri` parse, rejecting a bare domain, etc.) is left to
+/// whatever HTTP client eventually follows the redirect; this is just
+/// enough to catch an obviously-wrong value (a bare domain, a typo)
+/// before it's saved.
+pub(crate) fn validate_redirect_target(target: &str) -> Result<(), ConfigError> {
+    if !(target.starts_with("http://") || target.starts_with("https://")) {
+        return Err(ConfigError::Validation(format!(
+            "redirect target \"{target}\" must be an absolute http:// or https:// URL"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_bind_ip(allowed: &[Ipv4Net], ip: Ipv4Addr, ctx: &str) -> Result<(), ConfigError> {
@@ -447,6 +516,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -468,6 +538,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok(), "bind_ip in the second range should be accepted");
@@ -488,6 +559,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -508,6 +580,57 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
+            enabled: true,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_a_redirect_host_with_no_upstream() {
+        let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
+        cfg.hosts.push(ProxyHost {
+            id: Uuid::new_v4(),
+            domain: "old.example.com".into(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_port: 443,
+            upstream: String::new(),
+            websockets: false,
+            force_https: true,
+            acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            access_allow_ips: vec![],
+            access_login: None,
+            redirect: Some(RedirectTarget {
+                target: "https://new.example.com".into(),
+                preserve_path: true,
+                status: RedirectStatus::Permanent,
+            }),
+            enabled: true,
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_a_redirect_host_with_a_non_absolute_target() {
+        let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
+        cfg.hosts.push(ProxyHost {
+            id: Uuid::new_v4(),
+            domain: "old.example.com".into(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_port: 443,
+            upstream: String::new(),
+            websockets: false,
+            force_https: true,
+            acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            access_allow_ips: vec![],
+            access_login: None,
+            redirect: Some(RedirectTarget {
+                target: "new.example.com".into(),
+                preserve_path: true,
+                status: RedirectStatus::Permanent,
+            }),
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -587,6 +710,7 @@ dns_api_token = "token-placeholder"
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 access_allow_ips: vec![],
                 access_login: None,
+                redirect: None,
                 enabled: true,
             });
         }
@@ -612,6 +736,7 @@ dns_api_token = "token-placeholder"
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 access_allow_ips: vec![],
                 access_login: None,
+                redirect: None,
                 enabled: true,
             });
         }
@@ -633,6 +758,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -663,6 +789,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());

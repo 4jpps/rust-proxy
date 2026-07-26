@@ -69,6 +69,21 @@ dns_api_token = "your-dns-provider-api-token-with-dns-edit-scope"
 # [hosts.access_login]
 # username = "viewer"
 # password_hash = "$argon2id$v=19$..."
+
+# Example redirection host -- old.example.com gets its own ACME cert
+# and redirects every request straight to new.example.com, preserving
+# whatever path/query was visited. upstream/websockets are ignored when
+# redirect is set.
+# [[hosts]]
+# domain = "old.example.com"
+# bind_ip = "10.0.0.2"
+# bind_port = 443
+# force_https = true
+# acme_enabled = true
+# [hosts.redirect]
+# target = "https://new.example.com"
+# preserve_path = true
+# status = "permanent"
 # enabled = true
 
 # Example port rule -- RustDesk, forwarded from the /29 to a local

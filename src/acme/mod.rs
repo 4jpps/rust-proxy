@@ -380,6 +380,7 @@ mod tests {
             acme_challenge_type: challenge_type,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
             enabled: true,
         }
     }

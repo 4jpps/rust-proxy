@@ -76,6 +76,18 @@ Nginx Proxy Manager's own access lists:
   leaving it out on an edit clears it, the same as any other host field,
   there's no separate "leave unchanged" option.
 
+A host can also be a pure redirect instead of a reverse proxy -- set
+`redirect` (`{"target", "preserve_path", "status"}`) and `upstream`
+becomes ignored/optional. `target` must be an absolute `http://`/
+`https://` URL; `preserve_path` (default `true`) appends the visited
+path/query onto `target` (redirecting `old.example.com/post` straight
+to `new.example.com/post`); `status` is `"permanent"` (301, the
+default) or `"temporary"` (302). Same as Nginx Proxy Manager's
+Redirection Hosts, a redirect host still gets its own ACME cert and its
+own `access_allow_ips`/`access_login` -- domain matching, TLS, and
+access control are identical to a proxy host, only the final response
+differs.
+
 ## API
 
 Every route under `/api/*` except `/api/login`/`/api/logout` requires
@@ -129,7 +141,7 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 |--------|-------------------------|-------------------------------------------------------------------------------------------|
 | GET    | `/api/dashboard`        | -- (host/port-rule/cert counts, configured `bind_ranges`)                                 |
 | GET    | `/api/hosts`            | --                                                                                         |
-| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","access_allow_ips","access_login","enabled"}` |
+| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","access_allow_ips","access_login","redirect","enabled"}` |
 | PUT    | `/api/hosts/:id`        | same shape as POST                                                                         |
 | DELETE | `/api/hosts/:id`        | --                                                                                         |
 | GET    | `/api/port-rules`       | --                                                                                         |
@@ -175,11 +187,13 @@ for the token-authenticated API.
   `run_renewal_loop` checks every ACME-enabled host every 12h and
   re-issues anything within `acme.renew_before_days` of expiry.
 - `proxy` -- the data plane: `router` (pure host-matching), `tls`
-  (SNI cert dispatch reading live state), `http` (forwarding +
-  WebSocket upgrade passthrough), `access` (pure IP-allow-list checks),
-  `login` (the `access_login` session-cookie gate: credential check,
-  HMAC session signing/verification, and the login page itself), both
-  run before a matched request is forwarded, `passthrough` (raw TCP/UDP
+  (SNI cert dispatch reading live state), `http` (forwarding + WebSocket
+  upgrade passthrough + a `redirect` host's response), `access` (pure
+  IP-allow-list checks), `login` (the `access_login` session-cookie
+  gate: credential check, HMAC session signing/verification, and the
+  login page itself) -- access/login run before a matched request is
+  forwarded (or, for a `redirect` host, before the redirect response is
+  built instead), `passthrough` (raw TCP/UDP
   for non-HTTP port rules). ALPN offers `h2` then `http/1.1`; the HTTPS
   listener uses `hyper-util`'s auto builder to actually speak whichever
   one a client negotiates, with HTTP/1 upgrades (what WebSocket

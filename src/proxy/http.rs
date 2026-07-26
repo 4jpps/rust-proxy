@@ -15,6 +15,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
+use crate::config::{RedirectStatus, RedirectTarget};
 use crate::state::AppState;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -96,6 +97,31 @@ pub fn https_redirect_response<B>(req: &Request<B>) -> Response<BoxBody<Bytes, h
 
     Response::builder()
         .status(hyper::StatusCode::MOVED_PERMANENTLY)
+        .header(hyper::header::LOCATION, location)
+        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static redirect response is always valid")
+}
+
+/// Serves a `redirect` host's response -- the request never reaches an
+/// upstream at all. `target.target` is an admin-configured absolute URL
+/// (validated by `config::validate_redirect_target`), not something
+/// reflected from request input, so -- unlike `proxy::login`'s
+/// `return_to` -- it's fine for this to leave the site; that's the whole
+/// point of the feature.
+pub fn redirect_target_response<B>(req: &Request<B>, target: &RedirectTarget) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let location = if target.preserve_path {
+        let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        format!("{}{}", target.target.trim_end_matches('/'), path_and_query)
+    } else {
+        target.target.clone()
+    };
+    let status = match target.status {
+        RedirectStatus::Permanent => hyper::StatusCode::MOVED_PERMANENTLY,
+        RedirectStatus::Temporary => hyper::StatusCode::FOUND,
+    };
+
+    Response::builder()
+        .status(status)
         .header(hyper::header::LOCATION, location)
         .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
         .expect("static redirect response is always valid")
@@ -245,6 +271,50 @@ mod tests {
         let resp = https_redirect_response(&req);
         let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
         assert_eq!(location, "https://example.com/");
+    }
+
+    fn redirect_target(target: &str, preserve_path: bool, status: RedirectStatus) -> RedirectTarget {
+        RedirectTarget {
+            target: target.into(),
+            preserve_path,
+            status,
+        }
+    }
+
+    #[test]
+    fn redirect_target_response_appends_the_request_path_when_preserving_it() {
+        let req = Request::builder().uri("/blog/post?x=1").body(()).unwrap();
+        let target = redirect_target("https://new.example.com", true, RedirectStatus::Permanent);
+        let resp = redirect_target_response(&req, &target);
+        assert_eq!(resp.status(), hyper::StatusCode::MOVED_PERMANENTLY);
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(location, "https://new.example.com/blog/post?x=1");
+    }
+
+    #[test]
+    fn redirect_target_response_does_not_double_up_a_trailing_slash() {
+        let req = Request::builder().uri("/post").body(()).unwrap();
+        let target = redirect_target("https://new.example.com/", true, RedirectStatus::Permanent);
+        let resp = redirect_target_response(&req, &target);
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(location, "https://new.example.com/post");
+    }
+
+    #[test]
+    fn redirect_target_response_ignores_the_request_path_when_not_preserving_it() {
+        let req = Request::builder().uri("/whatever/path").body(()).unwrap();
+        let target = redirect_target("https://new.example.com/landing", false, RedirectStatus::Permanent);
+        let resp = redirect_target_response(&req, &target);
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(location, "https://new.example.com/landing");
+    }
+
+    #[test]
+    fn redirect_target_response_uses_302_for_a_temporary_redirect() {
+        let req = Request::builder().uri("/").body(()).unwrap();
+        let target = redirect_target("https://new.example.com", true, RedirectStatus::Temporary);
+        let resp = redirect_target_response(&req, &target);
+        assert_eq!(resp.status(), hyper::StatusCode::FOUND);
     }
 
     /// End-to-end: a real fake upstream on loopback, our proxy server

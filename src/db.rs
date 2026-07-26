@@ -15,7 +15,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::config::{AcmeChallengeType, HostAuth, PortRule, Protocol, ProxyHost};
+use crate::config::{AcmeChallengeType, HostAuth, PortRule, Protocol, ProxyHost, RedirectStatus, RedirectTarget};
 
 pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let url = if db_path.as_os_str() == ":memory:" {
@@ -48,6 +48,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             access_allow_ips TEXT NOT NULL DEFAULT '',
             access_login_username TEXT,
             access_login_password_hash TEXT,
+            redirect_target TEXT,
+            redirect_preserve_path INTEGER NOT NULL DEFAULT 1,
+            redirect_status TEXT NOT NULL DEFAULT 'permanent',
             enabled INTEGER NOT NULL
         )
         "#,
@@ -64,6 +67,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_allow_ips TEXT NOT NULL DEFAULT ''").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_login_username TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_login_password_hash TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_target TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_preserve_path INTEGER NOT NULL DEFAULT 1").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_status TEXT NOT NULL DEFAULT 'permanent'").execute(pool).await;
 
     sqlx::query(
         r#"
@@ -175,7 +181,8 @@ fn parse_rfc3339(s: &str) -> DateTime<Utc> {
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, \
-         access_allow_ips, access_login_username, access_login_password_hash, enabled FROM hosts",
+         access_allow_ips, access_login_username, access_login_password_hash, \
+         redirect_target, redirect_preserve_path, redirect_status, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -199,6 +206,14 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 (Some(username), Some(password_hash)) => Some(HostAuth { username, password_hash }),
                 _ => None,
             };
+            let redirect = row.get::<Option<String>, _>("redirect_target").map(|target| RedirectTarget {
+                target,
+                preserve_path: row.get::<i64, _>("redirect_preserve_path") != 0,
+                status: match row.get::<String, _>("redirect_status").as_str() {
+                    "temporary" => RedirectStatus::Temporary,
+                    _ => RedirectStatus::Permanent,
+                },
+            });
             Ok(ProxyHost {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 domain: row.get("domain"),
@@ -211,6 +226,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 acme_challenge_type: challenge_type,
                 access_allow_ips,
                 access_login,
+                redirect,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -231,10 +247,22 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             Some(auth) => (Some(auth.username.as_str()), Some(auth.password_hash.as_str())),
             None => (None, None),
         };
+        let (redirect_target, redirect_preserve_path, redirect_status) = match &h.redirect {
+            Some(redirect) => (
+                Some(redirect.target.as_str()),
+                redirect.preserve_path as i64,
+                match redirect.status {
+                    RedirectStatus::Permanent => "permanent",
+                    RedirectStatus::Temporary => "temporary",
+                },
+            ),
+            None => (None, true as i64, "permanent"),
+        };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, \
-             acme_challenge_type, access_allow_ips, access_login_username, access_login_password_hash, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, access_allow_ips, access_login_username, access_login_password_hash, \
+             redirect_target, redirect_preserve_path, redirect_status, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -248,6 +276,9 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(access_allow_ips)
         .bind(login_username)
         .bind(login_password_hash)
+        .bind(redirect_target)
+        .bind(redirect_preserve_path)
+        .bind(redirect_status)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -327,6 +358,7 @@ mod tests {
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            redirect: None,
             enabled: true,
         }
     }
@@ -381,6 +413,22 @@ mod tests {
         let loaded = load_hosts(&pool).await.unwrap();
         assert!(loaded[0].access_allow_ips.is_empty());
         assert!(loaded[0].access_login.is_none());
+        assert!(loaded[0].redirect.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_target_round_trips_through_sqlite() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.redirect = Some(RedirectTarget {
+            target: "https://new.example.com".into(),
+            preserve_path: false,
+            status: RedirectStatus::Temporary,
+        });
+        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert_eq!(loaded[0].redirect, host.redirect);
     }
 
     #[tokio::test]

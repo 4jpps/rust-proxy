@@ -42,13 +42,13 @@
 
   <h2>Proxy hosts</h2>
   <table id="hosts-table"><thead><tr>
-    <th>Domain</th><th>Bind</th><th>Upstream</th><th>WS</th><th>HTTPS redir</th><th>ACME</th><th>Challenge</th><th>Access</th><th>Enabled</th><th></th>
+    <th>Domain</th><th>Bind</th><th>Upstream / Redirect</th><th>WS</th><th>HTTPS redir</th><th>ACME</th><th>Challenge</th><th>Access</th><th>Enabled</th><th></th>
   </tr></thead><tbody></tbody></table>
   <form class="inline" id="host-form">
     <input type="text" name="domain" placeholder="domain" required>
     <input type="text" name="bind_ip" placeholder="bind ip" required>
     <input type="number" name="bind_port" placeholder="port" value="443" required>
-    <input type="text" name="upstream" placeholder="upstream host:port" required>
+    <input type="text" name="upstream" placeholder="upstream host:port (leave blank for a redirect host)">
     <label class="chk"><input type="checkbox" name="websockets"> WS</label>
     <label class="chk"><input type="checkbox" name="force_https" checked> HTTPS redirect</label>
     <label class="chk"><input type="checkbox" name="acme_enabled" checked> ACME</label>
@@ -60,6 +60,12 @@
     <input type="text" name="access_allow_ips" placeholder="allowed IPs/CIDRs, comma-separated (optional)" title="Access list: IP allow list. Empty means unrestricted.">
     <input type="text" name="access_login_username" placeholder="login username (optional)" title="Gate this host behind a login page. Leave blank for no login gate.">
     <input type="password" name="access_login_password" placeholder="login password">
+    <input type="text" name="redirect_target" placeholder="redirect target URL (optional, overrides upstream)" title="If set, this host redirects here instead of proxying to upstream, e.g. https://new.example.com">
+    <label class="chk"><input type="checkbox" name="redirect_preserve_path" checked> Preserve path</label>
+    <select name="redirect_status" title="Redirect status code">
+      <option value="permanent" selected>301 permanent</option>
+      <option value="temporary">302 temporary</option>
+    </select>
     <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
     <button type="submit">Add host</button>
     <span class="error" id="host-error"></span>
@@ -174,7 +180,10 @@ async function refreshHosts() {
       h.access_allow_ips && h.access_allow_ips.length ? `${h.access_allow_ips.length} IP range${h.access_allow_ips.length === 1 ? '' : 's'}` : '',
       h.access_login ? `login: ${esc(h.access_login.username)}` : '',
     ].filter(Boolean).join(', ');
-    tr.innerHTML = `<td>${esc(h.domain)}</td><td>${esc(h.bind_ip)}:${h.bind_port}</td><td>${esc(h.upstream)}</td>
+    const target = h.redirect
+      ? `→ ${esc(h.redirect.target)} (${h.redirect.status === 'temporary' ? '302' : '301'})`
+      : esc(h.upstream);
+    tr.innerHTML = `<td>${esc(h.domain)}</td><td>${esc(h.bind_ip)}:${h.bind_port}</td><td>${target}</td>
       <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
       <td>${esc(h.acme_challenge_type)}</td>
       <td>${access}</td>
@@ -193,6 +202,7 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
   const allowIps = (fd.get('access_allow_ips') || '').split(',').map(s => s.trim()).filter(Boolean);
   const loginUsername = fd.get('access_login_username');
   const loginPassword = fd.get('access_login_password');
+  const redirectTarget = fd.get('redirect_target');
   const body = {
     domain: fd.get('domain'), bind_ip: fd.get('bind_ip'), bind_port: Number(fd.get('bind_port')),
     upstream: fd.get('upstream'), websockets: fd.get('websockets') === 'on',
@@ -200,6 +210,9 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
     acme_challenge_type: fd.get('acme_challenge_type'),
     access_allow_ips: allowIps,
     access_login: loginUsername ? { username: loginUsername, password: loginPassword } : null,
+    redirect: redirectTarget
+      ? { target: redirectTarget, preserve_path: fd.get('redirect_preserve_path') === 'on', status: fd.get('redirect_status') }
+      : null,
     enabled: fd.get('enabled') === 'on',
   };
   const resp = await api('/api/hosts', { method: 'POST', body: JSON.stringify(body) });

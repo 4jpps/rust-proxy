@@ -176,6 +176,9 @@ struct HostRequest {
     domain: String,
     bind_ip: Ipv4Addr,
     bind_port: u16,
+    /// Required unless `redirect` is set, in which case it's ignored and
+    /// may be omitted entirely.
+    #[serde(default)]
     upstream: String,
     #[serde(default)]
     websockets: bool,
@@ -195,6 +198,11 @@ struct HostRequest {
     /// stored raw.
     #[serde(default)]
     access_login: Option<HostLoginRequest>,
+    /// When set, this host redirects instead of proxying -- see
+    /// `config::RedirectTarget`. No password/hashing involved, so this
+    /// is deserialized straight from the request with no separate DTO.
+    #[serde(default)]
+    redirect: Option<crate::config::RedirectTarget>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -213,8 +221,13 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     if req.bind_port == 0 {
         return Err(ApiError::BadRequest("bind_port must not be 0".into()));
     }
-    if !req.upstream.contains(':') {
-        return Err(ApiError::BadRequest("upstream must be host:port".into()));
+    match &req.redirect {
+        Some(redirect) => crate::config::validate_redirect_target(&redirect.target).map_err(|e| ApiError::BadRequest(e.to_string()))?,
+        None => {
+            if !req.upstream.contains(':') {
+                return Err(ApiError::BadRequest("upstream must be host:port".into()));
+            }
+        }
     }
     crate::config::validate_bind_ip(&state.network().bind_ranges, req.bind_ip, "hosts")
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -259,6 +272,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
         access_login,
+        redirect: body.redirect,
         enabled: body.enabled,
     };
     let to_insert = host.clone();
@@ -290,6 +304,7 @@ async fn update_host(
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
         access_login,
+        redirect: body.redirect,
         enabled: body.enabled,
     };
     let to_store = updated.clone();
@@ -802,6 +817,68 @@ mod tests {
                     .body(axum::body::Body::from(
                         r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
                         "access_login":{"username":"viewer","password":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_redirect_host_requires_no_upstream_and_persists_the_target() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"old.example.com","bind_ip":"10.0.0.2","bind_port":443,
+                        "redirect":{"target":"https://new.example.com","preserve_path":true,"status":"permanent"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let created = body_json(create_resp).await;
+        assert_eq!(created["redirect"]["target"], "https://new.example.com");
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/hosts")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["redirect"]["target"], "https://new.example.com");
+    }
+
+    #[tokio::test]
+    async fn create_redirect_host_with_a_non_absolute_target_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"old.example.com","bind_ip":"10.0.0.2","bind_port":443,
+                        "redirect":{"target":"new.example.com","preserve_path":true,"status":"permanent"}}"#,
                     ))
                     .unwrap(),
             )

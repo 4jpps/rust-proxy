@@ -230,6 +230,10 @@ async fn handle_https_request(
         }
     }
 
+    if let Some(redirect) = &host.redirect {
+        return Ok(http::redirect_target_response(&req, redirect));
+    }
+
     let Ok(upstream) = resolve_upstream(&host.upstream) else {
         return Ok(bad_gateway());
     };
@@ -514,6 +518,7 @@ mod tests {
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips,
             access_login,
+            redirect: None,
             enabled: true,
         }
     }
@@ -704,6 +709,71 @@ mod tests {
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);
         assert!(response_text(resp).await.contains("Sign in to example.com"));
+    }
+
+    fn redirect_host(domain: &str, redirect: crate::config::RedirectTarget) -> ProxyHost {
+        ProxyHost {
+            id: Uuid::new_v4(),
+            domain: domain.into(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_port: 443,
+            upstream: String::new(),
+            websockets: false,
+            force_https: false,
+            acme_enabled: false,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            access_allow_ips: vec![],
+            access_login: None,
+            redirect: Some(redirect),
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_host_serves_the_redirect_without_ever_touching_an_upstream() {
+        let target = crate::config::RedirectTarget {
+            target: "https://new.example.com".into(),
+            preserve_path: true,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let state = test_state_with_host(redirect_host("example.com", target)).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/blog/post?x=1",
+            None,
+            None,
+        )
+        .await;
+        // upstream is empty/invalid ("") -- a BAD_GATEWAY here would mean
+        // the request fell through to resolve_upstream instead of being
+        // answered as a redirect.
+        assert_eq!(resp.status(), hyper::StatusCode::MOVED_PERMANENTLY);
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(location, "https://new.example.com/blog/post?x=1");
+    }
+
+    #[tokio::test]
+    async fn access_control_still_applies_to_a_redirect_host() {
+        let target = crate::config::RedirectTarget {
+            target: "https://new.example.com".into(),
+            preserve_path: true,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let mut host = redirect_host("example.com", target);
+        host.access_allow_ips = vec!["192.168.1.0/24".parse().unwrap()];
+        let state = test_state_with_host(host).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::FORBIDDEN);
     }
 
     /// A test-only "trust anything" verifier -- the self-signed cert

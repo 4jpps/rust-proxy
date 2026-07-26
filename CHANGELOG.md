@@ -26,6 +26,15 @@
   and offer to save a real login form, unlike Basic Auth's browser-
   native dialog. Passwords are argon2-hashed server-side and never
   stored or returned in plaintext. See `proxy::access`/`proxy::login`.
+- Redirection hosts -- a host can now be a pure redirect (`redirect`:
+  `{"target", "preserve_path", "status"}`) instead of a reverse proxy;
+  `upstream` becomes ignored/optional. `preserve_path` (default `true`)
+  appends the visited path/query onto `target`; `status` is
+  `"permanent"` (301, default) or `"temporary"` (302). Same as Nginx
+  Proxy Manager's Redirection Hosts, it still gets its own ACME cert and
+  its own `access_allow_ips`/`access_login` -- only the final response
+  differs from a normal proxy host. See `config::RedirectTarget` and
+  `proxy::http::redirect_target_response`.
 
 ## [0.1.0] - 2026-07-26
 
