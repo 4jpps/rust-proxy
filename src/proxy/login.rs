@@ -129,18 +129,40 @@ fn json_for_script(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()).replace('/', "\\/")
 }
 
+/// Only a same-origin relative path is a safe post-login destination for
+/// the client-side `window.location.href = returnTo` navigation this
+/// page performs. `return_to` reaches here from two places: the
+/// server's own derived request path (always origin-form, already
+/// safe) *or*, on a failed login attempt, echoed back verbatim from
+/// `LoginSubmission::return_to` -- straight from the POST body's JSON,
+/// fully attacker-controlled. Without this check, a crafted failed
+/// login (`return_to: "https://evil.example"`) embedded in the
+/// re-rendered page would redirect a victim to an attacker site
+/// immediately after they enter their *real* password and establish a
+/// genuine session -- an open redirect used for phishing, not merely a
+/// cosmetic bug. `//host/...` and `/\host/...` are also rejected --
+/// browsers can treat both as scheme-relative to a different origin.
+fn sanitize_return_to(return_to: &str) -> &str {
+    let is_safe = return_to.starts_with('/') && !return_to.starts_with("//") && !return_to.starts_with("/\\") && !return_to.contains("://");
+    if is_safe {
+        return_to
+    } else {
+        "/"
+    }
+}
+
 /// Renders the self-contained login page served in place of the
 /// originally-requested resource. A real `<form>` with a real
 /// `type="password"` input and `autocomplete` hints -- unlike Basic
 /// Auth's browser-native prompt, password managers reliably recognize
 /// and offer to save this.
 ///
-/// `return_to` is only ever a server-derived request path+query (HTTP
-/// request targets on this listener are always origin-form, never an
-/// attacker-suppliable absolute URL), but is still both HTML- and
-/// JSON-escaped here since it's embedded in both a rendered page and
-/// inline JS.
+/// `return_to` is re-validated by `sanitize_return_to` regardless of
+/// where it came from (see that function's doc for why), then both
+/// HTML- and JSON-escaped since it's embedded in both a rendered page
+/// and inline JS.
 pub fn render_login_page(domain: &str, return_to: &str, error: Option<&str>) -> String {
+    let return_to = sanitize_return_to(return_to);
     let domain_html = html_escape(domain);
     let return_to_json = json_for_script(return_to);
     let login_path_json = json_for_script(LOGIN_SUBMIT_PATH);
@@ -284,6 +306,39 @@ mod tests {
         assert!(!html.contains("<script>evil</script>"));
         assert!(!html.contains("<img onerror"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn sanitize_return_to_keeps_an_ordinary_relative_path() {
+        assert_eq!(sanitize_return_to("/dashboard?x=1"), "/dashboard?x=1");
+    }
+
+    #[test]
+    fn sanitize_return_to_rejects_an_absolute_url() {
+        // The open-redirect case: a failed login POST can carry any
+        // string as return_to (it's attacker-controlled JSON, not a
+        // server-derived path), and this must never survive into the
+        // page a real login later navigates to.
+        assert_eq!(sanitize_return_to("https://evil.example/phish"), "/");
+        assert_eq!(sanitize_return_to("http://evil.example"), "/");
+    }
+
+    #[test]
+    fn sanitize_return_to_rejects_protocol_relative_and_backslash_variants() {
+        assert_eq!(sanitize_return_to("//evil.example"), "/");
+        assert_eq!(sanitize_return_to("/\\evil.example"), "/");
+    }
+
+    #[test]
+    fn sanitize_return_to_rejects_a_bare_domain_or_empty_string() {
+        assert_eq!(sanitize_return_to("evil.example"), "/");
+        assert_eq!(sanitize_return_to(""), "/");
+    }
+
+    #[test]
+    fn render_login_page_never_embeds_an_unsafe_return_to() {
+        let html = render_login_page("example.com", "https://evil.example/phish", None);
+        assert!(!html.contains("evil.example"));
     }
 
     #[test]
