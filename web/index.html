@@ -106,6 +106,18 @@
 </div>
 
 <script>
+// Every table row below is built via `innerHTML` for simplicity, but the
+// values going into it (domain names, upstreams, descriptions, basic
+// auth usernames, token names, ...) are admin/API-token-supplied data,
+// not this script's own constants -- escape anything that isn't a
+// number/boolean/enum-from-a-closed-set the server controls, so a
+// malicious value set via a lower-trust API token (this UI's own docs
+// describe tokens as handed to "CI pipelines, scripts, other tools")
+// can't execute script in the human admin's session when they view it.
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
 async function api(path, opts) {
   const resp = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
   if (resp.status === 401) { showLogin(); throw new Error('unauthenticated'); }
@@ -160,11 +172,11 @@ async function refreshHosts() {
     const tr = document.createElement('tr');
     const access = [
       h.access_allow_ips && h.access_allow_ips.length ? `${h.access_allow_ips.length} IP range${h.access_allow_ips.length === 1 ? '' : 's'}` : '',
-      h.access_basic_auth ? `auth: ${h.access_basic_auth.username}` : '',
+      h.access_basic_auth ? `auth: ${esc(h.access_basic_auth.username)}` : '',
     ].filter(Boolean).join(', ');
-    tr.innerHTML = `<td>${h.domain}</td><td>${h.bind_ip}:${h.bind_port}</td><td>${h.upstream}</td>
+    tr.innerHTML = `<td>${esc(h.domain)}</td><td>${esc(h.bind_ip)}:${h.bind_port}</td><td>${esc(h.upstream)}</td>
       <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
-      <td>${h.acme_challenge_type}</td>
+      <td>${esc(h.acme_challenge_type)}</td>
       <td>${access}</td>
       <td>${h.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${h.id}">Delete</button></td>`;
     tr.querySelector('button').addEventListener('click', async () => {
@@ -202,8 +214,8 @@ async function refreshRules() {
   for (const r of rules) {
     const ports = r.port_start === r.port_end ? r.port_start : `${r.port_start}-${r.port_end}`;
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${r.bind_ip}</td><td>${ports}</td><td>${r.protocol}</td>
-      <td>${r.passthrough_target || '<em>firewall only</em>'}</td><td>${r.description}</td>
+    tr.innerHTML = `<td>${esc(r.bind_ip)}</td><td>${ports}</td><td>${esc(r.protocol)}</td>
+      <td>${r.passthrough_target ? esc(r.passthrough_target) : '<em>firewall only</em>'}</td><td>${esc(r.description)}</td>
       <td>${r.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${r.id}">Delete</button></td>`;
     tr.querySelector('button').addEventListener('click', async () => {
       await api(`/api/port-rules/${r.id}`, { method: 'DELETE' });
@@ -233,7 +245,7 @@ async function refreshCerts() {
   tbody.innerHTML = '';
   for (const c of certs) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${c.domain}</td><td>${new Date(c.not_after).toLocaleDateString()}</td><td>${c.days_remaining}</td>`;
+    tr.innerHTML = `<td>${esc(c.domain)}</td><td>${new Date(c.not_after).toLocaleDateString()}</td><td>${c.days_remaining}</td>`;
     tbody.appendChild(tr);
   }
 }
@@ -244,7 +256,7 @@ async function refreshTokens() {
   tbody.innerHTML = '';
   for (const t of tokens) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${t.name}</td><td>${new Date(t.created_at).toLocaleString()}</td>
+    tr.innerHTML = `<td>${esc(t.name)}</td><td>${new Date(t.created_at).toLocaleString()}</td>
       <td>${t.last_used_at ? new Date(t.last_used_at).toLocaleString() : 'never'}</td>
       <td><button class="danger" data-id="${t.id}">Revoke</button></td>`;
     tr.querySelector('button').addEventListener('click', async () => {
