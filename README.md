@@ -171,6 +171,36 @@ via `AmbientCapabilities`/`CapabilityBoundingSet`, plus
 depth. The admin UI's own port is additionally restricted to
 `admin.allowed_ips` at the firewall layer, not just by session auth.
 
+### Installing the `.deb`
+
+Every `vX.Y.Z` tag is built and published by CI (`.gitlab-ci.yml`) to
+this project's [Releases](../../releases) page and to a small
+self-hosted apt repo:
+
+```sh
+echo 'deb [trusted=yes] https://repo.jpps.us/stable /' | sudo tee /etc/apt/sources.list.d/jpps.list
+sudo apt update
+sudo apt install rust-proxy
+```
+
+(`[trusted=yes]` because this repo isn't GPG-signed yet -- it's a
+small, flat, single-maintainer repo, not a general-purpose
+distribution; download over HTTPS still protects the transfer, just
+not the publisher's identity the way a signed repo would.)
+
+`postinst` creates the `rust-proxy` system user and, on first install,
+either interactively prompts for initial configuration (admin
+credentials, DNS provider/token) or -- if run non-interactively, e.g.
+`apt-get install -y` in a script -- generates a random admin password
+and prints it once. Either way you get a real `/etc/rust-proxy/config.toml`
+and a running service; edit the file and `systemctl restart rust-proxy`
+to change anything afterward. An unattended install without ACME
+credentials on hand still works -- it just can't issue certs until
+`acme.dns_api_token` is filled in.
+
+Or download a specific release's `.deb` directly and `dpkg -i` it, or
+build/install manually:
+
 ```sh
 sudo install -d -m 750 -o rust-proxy -g rust-proxy /etc/rust-proxy
 sudo install -m 640 -o root -g rust-proxy deploy/config.toml.example /etc/rust-proxy/config.toml
@@ -179,10 +209,6 @@ sudo install -m 644 deploy/rust-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rust-proxy
 ```
-
-No `.deb`/CI packaging pipeline yet -- add one (mirroring
-`jpps/store`'s `.gitlab-ci.yml` + `cargo-deb` approach) once this is
-ready for a real rollout.
 
 ## Status
 

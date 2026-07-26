@@ -26,6 +26,14 @@ use types::{AuthorizationStatus, OrderStatus};
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const POLL_MAX_ATTEMPTS: u32 = 40; // ~2 minutes at 3s each
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(3600 * 12);
+/// How often to retry ACME account setup (key load/generate, directory
+/// fetch, account registration) after it fails -- deliberately much
+/// shorter than `RENEWAL_CHECK_INTERVAL`. A misconfigured or blank
+/// `acme.dns_api_token`/`contact_email` (a real, supported "I haven't
+/// set up ACME yet" state -- see deploy/debian/postinst) or a
+/// transient Let's Encrypt outage shouldn't take 12h to notice was
+/// fixed.
+const ACME_INIT_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 /// Real DNS propagation before an authoritative resolver-facing CA check
 /// succeeds is minutes, not seconds -- this is deliberately generous.
 const DNS_PROPAGATION_WAIT: Duration = Duration::from_secs(30);
@@ -195,15 +203,32 @@ where
 /// `acme.renew_before_days` and re-issues anything close to expiry (or
 /// missing entirely, e.g. first boot).
 pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
-    let account_key = AccountKey::load_or_generate(&state.acme().account_key_path)?;
-    let client = AcmeClient::new(&state.acme().directory_url, account_key).await?;
-    client.new_account(&state.acme().contact_email).await?;
-
     let http = reqwest::Client::new();
     let dns01: Box<dyn DnsProvider> = match state.acme().dns_provider {
-        DnsProviderKind::Cloudflare => Box::new(CloudflareDns01::new(http, state.acme().dns_api_token.clone())),
-        DnsProviderKind::DigitalOcean => Box::new(DigitalOceanDns01::new(http, state.acme().dns_api_token.clone())),
-        DnsProviderKind::Hetzner => Box::new(HetznerDns01::new(http, state.acme().dns_api_token.clone())),
+        DnsProviderKind::Cloudflare => Box::new(CloudflareDns01::new(http.clone(), state.acme().dns_api_token.clone())),
+        DnsProviderKind::DigitalOcean => Box::new(DigitalOceanDns01::new(http.clone(), state.acme().dns_api_token.clone())),
+        DnsProviderKind::Hetzner => Box::new(HetznerDns01::new(http.clone(), state.acme().dns_api_token.clone())),
+    };
+
+    // Account setup failing (blank/invalid contact_email or
+    // dns_api_token, Let's Encrypt briefly unreachable, ...) must
+    // never take down the whole daemon -- `proxy::run`/`api::run` run
+    // alongside this in `main.rs`'s `tokio::try_join!`, and an `Err`
+    // from any one of them cancels the others too. Plain HTTP/TCP/UDP
+    // hosts with `acme_enabled = false` have nothing to do with ACME
+    // at all and must keep working regardless of this loop's state.
+    let client = loop {
+        match init_acme_client(&state).await {
+            Ok(client) => break client,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "ACME account setup failed -- certificates for ACME-enabled hosts won't be issued until this is fixed; retrying in {}s",
+                    ACME_INIT_RETRY_INTERVAL.as_secs()
+                );
+                tokio::time::sleep(ACME_INIT_RETRY_INTERVAL).await;
+            }
+        }
     };
 
     loop {
@@ -214,6 +239,13 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
         }
         tokio::time::sleep(RENEWAL_CHECK_INTERVAL).await;
     }
+}
+
+async fn init_acme_client(state: &AppState) -> Result<AcmeClient, IssuanceError> {
+    let account_key = AccountKey::load_or_generate(&state.acme().account_key_path)?;
+    let client = AcmeClient::new(&state.acme().directory_url, account_key).await?;
+    client.new_account(&state.acme().contact_email).await?;
+    Ok(client)
 }
 
 async fn renew_if_needed(
@@ -232,4 +264,75 @@ async fn renew_if_needed(
     }
     tracing::info!(domain = %host.domain, "issuing/renewing certificate");
     issue_certificate(state, client, dns01, &host.domain).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig};
+    use std::path::PathBuf;
+    use wiremock::MockServer;
+
+    async fn test_state(directory_url: String) -> AppState {
+        let tmp = std::env::temp_dir().join(format!("rust-proxy-acme-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = Config {
+            network: NetworkConfig { bind_ranges: vec![] },
+            admin: AdminConfig {
+                bind_ip: "127.0.0.1".parse().unwrap(),
+                bind_port: 8080,
+                allowed_ips: vec![],
+                session_secret: "test-secret".into(),
+                admin_username: "admin".into(),
+                admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                db_path: PathBuf::from(":memory:"),
+            },
+            acme: AcmeConfig {
+                directory_url,
+                contact_email: "".into(), // deliberately blank, like an unconfigured install
+                dns_provider: DnsProviderKind::Cloudflare,
+                dns_api_token: "".into(),
+                cert_dir: tmp.join("certs"),
+                account_key_path: tmp.join("account.key"),
+                renew_before_days: 30,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+        };
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        AppState::new(cfg, pool, vec![], vec![])
+    }
+
+    // The bug this guards against: a blank/invalid `acme.contact_email`
+    // or `dns_api_token` (a real, supported "haven't set up ACME yet"
+    // state -- see deploy/debian/postinst) used to propagate an `Err`
+    // straight out of `run_renewal_loop`, which -- via `main.rs`'s
+    // `tokio::try_join!` -- took the *entire* daemon down with it,
+    // including the proxy data plane and admin API, neither of which
+    // have anything to do with ACME. Found by actually running a
+    // freshly-generated, ACME-unconfigured config.toml through the
+    // real binary while building the .deb packaging, not by reasoning
+    // about the code in the abstract.
+    #[tokio::test]
+    async fn acme_setup_failure_does_not_return_an_error_from_the_renewal_loop() {
+        // A MockServer with no mounted mocks 404s any request, so the
+        // directory fetch inside `init_acme_client` fails every time --
+        // exactly the "ACME isn't usable yet" condition this test cares
+        // about, without needing to model why (many real causes: blank
+        // contact_email, blank/invalid dns_api_token, Let's Encrypt
+        // itself unreachable -- all end up here as an `Err` from
+        // `init_acme_client`).
+        let server = MockServer::start().await;
+        let state = test_state(format!("{}/directory", server.uri())).await;
+
+        let handle = tokio::spawn(run_renewal_loop(state));
+
+        // `run_renewal_loop` should still be in its retry-sleep, not
+        // resolved, well before `ACME_INIT_RETRY_INTERVAL` (5 minutes)
+        // -- if it had returned (crashing the real daemon's
+        // `try_join!`), this `timeout` would see the task finish
+        // immediately instead of timing out.
+        let result = tokio::time::timeout(Duration::from_millis(300), handle).await;
+        assert!(result.is_err(), "run_renewal_loop returned instead of retrying -- this would crash the whole daemon");
+    }
 }

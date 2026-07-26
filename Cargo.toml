@@ -60,3 +60,25 @@ clap = { version = "4", features = ["derive"] }
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
+
+[package.metadata.deb]
+maintainer = "Jeff Parrish PC Services <https://www.jpps.us>"
+copyright = "2026, Jeff Parrish PC Services"
+section = "net"
+priority = "optional"
+extended-description = """\
+A lightweight L7 reverse proxy daemon: HTTP/WebSocket reverse proxying \
+with SNI-based TLS, a native RFC 8555 ACME client (dns-01 via a \
+pluggable DNS provider -- Cloudflare, DigitalOcean, or Hetzner), \
+dynamic default-DROP nftables firewall orchestration, arbitrary \
+TCP/UDP port passthrough, and a small embedded web admin UI with a \
+REST API (session or bearer-token auth). Built as an open, \
+self-hostable alternative to Nginx Proxy Manager. See README.md."""
+assets = [
+    ["target/release/rust-proxy", "usr/bin/", "755"],
+    ["deploy/rust-proxy.service", "lib/systemd/system/", "644"],
+    ["deploy/config.toml.example", "usr/share/doc/rust-proxy/", "644"],
+    ["README.md", "usr/share/doc/rust-proxy/", "644"],
+    ["LICENSE", "usr/share/doc/rust-proxy/", "644"],
+]
+maintainer-scripts = "deploy/debian/"

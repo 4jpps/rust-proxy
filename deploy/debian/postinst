@@ -1,0 +1,218 @@
+#!/bin/sh
+# postinst -- creates the system user, and on first install (only),
+# either interactively prompts for initial configuration (when run
+# from a real terminal) or generates safe random secrets and prints
+# the admin password once (when run non-interactively, e.g. `apt-get
+# install -y` in a script). Either way the service ends up with a
+# real config.toml -- a random session_secret, a real argon2 password
+# hash (via the just-installed binary's own `hash-password`
+# subcommand) -- before it's ever started, never a fixed placeholder
+# left running.
+#
+# Not full debconf integration -- same deliberate simplification as
+# jpps/store's postinst (see that project's CLAUDE.md's Packaging
+# section for the tradeoff), just adapted for a TOML config file
+# instead of an env file.
+set -e
+
+CONFIG_DIR=/etc/rust-proxy
+CONFIG_FILE=$CONFIG_DIR/config.toml
+STATE_DIR=/var/lib/rust-proxy
+
+random_secret() {
+    # 32 bytes of real randomness, hex-encoded -- session_secret and
+    # the auto-generated admin password both need this. /dev/urandom
+    # is always present, so this doesn't depend on openssl/pwgen
+    # being installed just for this one step.
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
+}
+
+# Already configured (from a previous install, or a previous run of
+# this same postinst) simply if config.toml already exists -- this
+# script only ever writes it with a real, freshly-generated
+# session_secret/admin_password_hash, never a placeholder, so its mere
+# presence means setup already happened. An upgrade or `apt install
+# --reinstall` must never re-prompt or clobber an operator's existing
+# config (rotating session_secret would log every admin session out;
+# rust-proxy's actual hosts/port_rules/api_tokens live in sqlite by
+# then anyway -- config.toml only matters for bootstrap).
+already_configured() {
+    [ -f "$CONFIG_FILE" ]
+}
+
+prompt() {
+    # $1 = prompt text, $2 = default (may be empty). Echoes the answer
+    # (or the default, if the operator just pressed Enter) to stdout.
+    printf '%s' "$1" > /dev/tty
+    if [ -n "$2" ]; then
+        printf ' [%s]' "$2" > /dev/tty
+    fi
+    printf ': ' > /dev/tty
+    answer=""
+    read -r answer < /dev/tty || true
+    if [ -z "$answer" ]; then
+        answer="$2"
+    fi
+    printf '%s' "$answer"
+}
+
+prompt_hidden() {
+    # Same as prompt(), but doesn't echo what's typed. $2 = default
+    # (may be empty, unlike the admin password itself which loops
+    # until non-empty -- see prompt_password below).
+    answer=""
+    printf '%s: ' "$1" > /dev/tty
+    stty -echo < /dev/tty
+    read -r answer < /dev/tty || true
+    stty echo < /dev/tty
+    printf '\n' > /dev/tty
+    if [ -z "$answer" ]; then
+        answer="$2"
+    fi
+    printf '%s' "$answer"
+}
+
+prompt_password() {
+    answer=""
+    while [ -z "$answer" ]; do
+        printf '%s: ' "$1" > /dev/tty
+        stty -echo < /dev/tty
+        read -r answer < /dev/tty || true
+        stty echo < /dev/tty
+        printf '\n' > /dev/tty
+        if [ -z "$answer" ]; then
+            printf 'Can'"'"'t be blank.\n' > /dev/tty
+        fi
+    done
+    printf '%s' "$answer"
+}
+
+interactive_setup() {
+    echo "" > /dev/tty
+    echo "rust-proxy: first-time setup" > /dev/tty
+    echo "-----------------------------------" > /dev/tty
+    echo "Leave the DNS provider fields blank to skip ACME for now --" > /dev/tty
+    echo "the proxy still works for plain HTTP/TCP/UDP hosts without it," > /dev/tty
+    echo "you just can't issue certs until config.toml is edited later." > /dev/tty
+    echo "" > /dev/tty
+
+    admin_bind_ip=$(prompt "Admin UI bind IP" "127.0.0.1")
+    admin_bind_port=$(prompt "Admin UI bind port" "8080")
+    admin_username=$(prompt "Admin username" "admin")
+    admin_password=$(prompt_password "Admin password")
+
+    contact_email=$(prompt "Contact email for Let's Encrypt account registration" "")
+    dns_provider=$(prompt "DNS provider for ACME dns-01 (cloudflare/digitalocean/hetzner)" "cloudflare")
+    dns_api_token=$(prompt_hidden "DNS provider API token (blank to configure later)" "")
+
+    session_secret=$(random_secret)
+    admin_password_hash=$(/usr/bin/rust-proxy hash-password "$admin_password")
+
+    write_config_file
+    echo "" > /dev/tty
+    echo "Configuration written to $CONFIG_FILE." > /dev/tty
+}
+
+noninteractive_setup() {
+    admin_bind_ip="127.0.0.1"
+    admin_bind_port="8080"
+    admin_username="admin"
+    admin_password=$(random_secret)
+    contact_email=""
+    dns_provider="cloudflare"
+    dns_api_token=""
+
+    session_secret=$(random_secret)
+    admin_password_hash=$(/usr/bin/rust-proxy hash-password "$admin_password")
+
+    write_config_file
+
+    echo "" >&2
+    echo "rust-proxy: no terminal available, generated a random admin password:" >&2
+    echo "" >&2
+    echo "    $admin_password" >&2
+    echo "" >&2
+    echo "Save this now -- it will not be shown again. The admin UI is bound to" >&2
+    echo "127.0.0.1:8080 until you edit $CONFIG_FILE (ACME/DNS provider fields" >&2
+    echo "are also left blank), then \`systemctl restart rust-proxy\`." >&2
+    echo "" >&2
+}
+
+write_config_file() {
+    umask 077
+    {
+        echo "[network]"
+        echo "# Empty by default -- unrestricted, bind to whatever this host has."
+        echo "# bind_ranges = [\"10.0.0.0/29\"]"
+        echo ""
+        echo "[admin]"
+        echo "bind_ip = \"$admin_bind_ip\""
+        echo "bind_port = $admin_bind_port"
+        echo "# Only these source IPs/CIDRs may reach the admin UI -- empty means"
+        echo "# loopback-only, enforced by nftables (see README's Configuration)."
+        echo "allowed_ips = []"
+        echo "session_secret = \"$session_secret\""
+        echo "admin_username = \"$admin_username\""
+        echo "admin_password_hash = \"$admin_password_hash\""
+        echo "db_path = \"$STATE_DIR/rust-proxy.db\""
+        echo ""
+        echo "[acme]"
+        echo "contact_email = \"$contact_email\""
+        echo "dns_provider = \"$dns_provider\""
+        echo "dns_api_token = \"$dns_api_token\""
+        # config.rs's own defaults for these two are under /etc/rust-proxy,
+        # which this script deliberately keeps read-only (750) to the
+        # rust-proxy group -- overriding both here to live under
+        # $STATE_DIR keeps every piece of mutable runtime state (sqlite
+        # db, issued certs, the ACME account key) together under the
+        # one directory the daemon actually owns and can write to.
+        echo "cert_dir = \"$STATE_DIR/certs\""
+        echo "account_key_path = \"$STATE_DIR/acme-account.key\""
+    } > "$CONFIG_FILE"
+}
+
+case "$1" in
+configure)
+    if ! getent passwd rust-proxy >/dev/null; then
+        adduser --system --group --no-create-home --home "$STATE_DIR" rust-proxy
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    # Group rust-proxy, not root -- the daemon runs as user rust-proxy
+    # (group rust-proxy) and needs to traverse this directory to open
+    # config.toml at all. Caught by actually running the generated
+    # config through the real binary during development: with this
+    # directory group-owned by root instead, the service can't even
+    # read its own config file, let alone the cert files below.
+    chown root:rust-proxy "$CONFIG_DIR"
+    chmod 750 "$CONFIG_DIR"
+    mkdir -p "$STATE_DIR"
+    chown rust-proxy:rust-proxy "$STATE_DIR"
+
+    if already_configured; then
+        echo "rust-proxy: existing configuration in $CONFIG_FILE left untouched."
+    else
+        if [ -t 0 ] && [ -r /dev/tty ]; then
+            interactive_setup
+        else
+            noninteractive_setup
+        fi
+    fi
+
+    chown root:rust-proxy "$CONFIG_FILE"
+    chmod 640 "$CONFIG_FILE"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+        systemctl enable rust-proxy || true
+        # `restart`, not `enable --now` -- starts a stopped unit on a
+        # fresh install *and* reloads a running one onto the new
+        # binary on an upgrade (`enable --now` only does the former;
+        # jpps/store's postinst found this the hard way, see its
+        # CLAUDE.md).
+        systemctl restart rust-proxy || true
+    fi
+    ;;
+esac
+
+exit 0

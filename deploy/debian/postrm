@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+purge)
+    deluser --system rust-proxy >/dev/null 2>&1 || true
+    rm -rf /etc/rust-proxy
+    # /var/lib/rust-proxy (sqlite DB -- hosts/port rules/API tokens --
+    # plus issued certs) is deliberately left in place even on purge,
+    # same choice jpps/store's postrm makes for its own database:
+    # losing config.toml's secrets on purge is fine (they're
+    # regenerated on reinstall), losing every issued cert and the
+    # admin's configured hosts/firewall rules without being asked to
+    # is not. Remove it by hand (`rm -rf /var/lib/rust-proxy`) if you
+    # really want a clean slate.
+    ;;
+esac
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

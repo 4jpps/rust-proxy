@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+remove|deconfigure)
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop rust-proxy >/dev/null 2>&1 || true
+    fi
+    # The daemon manages a default-DROP inbound nftables table
+    # (`inet rust_proxy`, see src/nftables/generator.rs) for as long as
+    # it's running -- with the process stopped and about to be
+    # uninstalled, nothing would ever update or remove that table
+    # again, potentially leaving the host locked down (including SSH,
+    # unless port 22 happened to have its own port_rule) with no way
+    # back in short of console access. Tear it down here, every time
+    # the package is removed (not just purged) -- restoring whatever
+    # firewall state existed before rust-proxy was installed matters
+    # more than preserving a ruleset nothing will manage anymore.
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet rust_proxy >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

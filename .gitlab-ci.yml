@@ -1,0 +1,138 @@
+# amd64-only .deb build, same shape as jpps/store's pipeline (see that
+# project's CLAUDE.md) -- one runner tag, cargo-deb, GitLab Release.
+# Unlike store, this project is PUBLIC, so it also publishes to the
+# shared self-hosted apt repo (repo.jpps.us) -- see the root CLAUDE.md's
+# "Publishing .deb builds to the shared apt repo" section, and
+# jpps/mlvpn-rs's .gitlab-ci.yml for the reference implementation this
+# was adapted from (testing_build_suffix / publish_to_apt_repo blocks).
+# No arm64/Windows/macOS targets yet -- deliberately deferred (Windows
+# and macOS need a Mac runner that doesn't exist yet).
+#
+#   - GL-Runner1, tag `linux`: shell executor, cargo-deb/mold/sccache
+#     already on PATH.
+#   - Push to a branch: `validate` only (build + test, no package).
+#   - Push a real vX.Y.Z tag: `package:amd64-deb` builds the .deb,
+#     publishes it to both this project's generic package registry and
+#     the public apt repo's `stable` sub-repo, and `release` attaches it
+#     to a GitLab Release.
+#   - A manual pipeline run on any other ref can also trigger
+#     `package:amd64-deb` (allow_failure so it never blocks/reds out a
+#     normal branch pipeline) -- publishes as a `~testingN`-suffixed
+#     build to the apt repo's `testing` sub-repo instead, for trying a
+#     packaging change without cutting a real release.
+
+stages:
+  - validate
+  - build
+  - release
+
+variables:
+  RUSTC_WRAPPER: sccache
+
+.on_branch_push: &on_branch_push
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+
+.package_rules: &package_rules
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+    - when: manual
+      allow_failure: true
+
+validate:
+  stage: validate
+  tags: [linux]
+  <<: *on_branch_push
+  variables:
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Clink-arg=-fuse-ld=mold
+  script:
+    - cargo build
+    - cargo test
+
+package:amd64-deb:
+  stage: build
+  tags: [linux]
+  <<: *package_rules
+  variables:
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Clink-arg=-fuse-ld=mold
+  script:
+    # Only a clean vX.Y.Z tag is a real release -- a manual run on any
+    # other ref (no tag, or a non-release tag) gets a `~testingN`
+    # suffix instead (dpkg's tilde sorts *before* nothing, so a real
+    # release always supersedes a leftover test build -- see root
+    # CLAUDE.md) and lands in the apt repo's `testing` sub-repo rather
+    # than `stable`.
+    - |
+      if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        DEB_REVISION_ARG=""
+        APT_DISTRIBUTION="stable"
+      else
+        echo "not a clean vX.Y.Z release tag -- building as a throwaway testing build (suffix: testing${CI_PIPELINE_IID})"
+        DEB_REVISION_ARG="--deb-revision=~testing${CI_PIPELINE_IID}"
+        APT_DISTRIBUTION="testing"
+      fi
+    - cargo build --release
+    # A leftover .deb from an earlier cached run on this runner (a
+    # previous testing build with a different suffix) would otherwise
+    # sit alongside the new one, and the ls-based rename below would
+    # silently pick up more than one file -- see root CLAUDE.md's
+    # apt-repo gotcha #2.
+    - rm -f target/debian/*.deb
+    - cargo deb --no-build ${DEB_REVISION_ARG}
+    - mv target/debian/*.deb rust-proxy-amd64.deb
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        curl --fail --silent --show-error \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file rust-proxy-amd64.deb \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rust-proxy/${CI_COMMIT_TAG}/rust-proxy-amd64.deb"
+      fi
+    - |
+      mkdir -p ~/.ssh
+      grep -qF "172.16.61.177 ssh-ed25519" ~/.ssh/known_hosts 2>/dev/null || \
+        echo "172.16.61.177 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJgzIRW9s8JQothWIuOYQ5XUrkNWsSeUiuzM473YswnW" >> ~/.ssh/known_hosts
+      cp "${APT_REPO_SSH_KEY}" ~/.ssh/apt_repo_key
+      chmod 600 ~/.ssh/apt_repo_key
+      scp -i ~/.ssh/apt_repo_key rust-proxy-amd64.deb "apt-publish@172.16.61.177:/tmp/rust-proxy-amd64.deb"
+      ssh -i ~/.ssh/apt_repo_key apt-publish@172.16.61.177 \
+        "/home/apt-publish/publish-to-apt-repo ${APT_DISTRIBUTION} /tmp/rust-proxy-amd64.deb && rm -f /tmp/rust-proxy-amd64.deb"
+  artifacts:
+    paths:
+      - rust-proxy-amd64.deb
+    expire_in: 30 days
+
+release:
+  stage: release
+  tags: [linux]
+  needs: [package:amd64-deb]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+  script:
+    - |
+      set -e
+      # CHANGELOG.md headers are "## [X.Y.Z] - date" (no leading "v",
+      # unlike the git tag) -- pull the body between this version's
+      # heading and the next one, so the Release description isn't
+      # just a bare file list.
+      VERSION="${CI_COMMIT_TAG#v}"
+      NOTES=$(awk -v ver="$VERSION" '
+        /^## \[/ {
+          if (found) exit
+          if ($0 ~ "\\[" ver "\\]") { found=1; next }
+          next
+        }
+        found { print }
+      ' CHANGELOG.md)
+      if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
+        NOTES="(no CHANGELOG.md entry found for $VERSION)"
+      fi
+      PKG_URL="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/rust-proxy/$CI_COMMIT_TAG/rust-proxy-amd64.deb"
+      ASSETS=$(jq -n --arg url "$PKG_URL" '{links: [{name: "Linux amd64 .deb", url: $url, link_type: "package"}]}')
+      curl --fail --silent --show-error \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "$(jq -n --arg tag "$CI_COMMIT_TAG" --arg notes "$NOTES" --argjson assets "$ASSETS" \
+                    '{name: ("rust-proxy " + $tag), tag_name: $tag, description: $notes, assets: $assets}')" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
