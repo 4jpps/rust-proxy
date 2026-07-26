@@ -10,6 +10,7 @@
 //! rule) causes a listener to start or stop, so unrelated connections are
 //! never dropped.
 
+pub mod access;
 pub mod http;
 pub mod passthrough;
 pub mod router;
@@ -123,12 +124,20 @@ fn spawn_https_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> J
         let acceptor = TlsAcceptor::from(Arc::new(build_https_server_config(state.clone())));
 
         loop {
-            let (stream, _peer) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(err) => {
                     tracing::warn!(error = %err, "https listener accept failed");
                     continue;
                 }
+            };
+            // The listener only ever binds an IPv4 `bind_ip`, so `peer`
+            // is always `V4` in practice; `UNSPECIFIED` is an unreachable
+            // fallback that fails closed (matches no `access_allow_ips`
+            // range) rather than panicking.
+            let peer_ip = match peer.ip() {
+                std::net::IpAddr::V4(v4) => v4,
+                std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
             };
             let acceptor = acceptor.clone();
             let state = state.clone();
@@ -145,7 +154,7 @@ fn spawn_https_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> J
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let sni = sni.clone();
-                    async move { handle_https_request(state, bind_ip, bind_port, sni, req).await }
+                    async move { handle_https_request(state, bind_ip, bind_port, peer_ip, sni, req).await }
                 });
                 // `auto::Builder` sniffs the connection preface to pick
                 // HTTP/1 vs HTTP/2 per-connection -- ALPN already steered
@@ -187,6 +196,7 @@ async fn handle_https_request(
     state: AppState,
     bind_ip: Ipv4Addr,
     bind_port: u16,
+    peer_ip: Ipv4Addr,
     sni: Option<String>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
@@ -205,6 +215,15 @@ async fn handle_https_request(
     let Some(host) = matched else {
         return Ok(not_found());
     };
+
+    if !access::ip_allowed(&host.access_allow_ips, peer_ip) {
+        return Ok(forbidden());
+    }
+    let auth_header = req.headers().get(hyper::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    if !access::check_basic_auth(&host.access_basic_auth, auth_header) {
+        return Ok(unauthorized(&host.domain));
+    }
+
     let Ok(upstream) = resolve_upstream(&host.upstream) else {
         return Ok(bad_gateway());
     };
@@ -313,10 +332,29 @@ fn bad_gateway() -> Response<BoxBody<Bytes, hyper::Error>> {
         .expect("static response is always valid")
 }
 
+fn forbidden() -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(hyper::StatusCode::FORBIDDEN)
+        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static response is always valid")
+}
+
+/// `WWW-Authenticate` prompts a browser's own login dialog, same as any
+/// server enforcing Basic Auth directly. `realm` is the domain rather
+/// than a fixed string so a client juggling multiple protected hosts
+/// through this proxy sees which one it's authenticating against.
+fn unauthorized(realm: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(hyper::StatusCode::UNAUTHORIZED)
+        .header(hyper::header::WWW_AUTHENTICATE, format!("Basic realm=\"{realm}\""))
+        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static response is always valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig, PortRule, Protocol};
+    use crate::config::{AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig, PortRule, ProxyHost, Protocol};
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::{DigitallySignedStruct, SignatureScheme};
     use rustls_pki_types::{CertificateDer, ServerName as RustlsServerName, UnixTime};
@@ -392,6 +430,149 @@ mod tests {
             entry
         });
         state
+    }
+
+    async fn test_state_with_host(host: ProxyHost) -> AppState {
+        let state = test_state_with_cert(&host.domain).await;
+        state.set_hosts(vec![host]);
+        state
+    }
+
+    fn access_host(domain: &str, access_allow_ips: Vec<ipnet::Ipv4Net>, access_basic_auth: Option<crate::config::BasicAuth>) -> ProxyHost {
+        ProxyHost {
+            id: Uuid::new_v4(),
+            domain: domain.into(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_port: 443,
+            upstream: "127.0.0.1:1".into(),
+            websockets: false,
+            force_https: false,
+            acme_enabled: false,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            access_allow_ips,
+            access_basic_auth,
+            enabled: true,
+        }
+    }
+
+    /// Drives `handle_https_request` through a real loopback HTTP/1.1
+    /// connection (same shape as `proxy::http`'s own
+    /// `forward_http_proxies_a_real_request_to_a_loopback_upstream` test)
+    /// rather than fabricating a `Request<Incoming>` -- `Incoming` is a
+    /// real hyper body type tied to an actual connection, so there's no
+    /// safe way to construct one without a real client/server round trip.
+    async fn send_test_request(
+        state: AppState,
+        bind_ip: Ipv4Addr,
+        bind_port: u16,
+        peer_ip: Ipv4Addr,
+        sni: Option<String>,
+        auth_header: Option<String>,
+    ) -> Response<Incoming> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let state = state.clone();
+                let sni = sni.clone();
+                async move { handle_https_request(state, bind_ip, bind_port, peer_ip, sni, req).await }
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+
+        let mut builder = Request::builder().uri("/");
+        if let Some(value) = auth_header {
+            builder = builder.header(hyper::header::AUTHORIZATION, value);
+        }
+        let req = builder.body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        sender.send_request(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_from_an_ip_outside_the_allow_list_is_forbidden() {
+        let state = test_state_with_host(access_host("example.com", vec!["192.168.1.0/24".parse().unwrap()], None)).await;
+        let resp = send_test_request(
+            state,
+            "10.0.0.2".parse().unwrap(),
+            443,
+            "203.0.113.7".parse().unwrap(),
+            Some("example.com".to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn request_from_an_allowed_ip_without_basic_auth_configured_is_not_blocked() {
+        let state = test_state_with_host(access_host("example.com", vec!["10.0.0.0/24".parse().unwrap()], None)).await;
+        let resp = send_test_request(
+            state,
+            "10.0.0.2".parse().unwrap(),
+            443,
+            "10.0.0.42".parse().unwrap(),
+            Some("example.com".to_string()),
+            None,
+        )
+        .await;
+        // Upstream is unreachable (127.0.0.1:1) so this proves access
+        // control let the request through, not that it fully succeeded.
+        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn request_without_credentials_is_challenged_when_basic_auth_is_configured() {
+        let auth = crate::config::BasicAuth {
+            username: "viewer".into(),
+            password_hash: crate::api::auth::hash_password("s3cret").unwrap(),
+        };
+        let state = test_state_with_host(access_host("example.com", vec![], Some(auth))).await;
+        let resp = send_test_request(
+            state,
+            "10.0.0.2".parse().unwrap(),
+            443,
+            "203.0.113.7".parse().unwrap(),
+            Some("example.com".to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(hyper::header::WWW_AUTHENTICATE).unwrap(),
+            "Basic realm=\"example.com\""
+        );
+    }
+
+    #[tokio::test]
+    async fn request_with_correct_basic_auth_credentials_passes_through_to_the_upstream_lookup() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let auth = crate::config::BasicAuth {
+            username: "viewer".into(),
+            password_hash: crate::api::auth::hash_password("s3cret").unwrap(),
+        };
+        let state = test_state_with_host(access_host("example.com", vec![], Some(auth))).await;
+        let header = format!("Basic {}", STANDARD.encode("viewer:s3cret"));
+        let resp = send_test_request(
+            state,
+            "10.0.0.2".parse().unwrap(),
+            443,
+            "203.0.113.7".parse().unwrap(),
+            Some("example.com".to_string()),
+            Some(header),
+        )
+        .await;
+        // Upstream is unreachable (127.0.0.1:1) so this proves the
+        // credentials cleared access control, not that it fully succeeded.
+        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
     }
 
     /// A test-only "trust anything" verifier -- the self-signed cert

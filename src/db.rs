@@ -15,7 +15,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::config::{AcmeChallengeType, PortRule, Protocol, ProxyHost};
+use crate::config::{AcmeChallengeType, BasicAuth, PortRule, Protocol, ProxyHost};
 
 pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let url = if db_path.as_os_str() == ":memory:" {
@@ -45,20 +45,25 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             force_https INTEGER NOT NULL,
             acme_enabled INTEGER NOT NULL,
             acme_challenge_type TEXT NOT NULL DEFAULT 'auto',
+            access_allow_ips TEXT NOT NULL DEFAULT '',
+            access_basic_auth_username TEXT,
+            access_basic_auth_password_hash TEXT,
             enabled INTEGER NOT NULL
         )
         "#,
     )
     .execute(pool)
     .await?;
-    // A pre-existing `hosts` table (from before `acme_challenge_type`
-    // existed) won't have this column -- `CREATE TABLE IF NOT EXISTS`
-    // only runs for a brand-new database, so an upgrade needs its own
-    // `ALTER TABLE`. Ignore the error when the column's already there
-    // (sqlite has no `ADD COLUMN IF NOT EXISTS`); the `DEFAULT 'auto'`
-    // above only applies to genuinely new tables, so this also backfills
-    // existing rows to the same default.
+    // A pre-existing `hosts` table (from before these columns existed)
+    // won't have them -- `CREATE TABLE IF NOT EXISTS` only runs for a
+    // brand-new database, so an upgrade needs its own `ALTER TABLE`s.
+    // Ignore the error when a column's already there (sqlite has no
+    // `ADD COLUMN IF NOT EXISTS`); the defaults above only apply to
+    // genuinely new tables, so this also backfills existing rows.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acme_challenge_type TEXT NOT NULL DEFAULT 'auto'").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_allow_ips TEXT NOT NULL DEFAULT ''").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_basic_auth_username TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_basic_auth_password_hash TEXT").execute(pool).await;
 
     sqlx::query(
         r#"
@@ -169,7 +174,8 @@ fn parse_rfc3339(s: &str) -> DateTime<Utc> {
 
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, enabled FROM hosts",
+        "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, \
+         access_allow_ips, access_basic_auth_username, access_basic_auth_password_hash, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -179,6 +185,19 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 "http01" => AcmeChallengeType::Http01,
                 "dns01" => AcmeChallengeType::Dns01,
                 _ => AcmeChallengeType::Auto,
+            };
+            let access_allow_ips = row
+                .get::<String, _>("access_allow_ips")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let access_basic_auth = match (
+                row.get::<Option<String>, _>("access_basic_auth_username"),
+                row.get::<Option<String>, _>("access_basic_auth_password_hash"),
+            ) {
+                (Some(username), Some(password_hash)) => Some(BasicAuth { username, password_hash }),
+                _ => None,
             };
             Ok(ProxyHost {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
@@ -190,6 +209,8 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 force_https: row.get::<i64, _>("force_https") != 0,
                 acme_enabled: row.get::<i64, _>("acme_enabled") != 0,
                 acme_challenge_type: challenge_type,
+                access_allow_ips,
+                access_basic_auth,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -205,8 +226,15 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             AcmeChallengeType::Http01 => "http01",
             AcmeChallengeType::Dns01 => "dns01",
         };
+        let access_allow_ips = h.access_allow_ips.iter().map(|net| net.to_string()).collect::<Vec<_>>().join(",");
+        let (basic_auth_username, basic_auth_password_hash) = match &h.access_basic_auth {
+            Some(auth) => (Some(auth.username.as_str()), Some(auth.password_hash.as_str())),
+            None => (None, None),
+        };
         sqlx::query(
-            "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, \
+             acme_challenge_type, access_allow_ips, access_basic_auth_username, access_basic_auth_password_hash, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -217,6 +245,9 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.force_https as i64)
         .bind(h.acme_enabled as i64)
         .bind(challenge_type)
+        .bind(access_allow_ips)
+        .bind(basic_auth_username)
+        .bind(basic_auth_password_hash)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -294,6 +325,8 @@ mod tests {
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            access_allow_ips: vec![],
+            access_basic_auth: None,
             enabled: true,
         }
     }
@@ -322,6 +355,32 @@ mod tests {
         assert_eq!(loaded[0].domain, "example.com");
         assert_eq!(loaded[0].id, host.id);
         assert!(loaded[0].websockets);
+    }
+
+    #[tokio::test]
+    async fn access_control_fields_round_trip_through_sqlite() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.access_allow_ips = vec!["10.0.0.0/24".parse().unwrap(), "192.168.1.0/24".parse().unwrap()];
+        host.access_basic_auth = Some(crate::config::BasicAuth {
+            username: "viewer".into(),
+            password_hash: "$argon2id$fake$hash".into(),
+        });
+        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert_eq!(loaded[0].access_allow_ips, host.access_allow_ips);
+        assert_eq!(loaded[0].access_basic_auth, host.access_basic_auth);
+    }
+
+    #[tokio::test]
+    async fn access_control_fields_default_to_unrestricted_when_absent() {
+        let pool = memory_pool().await;
+        save_hosts(&pool, std::slice::from_ref(&sample_host())).await.unwrap();
+
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert!(loaded[0].access_allow_ips.is_empty());
+        assert!(loaded[0].access_basic_auth.is_none());
     }
 
     #[tokio::test]

@@ -185,8 +185,23 @@ struct HostRequest {
     acme_enabled: bool,
     #[serde(default)]
     acme_challenge_type: crate::config::AcmeChallengeType,
+    /// CIDR strings (e.g. `"10.0.0.0/24"`) -- empty means unrestricted.
+    /// Parsed and validated in `parse_access_allow_ips`.
+    #[serde(default)]
+    access_allow_ips: Vec<String>,
+    /// `None` means no Basic Auth gate. `password` is plaintext, hashed
+    /// server-side (`build_basic_auth`) before it ever reaches sqlite --
+    /// same as the admin account's own password, never stored raw.
+    #[serde(default)]
+    access_basic_auth: Option<BasicAuthRequest>,
     #[serde(default = "default_true")]
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct BasicAuthRequest {
+    username: String,
+    password: String,
 }
 fn default_true() -> bool {
     true
@@ -205,8 +220,32 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     Ok(())
 }
 
+fn parse_access_allow_ips(raw: &[String]) -> Result<Vec<ipnet::Ipv4Net>, ApiError> {
+    raw.iter()
+        .map(|s| s.parse().map_err(|_| ApiError::BadRequest(format!("invalid access_allow_ips entry \"{s}\""))))
+        .collect()
+}
+
+/// Hashes the plaintext password (argon2, same as the admin account's
+/// own) into a storable `BasicAuth` -- `None` in means no auth gate for
+/// this host, same as leaving `access_basic_auth` out of the request
+/// entirely.
+fn build_basic_auth(req: &Option<BasicAuthRequest>) -> Result<Option<crate::config::BasicAuth>, ApiError> {
+    let Some(req) = req else { return Ok(None) };
+    if req.username.trim().is_empty() || req.password.is_empty() {
+        return Err(ApiError::BadRequest("access_basic_auth requires a non-empty username and password".into()));
+    }
+    let password_hash = auth::hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Some(crate::config::BasicAuth {
+        username: req.username.clone(),
+        password_hash,
+    }))
+}
+
 async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest>) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
+    let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
+    let access_basic_auth = build_basic_auth(&body.access_basic_auth)?;
     let host = ProxyHost {
         id: Uuid::new_v4(),
         domain: body.domain,
@@ -217,6 +256,8 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,
         acme_challenge_type: body.acme_challenge_type,
+        access_allow_ips,
+        access_basic_auth,
         enabled: body.enabled,
     };
     let to_insert = host.clone();
@@ -234,6 +275,8 @@ async fn update_host(
     Json(body): Json<HostRequest>,
 ) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
+    let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
+    let access_basic_auth = build_basic_auth(&body.access_basic_auth)?;
     let updated = ProxyHost {
         id,
         domain: body.domain,
@@ -244,6 +287,8 @@ async fn update_host(
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,
         acme_challenge_type: body.acme_challenge_type,
+        access_allow_ips,
+        access_basic_auth,
         enabled: body.enabled,
     };
     let to_store = updated.clone();
@@ -665,6 +710,97 @@ mod tests {
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
                         r#"{"domain":"example.com","bind_ip":"192.168.1.5","bind_port":443,"upstream":"127.0.0.1:8000"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_host_with_access_control_persists_ip_allow_list_and_never_returns_the_password_hash() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_allow_ips":["10.0.0.0/24"],"access_basic_auth":{"username":"viewer","password":"s3cret"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let created = body_json(create_resp).await;
+        assert_eq!(created["access_allow_ips"], serde_json::json!(["10.0.0.0/24"]));
+        assert_eq!(created["access_basic_auth"]["username"], "viewer");
+        assert!(
+            created["access_basic_auth"].get("password_hash").is_none(),
+            "the argon2 hash must never be returned, even to an authenticated admin"
+        );
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/hosts")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["access_allow_ips"], serde_json::json!(["10.0.0.0/24"]));
+        assert_eq!(json[0]["access_basic_auth"]["username"], "viewer");
+    }
+
+    #[tokio::test]
+    async fn create_host_with_an_invalid_access_allow_ips_entry_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_allow_ips":["not-a-cidr"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_host_with_an_empty_basic_auth_password_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_basic_auth":{"username":"viewer","password":""}}"#,
                     ))
                     .unwrap(),
             )

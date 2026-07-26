@@ -42,7 +42,7 @@
 
   <h2>Proxy hosts</h2>
   <table id="hosts-table"><thead><tr>
-    <th>Domain</th><th>Bind</th><th>Upstream</th><th>WS</th><th>HTTPS redir</th><th>ACME</th><th>Challenge</th><th>Enabled</th><th></th>
+    <th>Domain</th><th>Bind</th><th>Upstream</th><th>WS</th><th>HTTPS redir</th><th>ACME</th><th>Challenge</th><th>Access</th><th>Enabled</th><th></th>
   </tr></thead><tbody></tbody></table>
   <form class="inline" id="host-form">
     <input type="text" name="domain" placeholder="domain" required>
@@ -57,6 +57,9 @@
       <option value="http01">http-01 (needs port 80 reachable, no DNS credentials)</option>
       <option value="dns01">dns-01 (needs a configured DNS provider)</option>
     </select>
+    <input type="text" name="access_allow_ips" placeholder="allowed IPs/CIDRs, comma-separated (optional)" title="Access list: IP allow list. Empty means unrestricted.">
+    <input type="text" name="access_basic_auth_username" placeholder="basic auth username (optional)">
+    <input type="password" name="access_basic_auth_password" placeholder="basic auth password">
     <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
     <button type="submit">Add host</button>
     <span class="error" id="host-error"></span>
@@ -155,9 +158,14 @@ async function refreshHosts() {
   tbody.innerHTML = '';
   for (const h of hosts) {
     const tr = document.createElement('tr');
+    const access = [
+      h.access_allow_ips && h.access_allow_ips.length ? `${h.access_allow_ips.length} IP range${h.access_allow_ips.length === 1 ? '' : 's'}` : '',
+      h.access_basic_auth ? `auth: ${h.access_basic_auth.username}` : '',
+    ].filter(Boolean).join(', ');
     tr.innerHTML = `<td>${h.domain}</td><td>${h.bind_ip}:${h.bind_port}</td><td>${h.upstream}</td>
       <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
       <td>${h.acme_challenge_type}</td>
+      <td>${access}</td>
       <td>${h.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${h.id}">Delete</button></td>`;
     tr.querySelector('button').addEventListener('click', async () => {
       await api(`/api/hosts/${h.id}`, { method: 'DELETE' });
@@ -170,11 +178,16 @@ async function refreshHosts() {
 document.getElementById('host-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
+  const allowIps = (fd.get('access_allow_ips') || '').split(',').map(s => s.trim()).filter(Boolean);
+  const authUsername = fd.get('access_basic_auth_username');
+  const authPassword = fd.get('access_basic_auth_password');
   const body = {
     domain: fd.get('domain'), bind_ip: fd.get('bind_ip'), bind_port: Number(fd.get('bind_port')),
     upstream: fd.get('upstream'), websockets: fd.get('websockets') === 'on',
     force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
     acme_challenge_type: fd.get('acme_challenge_type'),
+    access_allow_ips: allowIps,
+    access_basic_auth: authUsername ? { username: authUsername, password: authPassword } : null,
     enabled: fd.get('enabled') === 'on',
   };
   const resp = await api('/api/hosts', { method: 'POST', body: JSON.stringify(body) });

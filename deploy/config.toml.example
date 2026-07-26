@@ -58,6 +58,17 @@ dns_api_token = "your-dns-provider-api-token-with-dns-edit-scope"
 # to "http01" or "dns01" to override; wildcard domains always use
 # dns-01 regardless of this setting.
 # acme_challenge_type = "auto"
+# access_allow_ips restricts which client IPs may reach this host
+# (application layer, independent of the firewall) -- empty/omitted
+# means unrestricted.
+# access_allow_ips = ["10.0.0.0/24"]
+# access_basic_auth gates this host behind HTTP Basic Auth. password_hash
+# is an argon2 PHC string (generate with `rust-proxy hash-password`),
+# never a plaintext password -- omit this table entirely for no auth
+# gate.
+# [hosts.access_basic_auth]
+# username = "viewer"
+# password_hash = "$argon2id$v=19$..."
 # enabled = true
 
 # Example port rule -- RustDesk, forwarded from the /29 to a local

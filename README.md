@@ -55,6 +55,20 @@ never offer http-01 for a wildcard identifier. Choosing `http01`
 without `force_https` still opens a port-80 listener/firewall rule for
 that host, just to answer the challenge.
 
+Each host can also gate access at the application layer, independent of
+`network.bind_ranges` and the nftables firewall -- the same idea as
+Nginx Proxy Manager's own access lists:
+
+- `access_allow_ips`: a list of CIDRs (`"10.0.0.0/24"`) allowed to reach
+  this host. Empty (the default) means unrestricted; any other source
+  IP gets a 403 before the request ever reaches the upstream.
+- `access_basic_auth`: an optional `{"username", "password"}` gate,
+  checked after the IP allow list. The password is hashed (argon2)
+  server-side and never stored or returned in plaintext -- like every
+  other credential this daemon issues, it's client-authoritative on
+  each `POST`/`PUT`: leaving it out on an edit clears it, the same as
+  any other host field, there's no separate "leave unchanged" option.
+
 ## API
 
 Every route under `/api/*` except `/api/login`/`/api/logout` requires
@@ -108,7 +122,7 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 |--------|-------------------------|-------------------------------------------------------------------------------------------|
 | GET    | `/api/dashboard`        | -- (host/port-rule/cert counts, configured `bind_ranges`)                                 |
 | GET    | `/api/hosts`            | --                                                                                         |
-| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","enabled"}` |
+| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","access_allow_ips","access_basic_auth","enabled"}` |
 | PUT    | `/api/hosts/:id`        | same shape as POST                                                                         |
 | DELETE | `/api/hosts/:id`        | --                                                                                         |
 | GET    | `/api/port-rules`       | --                                                                                         |
@@ -155,8 +169,9 @@ for the token-authenticated API.
   re-issues anything within `acme.renew_before_days` of expiry.
 - `proxy` -- the data plane: `router` (pure host-matching), `tls`
   (SNI cert dispatch reading live state), `http` (forwarding +
-  WebSocket upgrade passthrough), `passthrough` (raw TCP/UDP for
-  non-HTTP port rules). ALPN offers `h2` then `http/1.1`; the HTTPS
+  WebSocket upgrade passthrough), `access` (pure IP-allow-list/Basic-Auth
+  checks, run before a matched request is forwarded), `passthrough` (raw
+  TCP/UDP for non-HTTP port rules). ALPN offers `h2` then `http/1.1`; the HTTPS
   listener uses `hyper-util`'s auto builder to actually speak whichever
   one a client negotiates, with HTTP/1 upgrades (what WebSocket
   passthrough needs) still enabled. Deliberately doesn't enable HTTP/2

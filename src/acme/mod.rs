@@ -378,6 +378,8 @@ mod tests {
             force_https,
             acme_enabled: true,
             acme_challenge_type: challenge_type,
+            access_allow_ips: vec![],
+            access_basic_auth: None,
             enabled: true,
         }
     }
