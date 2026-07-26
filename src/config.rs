@@ -34,9 +34,17 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    /// The LXC's assigned /29 (or other) subnet. Every `bind_ip` used by a
-    /// host or port rule must fall inside this network.
-    pub subnet: Ipv4Net,
+    /// IP ranges every `bind_ip` (admin UI, a host, or a port rule) must
+    /// fall inside. Empty (the default) means unrestricted -- bind to
+    /// whatever address the environment actually has: a single
+    /// dedicated IP, a full LXC /29 block, several disjoint ranges,
+    /// whatever's available. Populating this is opt-in hardening for
+    /// anyone who *does* know their exact range ahead of time (e.g. a
+    /// dedicated LXC subnet) and wants a bind_ip typo caught at
+    /// config-validation time instead of silently failing to bind at
+    /// runtime -- not something every deployment needs to think about.
+    #[serde(default)]
+    pub bind_ranges: Vec<Ipv4Net>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,12 +168,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.network.subnet.contains(&self.admin.bind_ip) {
-            return Err(ConfigError::Validation(format!(
-                "admin.bind_ip {} is not inside network.subnet {}",
-                self.admin.bind_ip, self.network.subnet
-            )));
-        }
+        validate_bind_ip(&self.network.bind_ranges, self.admin.bind_ip, "admin")?;
         if self.admin.session_secret.trim().is_empty() {
             return Err(ConfigError::Validation("admin.session_secret must not be empty".into()));
         }
@@ -186,7 +189,7 @@ impl Config {
         let mut seen_host_domains: Vec<(Ipv4Addr, u16, String)> = Vec::new();
 
         for host in &self.hosts {
-            validate_bind_ip(&self.network.subnet, host.bind_ip, "hosts")?;
+            validate_bind_ip(&self.network.bind_ranges, host.bind_ip, "hosts")?;
             validate_port(host.bind_port, "hosts.bind_port")?;
             validate_domain(&host.domain)?;
             if host.upstream.trim().is_empty() || !host.upstream.contains(':') {
@@ -212,7 +215,7 @@ impl Config {
         }
 
         for rule in &self.port_rules {
-            validate_bind_ip(&self.network.subnet, rule.bind_ip, "port_rules")?;
+            validate_bind_ip(&self.network.bind_ranges, rule.bind_ip, "port_rules")?;
             validate_port(rule.port_start, "port_rules.port_start")?;
             validate_port(rule.port_end, "port_rules.port_end")?;
             if rule.port_start > rule.port_end {
@@ -257,10 +260,15 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), ConfigError> {
     }
 }
 
-fn validate_bind_ip(subnet: &Ipv4Net, ip: Ipv4Addr, ctx: &str) -> Result<(), ConfigError> {
-    if !subnet.contains(&ip) {
+pub(crate) fn validate_bind_ip(allowed: &[Ipv4Net], ip: Ipv4Addr, ctx: &str) -> Result<(), ConfigError> {
+    if allowed.is_empty() {
+        // Unrestricted -- no configured ranges to check against.
+        return Ok(());
+    }
+    if !allowed.iter().any(|net| net.contains(&ip)) {
+        let ranges = allowed.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
         return Err(ConfigError::Validation(format!(
-            "{ctx} bind_ip {ip} is not inside network.subnet {subnet}"
+            "{ctx} bind_ip {ip} is not inside any of network.bind_ranges ({ranges})"
         )));
     }
     Ok(())
@@ -280,7 +288,7 @@ mod tests {
     fn base_toml() -> String {
         r#"
 [network]
-subnet = "10.0.0.0/29"
+bind_ranges = ["10.0.0.0/29"]
 
 [admin]
 bind_ip = "10.0.0.1"
@@ -325,6 +333,48 @@ cloudflare_api_token = "token-placeholder"
         let toml_str = base_toml().replace("10.0.0.0/29", "not-a-cidr");
         let result: Result<Config, _> = toml::from_str(&toml_str);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_bind_ranges_means_unrestricted() {
+        // The flexible default: no configured ranges at all means any
+        // bind_ip is accepted, for environments that don't have (or
+        // don't want to think about) a dedicated block up front.
+        let toml_str = base_toml().replace(r#"bind_ranges = ["10.0.0.0/29"]"#, "").replace("10.0.0.1", "203.0.113.7");
+        let mut cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        assert!(cfg.network.bind_ranges.is_empty());
+        assert!(cfg.validate().is_ok());
+
+        cfg.hosts.push(ProxyHost {
+            id: Uuid::new_v4(),
+            domain: "example.com".into(),
+            bind_ip: "198.51.100.9".parse().unwrap(),
+            bind_port: 443,
+            upstream: "127.0.0.1:9000".into(),
+            websockets: false,
+            force_https: true,
+            acme_enabled: true,
+            enabled: true,
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn bind_ranges_may_be_multiple_disjoint_ranges() {
+        let toml_str = base_toml().replace(r#"bind_ranges = ["10.0.0.0/29"]"#, r#"bind_ranges = ["10.0.0.0/29", "192.168.1.0/24"]"#);
+        let mut cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        cfg.hosts.push(ProxyHost {
+            id: Uuid::new_v4(),
+            domain: "example.com".into(),
+            bind_ip: "192.168.1.50".parse().unwrap(),
+            bind_port: 443,
+            upstream: "127.0.0.1:9000".into(),
+            websockets: false,
+            force_https: true,
+            acme_enabled: true,
+            enabled: true,
+        });
+        assert!(cfg.validate().is_ok(), "bind_ip in the second range should be accepted");
     }
 
     #[test]

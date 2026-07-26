@@ -6,9 +6,11 @@
 # http://<admin.bind_ip>:<admin.bind_port>/, not by re-editing this file.
 
 [network]
-# The LXC's assigned subnet. Every bind_ip used anywhere below must fall
-# inside this range.
-subnet = "10.0.0.0/29"
+# Optional, empty by default -- unrestricted, bind to whatever address
+# this environment actually has (a single IP, a full subnet block,
+# several disjoint ranges). Populate this only if you want a bind_ip
+# typo caught at config-validation time; can list more than one range.
+# bind_ranges = ["10.0.0.0/29"]
 
 [admin]
 bind_ip = "10.0.0.1"

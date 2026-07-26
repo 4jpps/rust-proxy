@@ -1,10 +1,12 @@
 # rust-proxy
 
-A lightweight L7 reverse proxy daemon in Rust for an LXC container with
-a dedicated `/29` IPv4 block: HTTP/WebSocket reverse proxying with
-SNI-based TLS, a native RFC 8555 ACME client (dns-01 via Cloudflare),
-dynamic default-DROP nftables firewall orchestration, arbitrary
-TCP/UDP port passthrough, and a small embedded web admin UI.
+A lightweight L7 reverse proxy daemon in Rust, built as an open,
+self-hostable alternative to Nginx Proxy Manager: HTTP/WebSocket reverse
+proxying with SNI-based TLS, a native RFC 8555 ACME client (dns-01 via a
+pluggable DNS provider), dynamic default-DROP nftables firewall
+orchestration, arbitrary TCP/UDP port passthrough, and a small embedded
+web admin UI. Runs on anything from a single dedicated IP to a full
+subnet block -- see Configuration below.
 
 ## Building and testing
 
@@ -22,8 +24,12 @@ persistence tests run against an in-memory sqlite database.
 Copy `deploy/config.toml.example` to `/etc/rust-proxy/config.toml` and
 fill in `admin.session_secret` (`openssl rand -hex 32`),
 `admin.admin_password_hash` (`rust-proxy hash-password '...'`), and
-`acme.cloudflare_api_token`. `network.subnet` must be the LXC's assigned
-subnet -- every `bind_ip` used anywhere has to fall inside it.
+your DNS provider's ACME credentials. `network.bind_ranges` is optional
+and empty by default -- unrestricted, bind to whatever address the
+environment actually has, whether that's a single dedicated IP, a full
+LXC /29 block, or several disjoint ranges. Populate it only if you want
+config-validation-time hardening against bind_ip typos for a known
+range you control.
 
 `hosts`/`port_rules` in the TOML file only seed an empty database on
 first boot. After that, sqlite (`admin.db_path`) is the source of
@@ -32,8 +38,9 @@ the file.
 
 ## Architecture
 
-- `config` -- TOML parsing + validation (bind IPs inside the subnet,
-  non-zero/well-ordered ports, no duplicate binds).
+- `config` -- TOML parsing + validation (bind IPs inside the configured
+  `network.bind_ranges`, if any are configured; non-zero/well-ordered
+  ports; no duplicate binds).
 - `state` -- `AppState`: hosts/port_rules/certs live in `ArcSwap` for
   lock-free hot-reload reads; a `Mutex` per resource serializes the
   admin API's write path so concurrent edits can't race and drop each
@@ -68,8 +75,10 @@ the file.
 
 ## Deployment
 
-Target is a Proxmox LXC with a `/29` assigned. `deploy/rust-proxy.service`
-runs the daemon as a non-root `rust-proxy` user with just
+Runs on any Linux host, from a Proxmox LXC with a dedicated subnet to a
+single-IP VPS or home server -- see `network.bind_ranges` above.
+`deploy/rust-proxy.service` runs the daemon as a non-root `rust-proxy` user
+with just
 `CAP_NET_BIND_SERVICE` (privileged ports) and `CAP_NET_ADMIN` (nftables)
 via `AmbientCapabilities`/`CapabilityBoundingSet`, plus
 `NoNewPrivileges`/`ProtectSystem=strict`/`ProtectHome` for defense in

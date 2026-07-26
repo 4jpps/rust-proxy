@@ -111,7 +111,11 @@ struct DashboardResponse {
     enabled_host_count: usize,
     port_rule_count: usize,
     cert_count: usize,
-    subnet: String,
+    /// Empty means unrestricted -- no configured `network.bind_ranges`,
+    /// any bind_ip is accepted. The admin UI shows this distinctly from
+    /// "restricted to these ranges" rather than an empty list looking
+    /// like a loading glitch.
+    bind_ranges: Vec<String>,
 }
 
 async fn dashboard(State(state): State<AppState>) -> Json<DashboardResponse> {
@@ -121,7 +125,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<DashboardResponse> {
         enabled_host_count: hosts.iter().filter(|h| h.enabled).count(),
         port_rule_count: state.port_rules().len(),
         cert_count: state.certs().len(),
-        subnet: state.network().subnet.to_string(),
+        bind_ranges: state.network().bind_ranges.iter().map(|n| n.to_string()).collect(),
     })
 }
 
@@ -156,13 +160,8 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     if !req.upstream.contains(':') {
         return Err(ApiError::BadRequest("upstream must be host:port".into()));
     }
-    if !state.network().subnet.contains(&req.bind_ip) {
-        return Err(ApiError::BadRequest(format!(
-            "bind_ip {} is not inside the configured subnet {}",
-            req.bind_ip,
-            state.network().subnet
-        )));
-    }
+    crate::config::validate_bind_ip(&state.network().bind_ranges, req.bind_ip, "hosts")
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(())
 }
 
@@ -271,13 +270,8 @@ fn validate_port_rule_request(state: &AppState, req: &PortRuleRequest) -> Result
     if req.port_start > req.port_end {
         return Err(ApiError::BadRequest("port_start must be <= port_end".into()));
     }
-    if !state.network().subnet.contains(&req.bind_ip) {
-        return Err(ApiError::BadRequest(format!(
-            "bind_ip {} is not inside the configured subnet {}",
-            req.bind_ip,
-            state.network().subnet
-        )));
-    }
+    crate::config::validate_bind_ip(&state.network().bind_ranges, req.bind_ip, "port_rules")
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(())
 }
 
@@ -388,7 +382,7 @@ mod tests {
     async fn test_state() -> AppState {
         let cfg = Config {
             network: NetworkConfig {
-                subnet: "10.0.0.0/29".parse().unwrap(),
+                bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
             },
             admin: AdminConfig {
                 bind_ip: "10.0.0.1".parse().unwrap(),
@@ -546,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_host_with_bind_ip_outside_subnet_is_rejected() {
+    async fn create_host_with_bind_ip_outside_bind_ranges_is_rejected() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
 

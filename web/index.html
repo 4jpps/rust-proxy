@@ -121,7 +121,7 @@ async function refreshDashboard() {
     <div class="stat"><b>${d.host_count}</b>hosts (${d.enabled_host_count} enabled)</div>
     <div class="stat"><b>${d.port_rule_count}</b>firewall rules</div>
     <div class="stat"><b>${d.cert_count}</b>certificates</div>
-    <div class="stat"><b>${d.subnet}</b>subnet</div>`;
+    <div class="stat"><b>${d.bind_ranges.length ? d.bind_ranges.join(', ') : 'unrestricted'}</b>bind range${d.bind_ranges.length === 1 ? '' : 's'}</div>`;
 }
 
 async function refreshHosts() {

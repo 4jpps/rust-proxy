@@ -138,7 +138,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             network: NetworkConfig {
-                subnet: "10.0.0.0/29".parse().unwrap(),
+                bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
             },
             admin: AdminConfig {
                 bind_ip: "10.0.0.1".parse().unwrap(),
