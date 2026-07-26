@@ -15,7 +15,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::config::{AcmeChallengeType, BasicAuth, PortRule, Protocol, ProxyHost};
+use crate::config::{AcmeChallengeType, HostAuth, PortRule, Protocol, ProxyHost};
 
 pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let url = if db_path.as_os_str() == ":memory:" {
@@ -46,8 +46,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             acme_enabled INTEGER NOT NULL,
             acme_challenge_type TEXT NOT NULL DEFAULT 'auto',
             access_allow_ips TEXT NOT NULL DEFAULT '',
-            access_basic_auth_username TEXT,
-            access_basic_auth_password_hash TEXT,
+            access_login_username TEXT,
+            access_login_password_hash TEXT,
             enabled INTEGER NOT NULL
         )
         "#,
@@ -62,8 +62,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // genuinely new tables, so this also backfills existing rows.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acme_challenge_type TEXT NOT NULL DEFAULT 'auto'").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_allow_ips TEXT NOT NULL DEFAULT ''").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_basic_auth_username TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_basic_auth_password_hash TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_login_username TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_login_password_hash TEXT").execute(pool).await;
 
     sqlx::query(
         r#"
@@ -175,7 +175,7 @@ fn parse_rfc3339(s: &str) -> DateTime<Utc> {
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, \
-         access_allow_ips, access_basic_auth_username, access_basic_auth_password_hash, enabled FROM hosts",
+         access_allow_ips, access_login_username, access_login_password_hash, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -192,11 +192,11 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 .filter(|s| !s.is_empty())
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            let access_basic_auth = match (
-                row.get::<Option<String>, _>("access_basic_auth_username"),
-                row.get::<Option<String>, _>("access_basic_auth_password_hash"),
+            let access_login = match (
+                row.get::<Option<String>, _>("access_login_username"),
+                row.get::<Option<String>, _>("access_login_password_hash"),
             ) {
-                (Some(username), Some(password_hash)) => Some(BasicAuth { username, password_hash }),
+                (Some(username), Some(password_hash)) => Some(HostAuth { username, password_hash }),
                 _ => None,
             };
             Ok(ProxyHost {
@@ -210,7 +210,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 acme_enabled: row.get::<i64, _>("acme_enabled") != 0,
                 acme_challenge_type: challenge_type,
                 access_allow_ips,
-                access_basic_auth,
+                access_login,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -227,13 +227,13 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             AcmeChallengeType::Dns01 => "dns01",
         };
         let access_allow_ips = h.access_allow_ips.iter().map(|net| net.to_string()).collect::<Vec<_>>().join(",");
-        let (basic_auth_username, basic_auth_password_hash) = match &h.access_basic_auth {
+        let (login_username, login_password_hash) = match &h.access_login {
             Some(auth) => (Some(auth.username.as_str()), Some(auth.password_hash.as_str())),
             None => (None, None),
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, \
-             acme_challenge_type, access_allow_ips, access_basic_auth_username, access_basic_auth_password_hash, enabled) \
+             acme_challenge_type, access_allow_ips, access_login_username, access_login_password_hash, enabled) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
@@ -246,8 +246,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.acme_enabled as i64)
         .bind(challenge_type)
         .bind(access_allow_ips)
-        .bind(basic_auth_username)
-        .bind(basic_auth_password_hash)
+        .bind(login_username)
+        .bind(login_password_hash)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -326,7 +326,7 @@ mod tests {
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled: true,
         }
     }
@@ -362,7 +362,7 @@ mod tests {
         let pool = memory_pool().await;
         let mut host = sample_host();
         host.access_allow_ips = vec!["10.0.0.0/24".parse().unwrap(), "192.168.1.0/24".parse().unwrap()];
-        host.access_basic_auth = Some(crate::config::BasicAuth {
+        host.access_login = Some(crate::config::HostAuth {
             username: "viewer".into(),
             password_hash: "$argon2id$fake$hash".into(),
         });
@@ -370,7 +370,7 @@ mod tests {
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert_eq!(loaded[0].access_allow_ips, host.access_allow_ips);
-        assert_eq!(loaded[0].access_basic_auth, host.access_basic_auth);
+        assert_eq!(loaded[0].access_login, host.access_login);
     }
 
     #[tokio::test]
@@ -380,7 +380,7 @@ mod tests {
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert!(loaded[0].access_allow_ips.is_empty());
-        assert!(loaded[0].access_basic_auth.is_none());
+        assert!(loaded[0].access_login.is_none());
     }
 
     #[tokio::test]

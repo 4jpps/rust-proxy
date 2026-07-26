@@ -162,22 +162,25 @@ pub struct ProxyHost {
     /// access lists.
     #[serde(default)]
     pub access_allow_ips: Vec<Ipv4Net>,
-    /// HTTP Basic Auth gate. `None` (the default) means no auth
-    /// required. Checked after the IP allow list, before the request
-    /// reaches the upstream.
+    /// A login-page gate: a visitor without a valid session cookie for
+    /// this host gets a real HTML login page instead of the upstream
+    /// (see `proxy::login`), not an HTTP Basic Auth challenge -- Basic
+    /// Auth's browser-native prompt is poorly supported by most password
+    /// managers. `None` (the default) means no auth required. Checked
+    /// after the IP allow list, before the request reaches the upstream.
     #[serde(default)]
-    pub access_basic_auth: Option<BasicAuth>,
+    pub access_login: Option<HostAuth>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
-/// A single HTTP Basic Auth credential gating one host.
-/// `password_hash` is an argon2 PHC string, never a plaintext password --
-/// same hashing as the admin account's own password (see
-/// `api::auth::hash_password`), computed server-side from a plaintext
-/// password submitted through the admin API/UI.
+/// A single login credential gating one host behind `proxy::login`'s
+/// login page. `password_hash` is an argon2 PHC string, never a
+/// plaintext password -- same hashing as the admin account's own
+/// password (see `api::auth::hash_password`), computed server-side from
+/// a plaintext password submitted through the admin API/UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BasicAuth {
+pub struct HostAuth {
     pub username: String,
     /// Never serialized back out over the admin API -- `ProxyHost` is
     /// returned directly from `GET`/`POST`/`PUT /api/hosts`, and an
@@ -443,7 +446,7 @@ dns_api_token = "token-placeholder"
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -464,7 +467,7 @@ dns_api_token = "token-placeholder"
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok(), "bind_ip in the second range should be accepted");
@@ -484,7 +487,7 @@ dns_api_token = "token-placeholder"
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -504,7 +507,7 @@ dns_api_token = "token-placeholder"
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -583,7 +586,7 @@ dns_api_token = "token-placeholder"
                 acme_enabled: true,
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 access_allow_ips: vec![],
-                access_basic_auth: None,
+                access_login: None,
                 enabled: true,
             });
         }
@@ -608,7 +611,7 @@ dns_api_token = "token-placeholder"
                 acme_enabled: true,
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 access_allow_ips: vec![],
-                access_basic_auth: None,
+                access_login: None,
                 enabled: true,
             });
         }
@@ -629,7 +632,7 @@ dns_api_token = "token-placeholder"
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -659,7 +662,7 @@ dns_api_token = "token-placeholder"
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());

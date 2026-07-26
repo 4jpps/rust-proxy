@@ -15,13 +15,17 @@
   setting, since no CA offers http-01 for them. See `acme::http01` and
   `acme::resolve_challenge_type`.
 - Per-host access lists -- an IP allow list (`access_allow_ips`) and/or
-  an HTTP Basic Auth gate (`access_basic_auth`), enforced at the
-  application layer before a request reaches the upstream, independent
-  of `network.bind_ranges` and the nftables firewall. The most-cited
+  a login gate (`access_login`), enforced at the application layer
+  before a request reaches the upstream, independent of
+  `network.bind_ranges` and the nftables firewall. The most-cited
   real-world use of Nginx Proxy Manager's raw config-injection escape
-  hatch, covered here as a structured feature instead. Basic Auth
-  passwords are argon2-hashed server-side and never stored or returned
-  in plaintext. See `proxy::access`.
+  hatch, covered here as a structured feature instead. `access_login`
+  serves a real HTML login page (`proxy::login`) and a signed,
+  `HttpOnly`/`Secure` session cookie scoped to that one host, rather
+  than an HTTP Basic Auth prompt -- password managers reliably recognize
+  and offer to save a real login form, unlike Basic Auth's browser-
+  native dialog. Passwords are argon2-hashed server-side and never
+  stored or returned in plaintext. See `proxy::access`/`proxy::login`.
 
 ## [0.1.0] - 2026-07-26
 

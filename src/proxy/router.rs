@@ -83,7 +83,7 @@ mod tests {
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
-            access_basic_auth: None,
+            access_login: None,
             enabled,
         }
     }

@@ -62,11 +62,11 @@ dns_api_token = "your-dns-provider-api-token-with-dns-edit-scope"
 # (application layer, independent of the firewall) -- empty/omitted
 # means unrestricted.
 # access_allow_ips = ["10.0.0.0/24"]
-# access_basic_auth gates this host behind HTTP Basic Auth. password_hash
-# is an argon2 PHC string (generate with `rust-proxy hash-password`),
-# never a plaintext password -- omit this table entirely for no auth
-# gate.
-# [hosts.access_basic_auth]
+# access_login gates this host behind a real login page (not HTTP Basic
+# Auth -- see the README). password_hash is an argon2 PHC string
+# (generate with `rust-proxy hash-password`), never a plaintext
+# password -- omit this table entirely for no login gate.
+# [hosts.access_login]
 # username = "viewer"
 # password_hash = "$argon2id$v=19$..."
 # enabled = true

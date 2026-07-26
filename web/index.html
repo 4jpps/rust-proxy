@@ -58,8 +58,8 @@
       <option value="dns01">dns-01 (needs a configured DNS provider)</option>
     </select>
     <input type="text" name="access_allow_ips" placeholder="allowed IPs/CIDRs, comma-separated (optional)" title="Access list: IP allow list. Empty means unrestricted.">
-    <input type="text" name="access_basic_auth_username" placeholder="basic auth username (optional)">
-    <input type="password" name="access_basic_auth_password" placeholder="basic auth password">
+    <input type="text" name="access_login_username" placeholder="login username (optional)" title="Gate this host behind a login page. Leave blank for no login gate.">
+    <input type="password" name="access_login_password" placeholder="login password">
     <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
     <button type="submit">Add host</button>
     <span class="error" id="host-error"></span>
@@ -172,7 +172,7 @@ async function refreshHosts() {
     const tr = document.createElement('tr');
     const access = [
       h.access_allow_ips && h.access_allow_ips.length ? `${h.access_allow_ips.length} IP range${h.access_allow_ips.length === 1 ? '' : 's'}` : '',
-      h.access_basic_auth ? `auth: ${esc(h.access_basic_auth.username)}` : '',
+      h.access_login ? `login: ${esc(h.access_login.username)}` : '',
     ].filter(Boolean).join(', ');
     tr.innerHTML = `<td>${esc(h.domain)}</td><td>${esc(h.bind_ip)}:${h.bind_port}</td><td>${esc(h.upstream)}</td>
       <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
@@ -191,15 +191,15 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
   const allowIps = (fd.get('access_allow_ips') || '').split(',').map(s => s.trim()).filter(Boolean);
-  const authUsername = fd.get('access_basic_auth_username');
-  const authPassword = fd.get('access_basic_auth_password');
+  const loginUsername = fd.get('access_login_username');
+  const loginPassword = fd.get('access_login_password');
   const body = {
     domain: fd.get('domain'), bind_ip: fd.get('bind_ip'), bind_port: Number(fd.get('bind_port')),
     upstream: fd.get('upstream'), websockets: fd.get('websockets') === 'on',
     force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
     acme_challenge_type: fd.get('acme_challenge_type'),
     access_allow_ips: allowIps,
-    access_basic_auth: authUsername ? { username: authUsername, password: authPassword } : null,
+    access_login: loginUsername ? { username: loginUsername, password: loginPassword } : null,
     enabled: fd.get('enabled') === 'on',
   };
   const resp = await api('/api/hosts', { method: 'POST', body: JSON.stringify(body) });

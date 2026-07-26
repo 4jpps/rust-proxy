@@ -189,17 +189,18 @@ struct HostRequest {
     /// Parsed and validated in `parse_access_allow_ips`.
     #[serde(default)]
     access_allow_ips: Vec<String>,
-    /// `None` means no Basic Auth gate. `password` is plaintext, hashed
-    /// server-side (`build_basic_auth`) before it ever reaches sqlite --
-    /// same as the admin account's own password, never stored raw.
+    /// `None` means no login gate (see `proxy::login`). `password` is
+    /// plaintext, hashed server-side (`build_host_login`) before it ever
+    /// reaches sqlite -- same as the admin account's own password, never
+    /// stored raw.
     #[serde(default)]
-    access_basic_auth: Option<BasicAuthRequest>,
+    access_login: Option<HostLoginRequest>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
 
 #[derive(Deserialize)]
-struct BasicAuthRequest {
+struct HostLoginRequest {
     username: String,
     password: String,
 }
@@ -227,16 +228,16 @@ fn parse_access_allow_ips(raw: &[String]) -> Result<Vec<ipnet::Ipv4Net>, ApiErro
 }
 
 /// Hashes the plaintext password (argon2, same as the admin account's
-/// own) into a storable `BasicAuth` -- `None` in means no auth gate for
-/// this host, same as leaving `access_basic_auth` out of the request
+/// own) into a storable `HostAuth` -- `None` in means no login gate for
+/// this host, same as leaving `access_login` out of the request
 /// entirely.
-fn build_basic_auth(req: &Option<BasicAuthRequest>) -> Result<Option<crate::config::BasicAuth>, ApiError> {
+fn build_host_login(req: &Option<HostLoginRequest>) -> Result<Option<crate::config::HostAuth>, ApiError> {
     let Some(req) = req else { return Ok(None) };
     if req.username.trim().is_empty() || req.password.is_empty() {
-        return Err(ApiError::BadRequest("access_basic_auth requires a non-empty username and password".into()));
+        return Err(ApiError::BadRequest("access_login requires a non-empty username and password".into()));
     }
     let password_hash = auth::hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Some(crate::config::BasicAuth {
+    Ok(Some(crate::config::HostAuth {
         username: req.username.clone(),
         password_hash,
     }))
@@ -245,7 +246,7 @@ fn build_basic_auth(req: &Option<BasicAuthRequest>) -> Result<Option<crate::conf
 async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest>) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
     let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
-    let access_basic_auth = build_basic_auth(&body.access_basic_auth)?;
+    let access_login = build_host_login(&body.access_login)?;
     let host = ProxyHost {
         id: Uuid::new_v4(),
         domain: body.domain,
@@ -257,7 +258,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         acme_enabled: body.acme_enabled,
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
-        access_basic_auth,
+        access_login,
         enabled: body.enabled,
     };
     let to_insert = host.clone();
@@ -276,7 +277,7 @@ async fn update_host(
 ) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
     let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
-    let access_basic_auth = build_basic_auth(&body.access_basic_auth)?;
+    let access_login = build_host_login(&body.access_login)?;
     let updated = ProxyHost {
         id,
         domain: body.domain,
@@ -288,7 +289,7 @@ async fn update_host(
         acme_enabled: body.acme_enabled,
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
-        access_basic_auth,
+        access_login,
         enabled: body.enabled,
     };
     let to_store = updated.clone();
@@ -733,7 +734,7 @@ mod tests {
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
                         r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_allow_ips":["10.0.0.0/24"],"access_basic_auth":{"username":"viewer","password":"s3cret"}}"#,
+                        "access_allow_ips":["10.0.0.0/24"],"access_login":{"username":"viewer","password":"s3cret"}}"#,
                     ))
                     .unwrap(),
             )
@@ -742,9 +743,9 @@ mod tests {
         assert_eq!(create_resp.status(), StatusCode::OK);
         let created = body_json(create_resp).await;
         assert_eq!(created["access_allow_ips"], serde_json::json!(["10.0.0.0/24"]));
-        assert_eq!(created["access_basic_auth"]["username"], "viewer");
+        assert_eq!(created["access_login"]["username"], "viewer");
         assert!(
-            created["access_basic_auth"].get("password_hash").is_none(),
+            created["access_login"].get("password_hash").is_none(),
             "the argon2 hash must never be returned, even to an authenticated admin"
         );
 
@@ -760,7 +761,7 @@ mod tests {
             .unwrap();
         let json = body_json(list_resp).await;
         assert_eq!(json[0]["access_allow_ips"], serde_json::json!(["10.0.0.0/24"]));
-        assert_eq!(json[0]["access_basic_auth"]["username"], "viewer");
+        assert_eq!(json[0]["access_login"]["username"], "viewer");
     }
 
     #[tokio::test]
@@ -787,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_host_with_an_empty_basic_auth_password_is_rejected() {
+    async fn create_host_with_an_empty_login_password_is_rejected() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
 
@@ -800,7 +801,7 @@ mod tests {
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
                         r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_basic_auth":{"username":"viewer","password":""}}"#,
+                        "access_login":{"username":"viewer","password":""}}"#,
                     ))
                     .unwrap(),
             )

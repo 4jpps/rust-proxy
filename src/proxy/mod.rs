@@ -12,6 +12,7 @@
 
 pub mod access;
 pub mod http;
+pub mod login;
 pub mod passthrough;
 pub mod router;
 pub mod tls;
@@ -219,9 +220,14 @@ async fn handle_https_request(
     if !access::ip_allowed(&host.access_allow_ips, peer_ip) {
         return Ok(forbidden());
     }
-    let auth_header = req.headers().get(hyper::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-    if !access::check_basic_auth(&host.access_basic_auth, auth_header) {
-        return Ok(unauthorized(&host.domain));
+
+    if let Some(auth) = &host.access_login {
+        let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
+            .map(|token| login::verify_session(&state.admin().session_secret, &host.domain, &token))
+            .unwrap_or(false);
+        if !has_valid_session {
+            return Ok(handle_login_gate(&state, &host.domain, auth, req).await);
+        }
     }
 
     let Ok(upstream) = resolve_upstream(&host.upstream) else {
@@ -235,6 +241,75 @@ async fn handle_https_request(
             Ok(bad_gateway())
         }
     }
+}
+
+fn find_cookie(req: &Request<Incoming>, name: &str) -> Option<String> {
+    req.headers().get(hyper::header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|raw| {
+        raw.split(';').find_map(|pair| {
+            let (k, v) = pair.trim().split_once('=')?;
+            (k == name).then(|| v.to_string())
+        })
+    })
+}
+
+/// Handles every request to a login-gated host that arrived without a
+/// valid session: either a login submission (`POST` to
+/// `login::LOGIN_SUBMIT_PATH`), or any other request, which gets the
+/// login page rendered in place of the resource it actually wanted --
+/// `return_to` carries that original path/query so a successful login
+/// lands the visitor back where they meant to go.
+async fn handle_login_gate(
+    state: &AppState,
+    domain: &str,
+    auth: &crate::config::HostAuth,
+    req: Request<Incoming>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    if req.method() == hyper::Method::POST && req.uri().path() == login::LOGIN_SUBMIT_PATH {
+        let body_bytes = match req.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => return login_page_response(domain, "/", Some("invalid request"), hyper::StatusCode::BAD_REQUEST),
+        };
+        let Ok(submission) = serde_json::from_slice::<login::LoginSubmission>(&body_bytes) else {
+            return login_page_response(domain, "/", Some("invalid request"), hyper::StatusCode::BAD_REQUEST);
+        };
+        if login::verify_credentials(auth, &submission.username, &submission.password) {
+            let token = login::sign_session(&state.admin().session_secret, domain, &auth.username);
+            return login_success_response(&token);
+        }
+        return login_page_response(
+            domain,
+            &submission.return_to,
+            Some("Invalid username or password"),
+            hyper::StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    let return_to = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
+    login_page_response(domain, &return_to, None, hyper::StatusCode::OK)
+}
+
+fn login_page_response(domain: &str, return_to: &str, error: Option<&str>, status: hyper::StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let html = login::render_login_page(domain, return_to, error);
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(http_body_util::Full::new(Bytes::from(html)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static login page response is always valid")
+}
+
+/// `Secure` is always correct here -- this handler only ever runs behind
+/// the HTTPS listener, never the plain-HTTP redirect one.
+fn login_success_response(token: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let cookie = format!(
+        "{}={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+        login::SESSION_COOKIE,
+        login::SESSION_LIFETIME_SECS
+    );
+    Response::builder()
+        .status(hyper::StatusCode::OK)
+        .header(hyper::header::SET_COOKIE, cookie)
+        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static login success response is always valid")
 }
 
 /// Serves both plain-HTTP purposes port 80 ever has here: an ACME http-01
@@ -339,18 +414,6 @@ fn forbidden() -> Response<BoxBody<Bytes, hyper::Error>> {
         .expect("static response is always valid")
 }
 
-/// `WWW-Authenticate` prompts a browser's own login dialog, same as any
-/// server enforcing Basic Auth directly. `realm` is the domain rather
-/// than a fixed string so a client juggling multiple protected hosts
-/// through this proxy sees which one it's authenticating against.
-fn unauthorized(realm: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(hyper::StatusCode::UNAUTHORIZED)
-        .header(hyper::header::WWW_AUTHENTICATE, format!("Basic realm=\"{realm}\""))
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
-        .expect("static response is always valid")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,7 +501,7 @@ mod tests {
         state
     }
 
-    fn access_host(domain: &str, access_allow_ips: Vec<ipnet::Ipv4Net>, access_basic_auth: Option<crate::config::BasicAuth>) -> ProxyHost {
+    fn access_host(domain: &str, access_allow_ips: Vec<ipnet::Ipv4Net>, access_login: Option<crate::config::HostAuth>) -> ProxyHost {
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
@@ -450,7 +513,7 @@ mod tests {
             acme_enabled: false,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips,
-            access_basic_auth,
+            access_login,
             enabled: true,
         }
     }
@@ -461,14 +524,21 @@ mod tests {
     /// rather than fabricating a `Request<Incoming>` -- `Incoming` is a
     /// real hyper body type tied to an actual connection, so there's no
     /// safe way to construct one without a real client/server round trip.
+    /// `bind_ip`/`bind_port`/SNI are fixed at `access_host`'s own values
+    /// (10.0.0.2:443, "example.com") since every test in this module
+    /// uses them unchanged -- only `peer_ip` and the request itself vary.
     async fn send_test_request(
         state: AppState,
-        bind_ip: Ipv4Addr,
-        bind_port: u16,
         peer_ip: Ipv4Addr,
-        sni: Option<String>,
-        auth_header: Option<String>,
+        method: &str,
+        path: &str,
+        cookie: Option<String>,
+        json_body: Option<serde_json::Value>,
     ) -> Response<Incoming> {
+        let bind_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let bind_port = 443;
+        let sni = Some("example.com".to_string());
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -487,12 +557,23 @@ mod tests {
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
         tokio::spawn(conn);
 
-        let mut builder = Request::builder().uri("/");
-        if let Some(value) = auth_header {
-            builder = builder.header(hyper::header::AUTHORIZATION, value);
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(value) = cookie {
+            builder = builder.header(hyper::header::COOKIE, value);
         }
-        let req = builder.body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        let body_bytes = match &json_body {
+            Some(v) => {
+                builder = builder.header(hyper::header::CONTENT_TYPE, "application/json");
+                serde_json::to_vec(v).unwrap()
+            }
+            None => Vec::new(),
+        };
+        let req = builder.body(http_body_util::Full::new(Bytes::from(body_bytes))).unwrap();
         sender.send_request(req).await.unwrap()
+    }
+
+    async fn response_text(resp: Response<Incoming>) -> String {
+        String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
     }
 
     #[tokio::test]
@@ -500,10 +581,10 @@ mod tests {
         let state = test_state_with_host(access_host("example.com", vec!["192.168.1.0/24".parse().unwrap()], None)).await;
         let resp = send_test_request(
             state,
-            "10.0.0.2".parse().unwrap(),
-            443,
             "203.0.113.7".parse().unwrap(),
-            Some("example.com".to_string()),
+            "GET",
+            "/",
+            None,
             None,
         )
         .await;
@@ -511,14 +592,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_from_an_allowed_ip_without_basic_auth_configured_is_not_blocked() {
+    async fn request_from_an_allowed_ip_without_a_login_gate_configured_is_not_blocked() {
         let state = test_state_with_host(access_host("example.com", vec!["10.0.0.0/24".parse().unwrap()], None)).await;
         let resp = send_test_request(
             state,
-            "10.0.0.2".parse().unwrap(),
-            443,
             "10.0.0.42".parse().unwrap(),
-            Some("example.com".to_string()),
+            "GET",
+            "/",
+            None,
             None,
         )
         .await;
@@ -527,52 +608,102 @@ mod tests {
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
     }
 
-    #[tokio::test]
-    async fn request_without_credentials_is_challenged_when_basic_auth_is_configured() {
-        let auth = crate::config::BasicAuth {
+    fn viewer_auth() -> crate::config::HostAuth {
+        crate::config::HostAuth {
             username: "viewer".into(),
             password_hash: crate::api::auth::hash_password("s3cret").unwrap(),
-        };
-        let state = test_state_with_host(access_host("example.com", vec![], Some(auth))).await;
-        let resp = send_test_request(
-            state,
-            "10.0.0.2".parse().unwrap(),
-            443,
-            "203.0.113.7".parse().unwrap(),
-            Some("example.com".to_string()),
-            None,
-        )
-        .await;
-        assert_eq!(resp.status(), hyper::StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            resp.headers().get(hyper::header::WWW_AUTHENTICATE).unwrap(),
-            "Basic realm=\"example.com\""
-        );
+        }
     }
 
     #[tokio::test]
-    async fn request_with_correct_basic_auth_credentials_passes_through_to_the_upstream_lookup() {
-        use base64::engine::general_purpose::STANDARD;
-        use base64::Engine as _;
-
-        let auth = crate::config::BasicAuth {
-            username: "viewer".into(),
-            password_hash: crate::api::auth::hash_password("s3cret").unwrap(),
-        };
-        let state = test_state_with_host(access_host("example.com", vec![], Some(auth))).await;
-        let header = format!("Basic {}", STANDARD.encode("viewer:s3cret"));
+    async fn a_request_without_a_session_gets_the_login_page_instead_of_the_upstream() {
+        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
         let resp = send_test_request(
             state,
-            "10.0.0.2".parse().unwrap(),
-            443,
             "203.0.113.7".parse().unwrap(),
-            Some("example.com".to_string()),
-            Some(header),
+            "GET",
+            "/dashboard",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "text/html; charset=utf-8");
+        let body = response_text(resp).await;
+        assert!(body.contains("Sign in to example.com"));
+        // The originally-requested path is threaded through as return_to
+        // so a successful login lands the visitor back on it.
+        assert!(body.contains("/dashboard"));
+    }
+
+    #[tokio::test]
+    async fn login_submission_with_correct_credentials_sets_a_session_cookie() {
+        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "POST",
+            login::LOGIN_SUBMIT_PATH,
+            None,
+            Some(serde_json::json!({"username": "viewer", "password": "s3cret", "return_to": "/"})),
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        let set_cookie = resp.headers().get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert!(set_cookie.starts_with(&format!("{}=", login::SESSION_COOKIE)));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("Secure"));
+    }
+
+    #[tokio::test]
+    async fn login_submission_with_wrong_credentials_is_rejected_without_a_cookie() {
+        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "POST",
+            login::LOGIN_SUBMIT_PATH,
+            None,
+            Some(serde_json::json!({"username": "viewer", "password": "wrong", "return_to": "/"})),
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(hyper::header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_request_with_a_valid_session_cookie_passes_through_to_the_upstream_lookup() {
+        let token = login::sign_session("test-secret", "example.com", "viewer");
+        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/",
+            Some(format!("{}={token}", login::SESSION_COOKIE)),
+            None,
         )
         .await;
         // Upstream is unreachable (127.0.0.1:1) so this proves the
-        // credentials cleared access control, not that it fully succeeded.
+        // session cleared the login gate, not that it fully succeeded.
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn a_session_signed_for_a_different_domain_does_not_bypass_the_login_gate() {
+        let token = login::sign_session("test-secret", "other.example.com", "viewer");
+        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/",
+            Some(format!("{}={token}", login::SESSION_COOKIE)),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert!(response_text(resp).await.contains("Sign in to example.com"));
     }
 
     /// A test-only "trust anything" verifier -- the self-signed cert
