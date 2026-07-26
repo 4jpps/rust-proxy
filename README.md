@@ -1,8 +1,9 @@
 # rust-proxy
 
 A lightweight L7 reverse proxy daemon in Rust, built as an open,
-self-hostable alternative to Nginx Proxy Manager: HTTP/WebSocket reverse
-proxying with SNI-based TLS, a native RFC 8555 ACME client (dns-01 via a
+self-hostable alternative to Nginx Proxy Manager: HTTP/1.1+HTTP/2 and
+WebSocket reverse proxying with SNI-based TLS, a native RFC 8555 ACME
+client (dns-01 via a
 pluggable DNS provider -- Cloudflare, DigitalOcean, or Hetzner today),
 dynamic default-DROP nftables firewall orchestration, arbitrary TCP/UDP
 port passthrough, and a small embedded web admin UI. Runs on anything
@@ -142,7 +143,15 @@ for the token-authenticated API.
 - `proxy` -- the data plane: `router` (pure host-matching), `tls`
   (SNI cert dispatch reading live state), `http` (forwarding +
   WebSocket upgrade passthrough), `passthrough` (raw TCP/UDP for
-  non-HTTP port rules). A supervisor diffs the desired listener set
+  non-HTTP port rules). ALPN offers `h2` then `http/1.1`; the HTTPS
+  listener uses `hyper-util`'s auto builder to actually speak whichever
+  one a client negotiates, with HTTP/1 upgrades (what WebSocket
+  passthrough needs) still enabled. Deliberately doesn't enable HTTP/2
+  Extended CONNECT (RFC 8441) -- per that RFC, a client won't attempt a
+  WebSocket handshake over h2 without confirming that's supported, so
+  leaving it off means WebSocket clients cleanly fall back to HTTP/1.1
+  instead of failing; everything else gets real HTTP/2 multiplexing.
+  Same split Nginx itself makes. A supervisor diffs the desired listener set
   against what's running on every state change and only starts/stops
   the delta -- editing a route's upstream never restarts its listener.
   A host's `domain` may be a single leading wildcard label

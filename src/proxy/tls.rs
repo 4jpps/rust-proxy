@@ -58,18 +58,25 @@ fn build_certified_key(entry: &CertEntry) -> Result<CertifiedKey, rustls::Error>
     Ok(CertifiedKey::new(entry.cert_chain.clone(), key))
 }
 
+/// Shared with `proxy::mod`'s own tests (a real end-to-end ALPN/HTTP2
+/// test needs a real cert to terminate TLS with, same as every test
+/// here does) -- kept `#[cfg(test)]`-only rather than moved into
+/// non-test code, since generating a throwaway self-signed cert has no
+/// legitimate use outside tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) fn self_signed_entry(domain: &str) -> CertEntry {
     use crate::acme::cert::build_cert_entry;
     use rcgen::{CertificateParams, KeyPair};
 
-    fn self_signed_entry(domain: &str) -> CertEntry {
-        let key_pair = KeyPair::generate().unwrap();
-        let params = CertificateParams::new(vec![domain.to_string()]).unwrap();
-        let cert = params.self_signed(&key_pair).unwrap();
-        build_cert_entry(&cert.pem(), &key_pair.serialize_pem()).unwrap()
-    }
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec![domain.to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    build_cert_entry(&cert.pem(), &key_pair.serialize_pem()).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn selects_the_matching_domain_case_insensitively() {

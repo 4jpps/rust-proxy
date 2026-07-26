@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+- HTTP/2 support -- ALPN now offers `h2` alongside `http/1.1`, and the
+  HTTPS listener uses `hyper-util`'s auto h1/h2 connection builder.
+  Deliberately doesn't enable HTTP/2 Extended CONNECT (RFC 8441), so
+  WebSocket clients cleanly negotiate HTTP/1.1 instead (same split
+  Nginx makes) -- see `proxy/mod.rs`'s `build_https_server_config`.
+
 ## [0.1.0] - 2026-07-26
 
 First public release. A lightweight L7 reverse proxy daemon in Rust,

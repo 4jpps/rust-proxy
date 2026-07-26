@@ -24,7 +24,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -120,12 +120,7 @@ fn spawn_https_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> J
         };
         tracing::info!(%addr, "https listener started");
 
-        let resolver = Arc::new(tls::CertResolver::new(state.clone()));
-        let mut server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
-        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let acceptor = TlsAcceptor::from(Arc::new(build_https_server_config(state.clone())));
 
         loop {
             let (stream, _peer) = match listener.accept().await {
@@ -152,9 +147,16 @@ fn spawn_https_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> J
                     let sni = sni.clone();
                     async move { handle_https_request(state, bind_ip, bind_port, sni, req).await }
                 });
-                if let Err(err) = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .with_upgrades()
+                // `auto::Builder` sniffs the connection preface to pick
+                // HTTP/1 vs HTTP/2 per-connection -- ALPN already steered
+                // the client here (see `build_https_server_config`), this
+                // just has to actually speak whichever one shows up.
+                // `_with_upgrades` is what still makes `hyper::upgrade::on`
+                // (WebSocket passthrough, see `http::forward_http`) work
+                // on the HTTP/1 side; HTTP/2 clients get real h2
+                // multiplexing with no code-path changes needed here.
+                if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
                     .await
                 {
                     tracing::debug!(error = %err, "https connection ended");
@@ -162,6 +164,23 @@ fn spawn_https_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> J
             });
         }
     })
+}
+
+/// ALPN offers `h2` before `http/1.1` (server preference order) but
+/// deliberately never calls `.http2().enable_connect_protocol()` on the
+/// auto builder above -- that's what advertises HTTP/2 Extended CONNECT
+/// (RFC 8441, WebSocket-over-h2) support in the SETTINGS frame. Per
+/// that RFC, a client MUST NOT attempt a WebSocket handshake over h2
+/// unless it first confirms that setting is present; leaving it off
+/// means a WebSocket-bound client falls back to a normal HTTP/1.1
+/// connection (where the `Upgrade:` mechanism `forward_http` already
+/// implements works unchanged), while every other request gets real
+/// HTTP/2 multiplexing -- the same split Nginx itself makes.
+fn build_https_server_config(state: AppState) -> rustls::ServerConfig {
+    let resolver = Arc::new(tls::CertResolver::new(state));
+    let mut server_config = rustls::ServerConfig::builder().with_no_client_auth().with_cert_resolver(resolver);
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    server_config
 }
 
 async fn handle_https_request(
@@ -286,7 +305,11 @@ fn bad_gateway() -> Response<BoxBody<Bytes, hyper::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{PortRule, Protocol};
+    use crate::config::{AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig, PortRule, Protocol};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    use rustls_pki_types::{CertificateDer, ServerName as RustlsServerName, UnixTime};
+    use std::path::PathBuf;
     use uuid::Uuid;
 
     fn rule(bind_ip: &str, start: u16, end: u16, proto: Protocol, target: Option<&str>) -> PortRule {
@@ -325,5 +348,187 @@ mod tests {
     #[test]
     fn resolve_upstream_rejects_malformed_input() {
         assert!(resolve_upstream("not-a-host-port").is_err());
+    }
+
+    async fn test_state_with_cert(domain: &str) -> AppState {
+        let cfg = Config {
+            network: NetworkConfig { bind_ranges: vec![] },
+            admin: AdminConfig {
+                bind_ip: "127.0.0.1".parse().unwrap(),
+                bind_port: 8080,
+                allowed_ips: vec![],
+                session_secret: "test-secret".into(),
+                admin_username: "admin".into(),
+                admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                db_path: PathBuf::from(":memory:"),
+            },
+            acme: AcmeConfig {
+                directory_url: "https://example.invalid/directory".into(),
+                contact_email: "admin@example.com".into(),
+                dns_provider: DnsProviderKind::Cloudflare,
+                dns_api_token: "token".into(),
+                cert_dir: PathBuf::from("/tmp/certs"),
+                account_key_path: PathBuf::from("/tmp/account.key"),
+                renew_before_days: 30,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+        };
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let state = AppState::new(cfg, pool, vec![], vec![]);
+        state.upsert_cert(domain.to_string(), {
+            let entry = tls::self_signed_entry(domain);
+            entry
+        });
+        state
+    }
+
+    /// A test-only "trust anything" verifier -- the self-signed cert
+    /// `test_state_with_cert` hands out has no real CA chain, so a
+    /// normal verifier would reject it outright; this test cares about
+    /// ALPN negotiation and HTTP/2 transport, not certificate trust
+    /// (that's an orthogonal, already-real concern once a real CA
+    /// issues the cert via ACME).
+    #[derive(Debug)]
+    struct AcceptAnyCert;
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &RustlsServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// End-to-end: real TLS handshake against `build_https_server_config`
+    /// (the exact config `spawn_https_listener` uses), a real client
+    /// offering `h2` in ALPN, and a real HTTP/2 request driven all the
+    /// way through `serve_connection_with_upgrades`'s auto h1/h2
+    /// dispatch -- proves the ALPN change actually results in a working
+    /// HTTP/2 connection, not just that the config value changed.
+    #[tokio::test]
+    async fn https_listener_negotiates_http2_and_serves_a_real_request() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let state = test_state_with_cert("example.com").await;
+        let acceptor = TlsAcceptor::from(Arc::new(build_https_server_config(state)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+            let io = TokioIo::new(tls_stream);
+            let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
+                let body: BoxBody<Bytes, hyper::Error> =
+                    http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-h2-test", "yes").body(body).unwrap())
+            });
+            hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .unwrap();
+        });
+
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = RustlsServerName::try_from("example.com").unwrap();
+        let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+
+        let negotiated = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        assert_eq!(negotiated, Some(b"h2".to_vec()), "server should have negotiated h2 when the client offered it");
+
+        let io = TokioIo::new(tls_stream);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::builder().uri("/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-h2-test").unwrap(), "yes");
+    }
+
+    /// A client that only offers `http/1.1` (no h2) must still work --
+    /// the WebSocket-fallback case this whole design hinges on.
+    #[tokio::test]
+    async fn https_listener_still_negotiates_http1_when_thats_all_the_client_offers() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let state = test_state_with_cert("example.com").await;
+        let acceptor = TlsAcceptor::from(Arc::new(build_https_server_config(state)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+            let io = TokioIo::new(tls_stream);
+            let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
+                let body: BoxBody<Bytes, hyper::Error> =
+                    http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                Ok::<_, std::convert::Infallible>(Response::builder().status(200).body(body).unwrap())
+            });
+            hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .unwrap();
+        });
+
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = RustlsServerName::try_from("example.com").unwrap();
+        let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+
+        let negotiated = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        assert_eq!(negotiated, Some(b"http/1.1".to_vec()));
+
+        let io = TokioIo::new(tls_stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "example.com")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
     }
 }
