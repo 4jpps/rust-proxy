@@ -1,14 +1,17 @@
 //! Native RFC 8555 ACME v2 engine: JWS framing (`jws`), protocol wire
 //! types (`types`), the HTTP client/state machine (`client`), pluggable
 //! dns-01 fulfillment (`dns01`, one `DnsProvider` impl per supported DNS
-//! host), and CSR/certificate handling (`cert`). `run_renewal_loop` is
-//! what `main.rs` spawns; `issue_certificate` is the single-domain
-//! issuance flow it (and a future manual "trigger ACME validation" admin
-//! API call) drives.
+//! host), http-01 fulfillment (`http01`, no third-party credentials
+//! needed at all), and CSR/certificate handling (`cert`).
+//! `run_renewal_loop` is what `main.rs` spawns; `issue_certificate` is
+//! the single-domain issuance flow it (and a future manual "trigger ACME
+//! validation" admin API call) drives, picking dns-01 or http-01 per
+//! host via `resolve_challenge_type`.
 
 pub mod cert;
 pub mod client;
 pub mod dns01;
+pub mod http01;
 pub mod jws;
 pub mod types;
 
@@ -16,12 +19,52 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::config::{DnsProviderKind, ProxyHost};
+use crate::config::{AcmeChallengeType, DnsProviderKind, ProxyHost};
 use crate::state::AppState;
 use client::{AcmeClient, AcmeError};
 use dns01::{acme_challenge_record_name, dns01_txt_value, CloudflareDns01, DigitalOceanDns01, Dns01Error, DnsProvider, HetznerDns01};
 use jws::{AccountKey, JwsError};
-use types::{AuthorizationStatus, OrderStatus};
+use types::{Authorization, AuthorizationStatus, OrderStatus};
+
+/// Which ACME challenge type actually gets used for one host --
+/// `AcmeChallengeType::Auto` resolves here rather than being stored
+/// pre-resolved, so flipping a host's `force_https`/`acme_challenge_type`
+/// takes effect on the next issuance/renewal with no separate migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeMethod {
+    Http01,
+    Dns01,
+}
+
+pub fn resolve_challenge_type(host: &ProxyHost) -> ChallengeMethod {
+    // RFC 8555 SS8.3: CAs never offer http-01 for a wildcard identifier --
+    // dns-01 is the only option regardless of the host's own setting.
+    if crate::config::is_wildcard_domain(&host.domain) {
+        return ChallengeMethod::Dns01;
+    }
+    match host.acme_challenge_type {
+        AcmeChallengeType::Http01 => ChallengeMethod::Http01,
+        AcmeChallengeType::Dns01 => ChallengeMethod::Dns01,
+        // http-01 needs port 80 reachable on this exact domain; nothing
+        // opens it without force_https, so Auto only picks http-01 when
+        // that's already true, falling back to dns-01 otherwise.
+        AcmeChallengeType::Auto => {
+            if host.force_https {
+                ChallengeMethod::Http01
+            } else {
+                ChallengeMethod::Dns01
+            }
+        }
+    }
+}
+
+/// Whether `proxy::run`'s port-80 listener (and the matching nftables
+/// rule) needs to exist purely to serve an http-01 challenge for this
+/// host -- independent of `force_https`, which already opens port 80 for
+/// its own, unrelated reason (the redirect).
+pub fn opens_port_80_for_acme(host: &ProxyHost) -> bool {
+    host.acme_enabled && resolve_challenge_type(host) == ChallengeMethod::Http01
+}
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const POLL_MAX_ATTEMPTS: u32 = 40; // ~2 minutes at 3s each
@@ -48,8 +91,12 @@ pub enum IssuanceError {
     Jws(#[from] JwsError),
     #[error(transparent)]
     Cert(#[from] cert::CertError),
+    #[error("order for {0} has no authorizations")]
+    NoAuthorization(String),
     #[error("no dns-01 challenge offered for {0}")]
     NoDns01Challenge(String),
+    #[error("no http-01 challenge offered for {0}")]
+    NoHttp01Challenge(String),
     #[error("authorization for {0} did not become valid (status: {1:?})")]
     AuthorizationFailed(String, AuthorizationStatus),
     #[error("order did not finalize (status: {0:?})")]
@@ -60,23 +107,42 @@ pub enum IssuanceError {
     Io(#[from] std::io::Error),
 }
 
-/// Runs the full issue/renew flow for one domain: order -> dns-01 ->
-/// finalize -> download -> persist to disk (0600) -> publish into
-/// `state`'s hot-reloadable cert map for SNI dispatch. The Cloudflare TXT
-/// record is always cleaned up on the way out, success or failure.
+/// Runs the full issue/renew flow for one host: order -> dns-01 or
+/// http-01 (per `resolve_challenge_type`) -> finalize -> download ->
+/// persist to disk (0600) -> publish into `state`'s hot-reloadable cert
+/// map for SNI dispatch. Whichever challenge fulfillment was published
+/// (a DNS TXT record, or an in-memory http-01 token) is always cleaned
+/// up on the way out, success or failure.
 pub async fn issue_certificate(
     state: &AppState,
     client: &AcmeClient,
     dns01: &dyn DnsProvider,
-    domain: &str,
+    host: &ProxyHost,
 ) -> Result<(), IssuanceError> {
+    let domain = &host.domain;
     let (order_url, order) = client.new_order(&[domain.to_string()]).await?;
     let authz_url = order
         .authorizations
         .first()
-        .ok_or_else(|| IssuanceError::NoDns01Challenge(domain.to_string()))?;
-
+        .ok_or_else(|| IssuanceError::NoAuthorization(domain.to_string()))?;
     let authz = client.get_authorization(authz_url).await?;
+
+    let issued = match resolve_challenge_type(host) {
+        ChallengeMethod::Dns01 => issue_via_dns01(client, dns01, domain, &authz, authz_url, &order_url, &order.finalize).await?,
+        ChallengeMethod::Http01 => issue_via_http01(state, client, domain, &authz, authz_url, &order_url, &order.finalize).await?,
+    };
+    publish_cert(state, domain, &issued).await
+}
+
+async fn issue_via_dns01(
+    client: &AcmeClient,
+    dns01: &dyn DnsProvider,
+    domain: &str,
+    authz: &Authorization,
+    authz_url: &str,
+    order_url: &str,
+    finalize_url: &str,
+) -> Result<IssuedCert, IssuanceError> {
     let challenge = authz
         .challenges
         .iter()
@@ -91,17 +157,46 @@ pub async fn issue_certificate(
     let zone = dns01.find_zone(zone_lookup_domain).await?;
     let record_id = dns01.create_txt_record(&zone, &record_name, &txt_value).await?;
 
+    // Real DNS propagation before an authoritative resolver-facing CA
+    // check succeeds is minutes, not seconds; http-01 has no equivalent
+    // wait since the challenge is served straight from memory.
+    tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
+
     // Everything from here on must still clean up the TXT record even on
     // failure -- run the rest of the flow and clean up unconditionally
     // afterward rather than threading `?` straight through.
-    let result = complete_order(client, &challenge.url, authz_url, &order_url, &order.finalize, domain).await;
+    let result = complete_order(client, &challenge.url, authz_url, order_url, finalize_url, domain).await;
 
     if let Err(err) = dns01.delete_txt_record(&zone, &record_id).await {
         tracing::warn!(domain, error = %err, "failed to clean up ACME challenge TXT record (left dangling with the DNS provider)");
     }
+    result
+}
 
-    let issued = result?;
-    publish_cert(state, domain, &issued).await
+async fn issue_via_http01(
+    state: &AppState,
+    client: &AcmeClient,
+    domain: &str,
+    authz: &Authorization,
+    authz_url: &str,
+    order_url: &str,
+    finalize_url: &str,
+) -> Result<IssuedCert, IssuanceError> {
+    let challenge = authz
+        .challenges
+        .iter()
+        .find(|c| c.typ == "http-01")
+        .ok_or_else(|| IssuanceError::NoHttp01Challenge(domain.to_string()))?;
+
+    let key_authorization = http01::key_authorization(&challenge.token, client.account_key());
+    state.set_http01_challenge(challenge.token.clone(), key_authorization);
+
+    // Same unconditional-cleanup shape as dns-01's TXT record -- the
+    // in-memory token must not outlive this one validation attempt,
+    // success or failure.
+    let result = complete_order(client, &challenge.url, authz_url, order_url, finalize_url, domain).await;
+    state.remove_http01_challenge(&challenge.token);
+    result
 }
 
 struct IssuedCert {
@@ -124,7 +219,6 @@ async fn complete_order(
     finalize_url: &str,
     domain: &str,
 ) -> Result<IssuedCert, IssuanceError> {
-    tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
     client.notify_challenge_ready(challenge_url).await?;
 
     let authz = poll_until(
@@ -263,7 +357,7 @@ async fn renew_if_needed(
         return Ok(());
     }
     tracing::info!(domain = %host.domain, "issuing/renewing certificate");
-    issue_certificate(state, client, dns01, &host.domain).await
+    issue_certificate(state, client, dns01, host).await
 }
 
 #[cfg(test)]
@@ -272,6 +366,65 @@ mod tests {
     use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig};
     use std::path::PathBuf;
     use wiremock::MockServer;
+
+    fn host(domain: &str, force_https: bool, challenge_type: AcmeChallengeType) -> ProxyHost {
+        ProxyHost {
+            id: uuid::Uuid::new_v4(),
+            domain: domain.into(),
+            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_port: 443,
+            upstream: "127.0.0.1:8000".into(),
+            websockets: false,
+            force_https,
+            acme_enabled: true,
+            acme_challenge_type: challenge_type,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn auto_resolves_to_http01_when_force_https_is_set() {
+        let h = host("example.com", true, AcmeChallengeType::Auto);
+        assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Http01);
+    }
+
+    #[test]
+    fn auto_resolves_to_dns01_without_force_https() {
+        let h = host("example.com", false, AcmeChallengeType::Auto);
+        assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Dns01);
+    }
+
+    #[test]
+    fn wildcard_domains_always_use_dns01_regardless_of_setting() {
+        let h = host("*.pages.example.com", true, AcmeChallengeType::Http01);
+        assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Dns01);
+    }
+
+    #[test]
+    fn explicit_http01_wins_even_without_force_https() {
+        let h = host("example.com", false, AcmeChallengeType::Http01);
+        assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Http01);
+    }
+
+    #[test]
+    fn explicit_dns01_wins_even_with_force_https() {
+        let h = host("example.com", true, AcmeChallengeType::Dns01);
+        assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Dns01);
+    }
+
+    #[test]
+    fn port_80_is_needed_for_acme_only_when_http01_is_resolved() {
+        assert!(opens_port_80_for_acme(&host("example.com", false, AcmeChallengeType::Http01)));
+        assert!(!opens_port_80_for_acme(&host("example.com", false, AcmeChallengeType::Dns01)));
+        assert!(!opens_port_80_for_acme(&host("example.com", false, AcmeChallengeType::Auto)));
+    }
+
+    #[test]
+    fn port_80_is_not_needed_for_acme_when_acme_is_disabled() {
+        let mut h = host("example.com", true, AcmeChallengeType::Http01);
+        h.acme_enabled = false;
+        assert!(!opens_port_80_for_acme(&h));
+    }
 
     async fn test_state(directory_url: String) -> AppState {
         let tmp = std::env::temp_dir().join(format!("rust-proxy-acme-test-{}", uuid::Uuid::new_v4()));

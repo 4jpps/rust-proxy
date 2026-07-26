@@ -183,6 +183,8 @@ struct HostRequest {
     force_https: bool,
     #[serde(default = "default_true")]
     acme_enabled: bool,
+    #[serde(default)]
+    acme_challenge_type: crate::config::AcmeChallengeType,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -214,6 +216,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         websockets: body.websockets,
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,
+        acme_challenge_type: body.acme_challenge_type,
         enabled: body.enabled,
     };
     let to_insert = host.clone();
@@ -240,6 +243,7 @@ async fn update_host(
         websockets: body.websockets,
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,
+        acme_challenge_type: body.acme_challenge_type,
         enabled: body.enabled,
     };
     let to_store = updated.clone();

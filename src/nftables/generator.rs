@@ -78,8 +78,10 @@ fn write_host_rules(out: &mut String, host: &ProxyHost) {
         "        tcp dport {} ip daddr {} accept",
         host.bind_port, host.bind_ip
     );
-    if host.force_https {
-        // The redirect listener itself still needs port 80 open.
+    if host.force_https || crate::acme::opens_port_80_for_acme(host) {
+        // The force_https redirect listener and/or an http-01 challenge
+        // listener (see `acme::opens_port_80_for_acme`) both need port
+        // 80 open.
         let _ = writeln!(out, "        tcp dport 80 ip daddr {} accept", host.bind_ip);
     }
     let _ = writeln!(out);
@@ -133,6 +135,7 @@ mod tests {
             websockets: false,
             force_https,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         }
     }
@@ -222,6 +225,14 @@ mod tests {
         let out = generate_ruleset(&[h], &[], &admin());
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(!out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
+    }
+
+    #[test]
+    fn host_with_http01_challenge_type_opens_port_80_without_force_https() {
+        let mut h = host("example.com", "10.0.0.2", 443, false);
+        h.acme_challenge_type = crate::config::AcmeChallengeType::Http01;
+        let out = generate_ruleset(&[h], &[], &admin());
+        assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
     }
 
     #[test]

@@ -4,11 +4,11 @@ A lightweight L7 reverse proxy daemon in Rust, built as an open,
 self-hostable alternative to Nginx Proxy Manager: HTTP/1.1+HTTP/2 and
 WebSocket reverse proxying with SNI-based TLS, a native RFC 8555 ACME
 client (dns-01 via a
-pluggable DNS provider -- Cloudflare, DigitalOcean, or Hetzner today),
-dynamic default-DROP nftables firewall orchestration, arbitrary TCP/UDP
-port passthrough, and a small embedded web admin UI. Runs on anything
-from a single dedicated IP to a full subnet block -- see Configuration
-below.
+pluggable DNS provider -- Cloudflare, DigitalOcean, or Hetzner today --
+or http-01, needing no DNS credentials at all), dynamic default-DROP
+nftables firewall orchestration, arbitrary TCP/UDP port passthrough,
+and a small embedded web admin UI. Runs on anything from a single
+dedicated IP to a full subnet block -- see Configuration below.
 
 ## Building and testing
 
@@ -44,6 +44,16 @@ range you control.
 first boot. After that, sqlite (`admin.db_path`) is the source of
 truth and everything is managed from the admin UI, not by re-editing
 the file.
+
+Each host picks its own ACME challenge type via `acme_challenge_type`:
+`auto` (the default) uses http-01 when the host has `force_https` on
+(port 80 is already open for the redirect, so no DNS provider
+credentials are needed) and falls back to dns-01 otherwise; `http01`
+and `dns01` force one or the other explicitly. A wildcard domain
+(`*.example.com`) always uses dns-01 regardless of this setting -- CAs
+never offer http-01 for a wildcard identifier. Choosing `http01`
+without `force_https` still opens a port-80 listener/firewall rule for
+that host, just to answer the challenge.
 
 ## API
 
@@ -98,7 +108,7 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 |--------|-------------------------|-------------------------------------------------------------------------------------------|
 | GET    | `/api/dashboard`        | -- (host/port-rule/cert counts, configured `bind_ranges`)                                 |
 | GET    | `/api/hosts`            | --                                                                                         |
-| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","enabled"}` |
+| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","enabled"}` |
 | PUT    | `/api/hosts/:id`        | same shape as POST                                                                         |
 | DELETE | `/api/hosts/:id`        | --                                                                                         |
 | GET    | `/api/port-rules`       | --                                                                                         |
@@ -136,10 +146,13 @@ for the token-authenticated API.
 - `acme` -- native RFC 8555 client: JWS framing (`jws`), wire types
   (`types`), the HTTP state machine (`client`), pluggable dns-01
   (`dns01` -- a `DnsProvider` trait plus one implementation per provider:
-  `dns01::cloudflare`, `dns01::digitalocean`, `dns01::hetzner`), and
-  CSR/certificate handling (`cert`). `run_renewal_loop`
-  checks every ACME-enabled host every 12h and re-issues anything
-  within `acme.renew_before_days` of expiry.
+  `dns01::cloudflare`, `dns01::digitalocean`, `dns01::hetzner`), http-01
+  (`http01` -- serves the key authorization from an in-memory map on
+  `proxy::mod`'s port-80 listener, no third-party credentials needed),
+  and CSR/certificate handling (`cert`). `resolve_challenge_type` picks
+  which one a given host actually uses (see Configuration above).
+  `run_renewal_loop` checks every ACME-enabled host every 12h and
+  re-issues anything within `acme.renew_before_days` of expiry.
 - `proxy` -- the data plane: `router` (pure host-matching), `tls`
   (SNI cert dispatch reading live state), `http` (forwarding +
   WebSocket upgrade passthrough), `passthrough` (raw TCP/UDP for

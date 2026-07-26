@@ -15,6 +15,8 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
+use crate::state::AppState;
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
@@ -99,6 +101,28 @@ pub fn https_redirect_response<B>(req: &Request<B>) -> Response<BoxBody<Bytes, h
         .expect("static redirect response is always valid")
 }
 
+/// If `req`'s path is an ACME http-01 challenge fetch
+/// (`/.well-known/acme-challenge/<token>`) for a token `state` currently
+/// has a pending key authorization for, serves it directly per RFC 8555
+/// SS8.3. This must be checked before `https_redirect_response` on a
+/// `force_https` host's port-80 listener -- the CA's validator speaks
+/// plain HTTP and never follows a redirect to `https`.
+pub fn http01_challenge_response<B>(state: &AppState, req: &Request<B>) -> Option<Response<BoxBody<Bytes, hyper::Error>>> {
+    let token = req.uri().path().strip_prefix(crate::acme::http01::CHALLENGE_PATH_PREFIX)?;
+    let key_authorization = state.get_http01_challenge(token)?;
+    Some(
+        Response::builder()
+            .status(hyper::StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/plain")
+            .body(
+                http_body_util::Full::new(Bytes::from(key_authorization))
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed(),
+            )
+            .expect("static challenge response is always valid"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +168,71 @@ mod tests {
         assert_eq!(resp.status(), hyper::StatusCode::MOVED_PERMANENTLY);
         let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
         assert_eq!(location, "https://example.com/some/path?x=1");
+    }
+
+    async fn test_state() -> AppState {
+        use crate::config::{AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig};
+        use std::path::PathBuf;
+
+        let cfg = Config {
+            network: NetworkConfig { bind_ranges: vec![] },
+            admin: AdminConfig {
+                bind_ip: "127.0.0.1".parse().unwrap(),
+                bind_port: 8080,
+                allowed_ips: vec![],
+                session_secret: "test-secret".into(),
+                admin_username: "admin".into(),
+                admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                db_path: PathBuf::from(":memory:"),
+            },
+            acme: AcmeConfig {
+                directory_url: "https://example.invalid/directory".into(),
+                contact_email: "admin@example.com".into(),
+                dns_provider: DnsProviderKind::Cloudflare,
+                dns_api_token: "token".into(),
+                cert_dir: PathBuf::from("/tmp/certs"),
+                account_key_path: PathBuf::from("/tmp/account.key"),
+                renew_before_days: 30,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+        };
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        AppState::new(cfg, pool, vec![], vec![])
+    }
+
+    #[tokio::test]
+    async fn http01_challenge_response_serves_a_pending_key_authorization() {
+        let state = test_state().await;
+        state.set_http01_challenge("tok-1".into(), "tok-1.thumbprint".into());
+
+        let req = Request::builder()
+            .uri("/.well-known/acme-challenge/tok-1")
+            .body(())
+            .unwrap();
+        let resp = http01_challenge_response(&state, &req).unwrap();
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("tok-1.thumbprint"));
+    }
+
+    #[tokio::test]
+    async fn http01_challenge_response_is_none_for_an_unknown_token() {
+        let state = test_state().await;
+        let req = Request::builder()
+            .uri("/.well-known/acme-challenge/unknown")
+            .body(())
+            .unwrap();
+        assert!(http01_challenge_response(&state, &req).is_none());
+    }
+
+    #[tokio::test]
+    async fn http01_challenge_response_is_none_for_unrelated_paths() {
+        let state = test_state().await;
+        state.set_http01_challenge("tok-1".into(), "tok-1.thumbprint".into());
+        let req = Request::builder().uri("/some/other/path").body(()).unwrap();
+        assert!(http01_challenge_response(&state, &req).is_none());
     }
 
     #[test]

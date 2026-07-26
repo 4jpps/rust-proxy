@@ -72,7 +72,7 @@ fn reconcile(
         spawn_https_listener(state.clone(), key.0, key.1)
     });
     reconcile_map(redirects, &router::redirect_listener_keys(&hosts), |key| {
-        spawn_redirect_listener(key.0, key.1)
+        spawn_redirect_listener(state.clone(), key.0, key.1)
     });
     reconcile_map(passthroughs, &passthrough_keys(&port_rules), |key| {
         spawn_passthrough_listener(&port_rules, key.0, key.1, key.2)
@@ -218,7 +218,11 @@ async fn handle_https_request(
     }
 }
 
-fn spawn_redirect_listener(bind_ip: Ipv4Addr, bind_port: u16) -> JoinHandle<()> {
+/// Serves both plain-HTTP purposes port 80 ever has here: an ACME http-01
+/// challenge fetch (checked first -- see `http::http01_challenge_response`,
+/// since the CA's validator never follows a redirect) and, for anything
+/// else, the `force_https` redirect to the same path on `https`.
+fn spawn_redirect_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
         let addr = SocketAddr::from((bind_ip, bind_port));
         let listener = match TcpListener::bind(addr).await {
@@ -239,8 +243,15 @@ fn spawn_redirect_listener(bind_ip: Ipv4Addr, bind_port: u16) -> JoinHandle<()> 
                 }
             };
             let io = TokioIo::new(stream);
-            let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
-                Ok::<_, std::convert::Infallible>(http::https_redirect_response(&req))
+            let state = state.clone();
+            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let state = state.clone();
+                async move {
+                    if let Some(resp) = http::http01_challenge_response(&state, &req) {
+                        return Ok::<_, std::convert::Infallible>(resp);
+                    }
+                    Ok::<_, std::convert::Infallible>(http::https_redirect_response(&req))
+                }
             });
             tokio::spawn(async move {
                 let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;

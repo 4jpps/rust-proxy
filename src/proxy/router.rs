@@ -49,12 +49,16 @@ pub fn https_listener_keys(hosts: &[ProxyHost]) -> Vec<(Ipv4Addr, u16)> {
     keys
 }
 
-/// Every unique `(bind_ip, 80)` an enabled `force_https` host needs a
-/// plain-HTTP redirect listener on.
+/// Every unique `(bind_ip, 80)` an enabled host needs a plain-HTTP
+/// listener on -- either a `force_https` redirect, or purely to serve an
+/// http-01 challenge (see `acme::opens_port_80_for_acme`) for a host
+/// that doesn't otherwise force HTTPS. The listener itself (`proxy::mod`)
+/// always checks for a pending challenge before falling back to the
+/// redirect response, so one listener per bind_ip serves both purposes.
 pub fn redirect_listener_keys(hosts: &[ProxyHost]) -> Vec<(Ipv4Addr, u16)> {
     let mut keys: Vec<(Ipv4Addr, u16)> = hosts
         .iter()
-        .filter(|h| h.enabled && h.force_https)
+        .filter(|h| h.enabled && (h.force_https || crate::acme::opens_port_80_for_acme(h)))
         .map(|h| (h.bind_ip, 80u16))
         .collect();
     keys.sort();
@@ -77,6 +81,7 @@ mod tests {
             websockets: false,
             force_https,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled,
         }
     }
@@ -178,6 +183,24 @@ mod tests {
         ];
         let keys = redirect_listener_keys(&hosts);
         assert_eq!(keys, vec![("10.0.0.2".parse().unwrap(), 80)]);
+    }
+
+    #[test]
+    fn redirect_listener_keys_include_http01_only_hosts_without_force_https() {
+        let mut h = host("a.example.com", "10.0.0.3", 443, false, true);
+        h.acme_challenge_type = crate::config::AcmeChallengeType::Http01;
+        let keys = redirect_listener_keys(&[h]);
+        assert_eq!(keys, vec![("10.0.0.3".parse().unwrap(), 80)]);
+    }
+
+    #[test]
+    fn redirect_listener_keys_exclude_wildcard_hosts_forced_to_dns01() {
+        // Explicit Http01 is ignored for a wildcard domain --
+        // `acme::resolve_challenge_type` always resolves it to dns-01,
+        // so no port-80 listener is needed for ACME purposes here.
+        let mut h = host("*.pages.example.com", "10.0.0.3", 443, false, true);
+        h.acme_challenge_type = crate::config::AcmeChallengeType::Http01;
+        assert!(redirect_listener_keys(&[h]).is_empty());
     }
 
     #[test]

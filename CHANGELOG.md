@@ -7,6 +7,13 @@
   Deliberately doesn't enable HTTP/2 Extended CONNECT (RFC 8441), so
   WebSocket clients cleanly negotiate HTTP/1.1 instead (same split
   Nginx makes) -- see `proxy/mod.rs`'s `build_https_server_config`.
+- http-01 ACME challenges as an alternative to dns-01 -- no DNS provider
+  credentials needed for a plain (non-wildcard) domain. New per-host
+  `acme_challenge_type` setting (`auto`/`http01`/`dns01`; `auto` uses
+  http-01 whenever `force_https` already has port 80 open, dns-01
+  otherwise). Wildcard domains always use dns-01 regardless of this
+  setting, since no CA offers http-01 for them. See `acme::http01` and
+  `acme::resolve_challenge_type`.
 
 ## [0.1.0] - 2026-07-26
 

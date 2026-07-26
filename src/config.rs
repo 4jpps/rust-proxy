@@ -148,6 +148,12 @@ pub struct ProxyHost {
     pub force_https: bool,
     #[serde(default = "default_true")]
     pub acme_enabled: bool,
+    /// Which ACME challenge type to use -- see `acme::resolve_challenge_type`
+    /// for how `Auto` actually resolves (wildcard domains always get
+    /// dns-01 regardless of this setting; CAs never offer http-01 for
+    /// them).
+    #[serde(default)]
+    pub acme_challenge_type: AcmeChallengeType,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -157,6 +163,32 @@ fn default_https_port() -> u16 {
 }
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AcmeChallengeType {
+    /// http-01 for a plain domain with `force_https` (no DNS provider
+    /// credentials needed -- the common case), dns-01 for a wildcard
+    /// domain or a plain domain without `force_https` (http-01 needs
+    /// port 80 reachable, which nothing opens without it).
+    Auto,
+    Http01,
+    Dns01,
+}
+
+impl Default for AcmeChallengeType {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// `*.` leading label, same shape `validate_domain` already accepts --
+/// shared here since both config validation and ACME challenge-type
+/// resolution (`acme::resolve_challenge_type`) need to recognize a
+/// wildcard domain.
+pub fn is_wildcard_domain(domain: &str) -> bool {
+    domain.starts_with("*.")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +411,7 @@ dns_api_token = "token-placeholder"
             websockets: false,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -397,6 +430,7 @@ dns_api_token = "token-placeholder"
             websockets: false,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         });
         assert!(cfg.validate().is_ok(), "bind_ip in the second range should be accepted");
@@ -414,6 +448,7 @@ dns_api_token = "token-placeholder"
             websockets: false,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -431,6 +466,7 @@ dns_api_token = "token-placeholder"
             websockets: false,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -507,6 +543,7 @@ dns_api_token = "token-placeholder"
                 websockets: false,
                 force_https: true,
                 acme_enabled: true,
+                acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 enabled: true,
             });
         }
@@ -529,6 +566,7 @@ dns_api_token = "token-placeholder"
                 websockets: false,
                 force_https: true,
                 acme_enabled: true,
+                acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 enabled: true,
             });
         }
@@ -547,6 +585,7 @@ dns_api_token = "token-placeholder"
             websockets: false,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -574,6 +613,7 @@ dns_api_token = "token-placeholder"
             websockets: false,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());

@@ -53,6 +53,11 @@ dns_api_token = "your-dns-provider-api-token-with-dns-edit-scope"
 # websockets = true
 # force_https = true
 # acme_enabled = true
+# acme_challenge_type defaults to "auto" (http-01 when force_https is
+# on, since port 80 is already open; dns-01 otherwise). Set explicitly
+# to "http01" or "dns01" to override; wildcard domains always use
+# dns-01 regardless of this setting.
+# acme_challenge_type = "auto"
 # enabled = true
 
 # Example port rule -- RustDesk, forwarded from the /29 to a local

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::config::{PortRule, Protocol, ProxyHost};
+use crate::config::{AcmeChallengeType, PortRule, Protocol, ProxyHost};
 
 pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let url = if db_path.as_os_str() == ":memory:" {
@@ -44,12 +44,21 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             websockets INTEGER NOT NULL,
             force_https INTEGER NOT NULL,
             acme_enabled INTEGER NOT NULL,
+            acme_challenge_type TEXT NOT NULL DEFAULT 'auto',
             enabled INTEGER NOT NULL
         )
         "#,
     )
     .execute(pool)
     .await?;
+    // A pre-existing `hosts` table (from before `acme_challenge_type`
+    // existed) won't have this column -- `CREATE TABLE IF NOT EXISTS`
+    // only runs for a brand-new database, so an upgrade needs its own
+    // `ALTER TABLE`. Ignore the error when the column's already there
+    // (sqlite has no `ADD COLUMN IF NOT EXISTS`); the `DEFAULT 'auto'`
+    // above only applies to genuinely new tables, so this also backfills
+    // existing rows to the same default.
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acme_challenge_type TEXT NOT NULL DEFAULT 'auto'").execute(pool).await;
 
     sqlx::query(
         r#"
@@ -159,11 +168,18 @@ fn parse_rfc3339(s: &str) -> DateTime<Utc> {
 }
 
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, enabled FROM hosts")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, enabled FROM hosts",
+    )
+    .fetch_all(pool)
+    .await?;
     rows.into_iter()
         .map(|row| {
+            let challenge_type = match row.get::<String, _>("acme_challenge_type").as_str() {
+                "http01" => AcmeChallengeType::Http01,
+                "dns01" => AcmeChallengeType::Dns01,
+                _ => AcmeChallengeType::Auto,
+            };
             Ok(ProxyHost {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 domain: row.get("domain"),
@@ -173,6 +189,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 websockets: row.get::<i64, _>("websockets") != 0,
                 force_https: row.get::<i64, _>("force_https") != 0,
                 acme_enabled: row.get::<i64, _>("acme_enabled") != 0,
+                acme_challenge_type: challenge_type,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -183,8 +200,13 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM hosts").execute(&mut *tx).await?;
     for h in hosts {
+        let challenge_type = match h.acme_challenge_type {
+            AcmeChallengeType::Auto => "auto",
+            AcmeChallengeType::Http01 => "http01",
+            AcmeChallengeType::Dns01 => "dns01",
+        };
         sqlx::query(
-            "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -194,6 +216,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.websockets as i64)
         .bind(h.force_https as i64)
         .bind(h.acme_enabled as i64)
+        .bind(challenge_type)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -270,6 +293,7 @@ mod tests {
             websockets: true,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         }
     }

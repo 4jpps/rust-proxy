@@ -29,6 +29,13 @@ struct Inner {
     hosts: ArcSwap<Vec<ProxyHost>>,
     port_rules: ArcSwap<Vec<PortRule>>,
     certs: ArcSwap<HashMap<String, CertEntry>>,
+    /// Pending http-01 challenges, keyed by token: `acme::issue_via_http01`
+    /// publishes the key authorization here before telling the CA the
+    /// challenge is ready, and `proxy::http`'s port-80 request handler
+    /// reads it back to answer `/.well-known/acme-challenge/<token>`.
+    /// Tokens are opaque and global (not scoped per-host), so a plain
+    /// lookup by token is all serving one needs -- no host matching.
+    http01_challenges: ArcSwap<HashMap<String, String>>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
     /// and `proxy::run`'s listener supervisor can both re-sync immediately
     /// instead of polling on a timer. `notify_waiters` (not `notify_one`)
@@ -59,6 +66,7 @@ impl AppState {
             hosts: ArcSwap::from_pointee(hosts),
             port_rules: ArcSwap::from_pointee(port_rules),
             certs: ArcSwap::from_pointee(HashMap::new()),
+            http01_challenges: ArcSwap::from_pointee(HashMap::new()),
             config_dirty: Notify::new(),
             db,
             hosts_write_lock: Mutex::new(()),
@@ -127,6 +135,25 @@ impl AppState {
         next.insert(domain, entry);
         self.0.certs.store(Arc::new(next));
     }
+
+    /// Publishes an http-01 key authorization for `token`, copy-on-write
+    /// like `certs`/`hosts` -- reads (every plain-HTTP request on port
+    /// 80) are far more frequent than writes (once per issuance attempt).
+    pub fn set_http01_challenge(&self, token: String, key_authorization: String) {
+        let mut next = (*self.0.http01_challenges.load_full()).clone();
+        next.insert(token, key_authorization);
+        self.0.http01_challenges.store(Arc::new(next));
+    }
+
+    pub fn get_http01_challenge(&self, token: &str) -> Option<String> {
+        self.0.http01_challenges.load().get(token).cloned()
+    }
+
+    pub fn remove_http01_challenge(&self, token: &str) {
+        let mut next = (*self.0.http01_challenges.load_full()).clone();
+        next.remove(token);
+        self.0.http01_challenges.store(Arc::new(next));
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +209,7 @@ mod tests {
             websockets: false,
             force_https: true,
             acme_enabled: true,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             enabled: true,
         }]);
 
@@ -206,6 +234,18 @@ mod tests {
         assert_eq!(state.hosts().len(), 0);
     }
 
+    #[tokio::test]
+    async fn http01_challenge_round_trips_by_token() {
+        let state = test_state().await;
+        assert_eq!(state.get_http01_challenge("token-1"), None);
+
+        state.set_http01_challenge("token-1".into(), "token-1.thumbprint".into());
+        assert_eq!(state.get_http01_challenge("token-1"), Some("token-1.thumbprint".into()));
+
+        state.remove_http01_challenge("token-1");
+        assert_eq!(state.get_http01_challenge("token-1"), None);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_reads_and_writes_never_panic_or_deadlock() {
         let state = test_state().await;
@@ -223,6 +263,7 @@ mod tests {
                     websockets: false,
                     force_https: true,
                     acme_enabled: true,
+                    acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                     enabled: true,
                 }]);
             }));
