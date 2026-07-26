@@ -27,7 +27,16 @@ admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE$WITHREALHASH"
 
 [acme]
 contact_email = "admin@example.com"
-cloudflare_api_token = "your-cloudflare-api-token-with-dns-edit-scope"
+# dns_provider defaults to "cloudflare" if omitted. Also supported:
+# "digitalocean", "hetzner". All three use a single bearer/header API
+# token, so dns_api_token covers whichever one you pick below.
+# dns_provider = "cloudflare"
+#
+# Cloudflare: an API token (not the legacy Global API Key) scoped to
+#   Zone:DNS:Edit for the zone(s) you'll issue certs under.
+# DigitalOcean: a personal access token with write access.
+# Hetzner: a DNS API token from the Hetzner DNS Console.
+dns_api_token = "your-dns-provider-api-token-with-dns-edit-scope"
 # directory_url defaults to Let's Encrypt production -- point this at
 # https://acme-staging-v02.api.letsencrypt.org/directory while testing,
 # to avoid production rate limits.

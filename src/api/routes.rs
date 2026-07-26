@@ -396,7 +396,8 @@ mod tests {
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
                 contact_email: "admin@example.com".into(),
-                cloudflare_api_token: "token".into(),
+                dns_provider: crate::config::DnsProviderKind::Cloudflare,
+                dns_api_token: "token".into(),
                 cert_dir: PathBuf::from("/tmp/certs"),
                 account_key_path: PathBuf::from("/tmp/account.key"),
                 renew_before_days: 30,

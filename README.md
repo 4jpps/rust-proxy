@@ -3,10 +3,11 @@
 A lightweight L7 reverse proxy daemon in Rust, built as an open,
 self-hostable alternative to Nginx Proxy Manager: HTTP/WebSocket reverse
 proxying with SNI-based TLS, a native RFC 8555 ACME client (dns-01 via a
-pluggable DNS provider), dynamic default-DROP nftables firewall
-orchestration, arbitrary TCP/UDP port passthrough, and a small embedded
-web admin UI. Runs on anything from a single dedicated IP to a full
-subnet block -- see Configuration below.
+pluggable DNS provider -- Cloudflare, DigitalOcean, or Hetzner today),
+dynamic default-DROP nftables firewall orchestration, arbitrary TCP/UDP
+port passthrough, and a small embedded web admin UI. Runs on anything
+from a single dedicated IP to a full subnet block -- see Configuration
+below.
 
 ## Building and testing
 
@@ -24,7 +25,14 @@ persistence tests run against an in-memory sqlite database.
 Copy `deploy/config.toml.example` to `/etc/rust-proxy/config.toml` and
 fill in `admin.session_secret` (`openssl rand -hex 32`),
 `admin.admin_password_hash` (`rust-proxy hash-password '...'`), and
-your DNS provider's ACME credentials. `network.bind_ranges` is optional
+`acme.dns_api_token` for whichever `acme.dns_provider` you use
+(`cloudflare`, the default if omitted; `digitalocean`; or `hetzner` --
+all three take a single bearer/header API token, see the comments in
+`deploy/config.toml.example`). Adding another provider means one new
+file under `src/acme/dns01/` implementing the `DnsProvider` trait
+(`find_zone`/`create_txt_record`/`delete_txt_record`) plus a new
+`DnsProviderKind` variant -- PRs for more providers welcome.
+`network.bind_ranges` is optional
 and empty by default -- unrestricted, bind to whatever address the
 environment actually has, whether that's a single dedicated IP, a full
 LXC /29 block, or several disjoint ranges. Populate it only if you want
@@ -51,8 +59,10 @@ the file.
   one explicit ACCEPT per active host/port-rule bind); `nftables::apply`
   is the thin layer that actually shells out to `nft -f -`.
 - `acme` -- native RFC 8555 client: JWS framing (`jws`), wire types
-  (`types`), the HTTP state machine (`client`), Cloudflare dns-01
-  (`dns01`), and CSR/certificate handling (`cert`). `run_renewal_loop`
+  (`types`), the HTTP state machine (`client`), pluggable dns-01
+  (`dns01` -- a `DnsProvider` trait plus one implementation per provider:
+  `dns01::cloudflare`, `dns01::digitalocean`, `dns01::hetzner`), and
+  CSR/certificate handling (`cert`). `run_renewal_loop`
   checks every ACME-enabled host every 12h and re-issues anything
   within `acme.renew_before_days` of expiry.
 - `proxy` -- the data plane: `router` (pure host-matching), `tls`

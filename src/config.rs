@@ -72,12 +72,37 @@ fn default_db_path() -> PathBuf {
     PathBuf::from("/etc/rust-proxy/rust-proxy.db")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsProviderKind {
+    Cloudflare,
+    DigitalOcean,
+    Hetzner,
+}
+
+impl Default for DnsProviderKind {
+    /// Matches the original Cloudflare-only behavior for anyone upgrading
+    /// an existing config.toml that predates `dns_provider` -- an absent
+    /// field must not silently switch providers out from under a live
+    /// deployment.
+    fn default() -> Self {
+        Self::Cloudflare
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcmeConfig {
     #[serde(default = "default_acme_directory")]
     pub directory_url: String,
     pub contact_email: String,
-    pub cloudflare_api_token: String,
+    #[serde(default)]
+    pub dns_provider: DnsProviderKind,
+    /// API token for whichever `dns_provider` is selected -- a Cloudflare
+    /// API token with Zone:DNS:Edit, a DigitalOcean personal access
+    /// token, or a Hetzner DNS API token. All three providers use a
+    /// single bearer/header token, so one field covers all of them
+    /// instead of a per-provider config block.
+    pub dns_api_token: String,
     #[serde(default = "default_cert_dir")]
     pub cert_dir: PathBuf,
     #[serde(default = "default_account_key_path")]
@@ -299,7 +324,7 @@ admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g"
 
 [acme]
 contact_email = "admin@example.com"
-cloudflare_api_token = "token-placeholder"
+dns_api_token = "token-placeholder"
 "#
         .to_string()
     }

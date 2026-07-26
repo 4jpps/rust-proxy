@@ -1,9 +1,10 @@
 //! Native RFC 8555 ACME v2 engine: JWS framing (`jws`), protocol wire
-//! types (`types`), the HTTP client/state machine (`client`), Cloudflare
-//! dns-01 fulfillment (`dns01`), and CSR/certificate handling (`cert`).
-//! `run_renewal_loop` is what `main.rs` spawns; `issue_certificate` is the
-//! single-domain issuance flow it (and a future manual "trigger ACME
-//! validation" admin API call) drives.
+//! types (`types`), the HTTP client/state machine (`client`), pluggable
+//! dns-01 fulfillment (`dns01`, one `DnsProvider` impl per supported DNS
+//! host), and CSR/certificate handling (`cert`). `run_renewal_loop` is
+//! what `main.rs` spawns; `issue_certificate` is the single-domain
+//! issuance flow it (and a future manual "trigger ACME validation" admin
+//! API call) drives.
 
 pub mod cert;
 pub mod client;
@@ -15,10 +16,10 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::config::ProxyHost;
+use crate::config::{DnsProviderKind, ProxyHost};
 use crate::state::AppState;
 use client::{AcmeClient, AcmeError};
-use dns01::{acme_challenge_record_name, dns01_txt_value, CloudflareDns01, Dns01Error};
+use dns01::{acme_challenge_record_name, dns01_txt_value, CloudflareDns01, DigitalOceanDns01, Dns01Error, DnsProvider, HetznerDns01};
 use jws::{AccountKey, JwsError};
 use types::{AuthorizationStatus, OrderStatus};
 
@@ -58,7 +59,7 @@ pub enum IssuanceError {
 pub async fn issue_certificate(
     state: &AppState,
     client: &AcmeClient,
-    dns01: &CloudflareDns01,
+    dns01: &dyn DnsProvider,
     domain: &str,
 ) -> Result<(), IssuanceError> {
     let (order_url, order) = client.new_order(&[domain.to_string()]).await?;
@@ -77,18 +78,18 @@ pub async fn issue_certificate(
     let txt_value = dns01_txt_value(&challenge.token, client.account_key());
     let record_name = acme_challenge_record_name(domain);
     // Zone lookup wants the real domain, not the wildcard label -- no
-    // Cloudflare zone is ever literally named "*.something".
+    // DNS zone is ever literally named "*.something".
     let zone_lookup_domain = domain.strip_prefix("*.").unwrap_or(domain);
-    let zone_id = dns01.find_zone_id(zone_lookup_domain).await?;
-    let record_id = dns01.create_txt_record(&zone_id, &record_name, &txt_value).await?;
+    let zone = dns01.find_zone(zone_lookup_domain).await?;
+    let record_id = dns01.create_txt_record(&zone, &record_name, &txt_value).await?;
 
     // Everything from here on must still clean up the TXT record even on
     // failure -- run the rest of the flow and clean up unconditionally
     // afterward rather than threading `?` straight through.
     let result = complete_order(client, &challenge.url, authz_url, &order_url, &order.finalize, domain).await;
 
-    if let Err(err) = dns01.delete_txt_record(&zone_id, &record_id).await {
-        tracing::warn!(domain, error = %err, "failed to clean up ACME challenge TXT record (left dangling in Cloudflare)");
+    if let Err(err) = dns01.delete_txt_record(&zone, &record_id).await {
+        tracing::warn!(domain, error = %err, "failed to clean up ACME challenge TXT record (left dangling with the DNS provider)");
     }
 
     let issued = result?;
@@ -199,11 +200,15 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
     client.new_account(&state.acme().contact_email).await?;
 
     let http = reqwest::Client::new();
-    let dns01 = CloudflareDns01::new(http, state.acme().cloudflare_api_token.clone());
+    let dns01: Box<dyn DnsProvider> = match state.acme().dns_provider {
+        DnsProviderKind::Cloudflare => Box::new(CloudflareDns01::new(http, state.acme().dns_api_token.clone())),
+        DnsProviderKind::DigitalOcean => Box::new(DigitalOceanDns01::new(http, state.acme().dns_api_token.clone())),
+        DnsProviderKind::Hetzner => Box::new(HetznerDns01::new(http, state.acme().dns_api_token.clone())),
+    };
 
     loop {
         for host in state.hosts().iter().filter(|h| h.acme_enabled && h.enabled) {
-            if let Err(err) = renew_if_needed(&state, &client, &dns01, host).await {
+            if let Err(err) = renew_if_needed(&state, &client, dns01.as_ref(), host).await {
                 tracing::error!(domain = %host.domain, error = %err, "certificate issuance/renewal failed");
             }
         }
@@ -214,7 +219,7 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
 async fn renew_if_needed(
     state: &AppState,
     client: &AcmeClient,
-    dns01: &CloudflareDns01,
+    dns01: &dyn DnsProvider,
     host: &ProxyHost,
 ) -> Result<(), IssuanceError> {
     let renew_before = chrono::Duration::days(state.acme().renew_before_days);
