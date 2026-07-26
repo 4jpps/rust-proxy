@@ -8,10 +8,12 @@
 //! data) so mutations are simple delete-all-then-reinsert-all rather than
 //! per-row diffing.
 
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
+use uuid::Uuid;
 
 use crate::config::{PortRule, Protocol, ProxyHost};
 
@@ -66,7 +68,94 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Only `token_hash` is ever persisted -- the plaintext token is shown
+    // to the caller exactly once, at creation, and never stored anywhere.
+    // `UNIQUE` on the hash isn't a meaningful collision defense (256-bit
+    // digests don't collide in practice); it's there so a lookup during
+    // auth can never ambiguously match more than one token.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
+}
+
+/// Metadata about an API token, as returned by the admin API -- never
+/// includes the hash (nothing outside `find_api_token_id_by_hash` needs
+/// it) or the plaintext (never persisted at all, see `create_api_token`).
+pub struct ApiTokenMeta {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+pub async fn create_api_token(pool: &SqlitePool, id: Uuid, name: &str, token_hash: &str, created_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO api_tokens (id, name, token_hash, created_at, last_used_at) VALUES (?, ?, ?, ?, NULL)")
+        .bind(id.to_string())
+        .bind(name)
+        .bind(token_hash)
+        .bind(created_at.to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_api_tokens(pool: &SqlitePool) -> Result<Vec<ApiTokenMeta>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, name, created_at, last_used_at FROM api_tokens ORDER BY created_at ASC")
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ApiTokenMeta {
+                id: Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4()),
+                name: row.get("name"),
+                created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
+                last_used_at: row.get::<Option<String>, _>("last_used_at").map(|s| parse_rfc3339(&s)),
+            })
+        })
+        .collect()
+}
+
+/// Looks up a token by the hash of its plaintext (never by plaintext
+/// itself -- callers hash first, see `api::auth::hash_api_token`).
+pub async fn find_api_token_id_by_hash(pool: &SqlitePool, token_hash: &str) -> Result<Option<Uuid>, sqlx::Error> {
+    let row = sqlx::query("SELECT id FROM api_tokens WHERE token_hash = ?")
+        .bind(token_hash)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| Uuid::parse_str(r.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4())))
+}
+
+/// Best-effort last-used tracking, called on every successful token auth
+/// -- a failure here should never fail the request it's just bookkeeping
+/// for, so callers log-and-ignore rather than propagate the error.
+pub async fn touch_api_token_last_used(pool: &SqlitePool, id: Uuid, when: DateTime<Utc>) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
+        .bind(when.to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_api_token(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM api_tokens WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    Ok(result.rows_affected() > 0)
+}
+
+fn parse_rfc3339(s: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
 }
 
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
@@ -242,5 +331,53 @@ mod tests {
 
         let loaded = load_port_rules(&pool).await.unwrap();
         assert_eq!(loaded[0].passthrough_target, None);
+    }
+
+    #[tokio::test]
+    async fn created_api_token_appears_in_the_list_with_no_last_used_at() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+
+        let tokens = list_api_tokens(&pool).await.unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].id, id);
+        assert_eq!(tokens[0].name, "ci pipeline");
+        assert_eq!(tokens[0].last_used_at, None);
+    }
+
+    #[tokio::test]
+    async fn api_token_is_found_by_its_hash_and_not_by_a_wrong_one() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+
+        assert_eq!(find_api_token_id_by_hash(&pool, "hash-of-token").await.unwrap(), Some(id));
+        assert_eq!(find_api_token_id_by_hash(&pool, "wrong-hash").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn touching_an_api_token_updates_its_last_used_at() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+
+        let now = Utc::now();
+        touch_api_token_last_used(&pool, id, now).await.unwrap();
+
+        let tokens = list_api_tokens(&pool).await.unwrap();
+        let last_used = tokens[0].last_used_at.expect("should be set after touch");
+        assert_eq!(last_used.timestamp(), now.timestamp());
+    }
+
+    #[tokio::test]
+    async fn deleting_an_api_token_removes_it_and_reports_whether_it_existed() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+
+        assert!(delete_api_token(&pool, id).await.unwrap());
+        assert!(list_api_tokens(&pool).await.unwrap().is_empty());
+        assert!(!delete_api_token(&pool, id).await.unwrap(), "deleting again should report nothing was found");
     }
 }

@@ -31,7 +31,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/port-rules", get(list_port_rules).post(create_port_rule))
         .route("/api/port-rules/:id", axum::routing::put(update_port_rule).delete(delete_port_rule))
         .route("/api/certs", get(list_certs))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_session));
+        .route("/api/tokens", get(list_api_tokens).post(create_api_token))
+        .route("/api/tokens/:id", axum::routing::delete(delete_api_token))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
         .route("/", get(admin_ui))
@@ -46,12 +48,48 @@ async fn admin_ui() -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], ADMIN_UI_HTML).into_response()
 }
 
-async fn require_session(State(state): State<AppState>, cookies: Cookies, req: Request, next: Next) -> Response {
-    let token = cookies.get(auth::SESSION_COOKIE).map(|c| c.value().to_string());
-    match token.and_then(|t| auth::verify_session(&state.admin().session_secret, &t)) {
-        Some(_username) => next.run(req).await,
-        None => StatusCode::UNAUTHORIZED.into_response(),
+/// Every protected route accepts either credential, checked in this
+/// order: first the session cookie (the common case for the web UI, and
+/// cheaper -- no DB round trip), then an `Authorization: Bearer <token>`
+/// header (see `api::auth::generate_api_token`/`README.md`'s API Tokens
+/// section for how to mint one). A valid token can reach every endpoint
+/// this middleware guards, including token management itself -- there's
+/// no scope system, a token is exactly as privileged as the admin
+/// session it was created from, matching this daemon's single-admin-
+/// account model. Treat a token like a password: anyone holding one can
+/// reconfigure the proxy and the firewall behind it.
+async fn require_admin(State(state): State<AppState>, cookies: Cookies, req: Request, next: Next) -> Response {
+    let session_ok = cookies
+        .get(auth::SESSION_COOKIE)
+        .map(|c| c.value().to_string())
+        .and_then(|t| auth::verify_session(&state.admin().session_secret, &t))
+        .is_some();
+    if session_ok {
+        return next.run(req).await;
     }
+
+    if let Some(token) = bearer_token(&req) {
+        let hash = auth::hash_api_token(&token);
+        if let Ok(Some(id)) = crate::db::find_api_token_id_by_hash(state.db(), &hash).await {
+            // Best-effort -- a failure to record last-used time must
+            // never block the request it's just bookkeeping for.
+            if let Err(err) = crate::db::touch_api_token_last_used(state.db(), id, chrono::Utc::now()).await {
+                tracing::warn!(error = %err, "failed to update api token last_used_at");
+            }
+            return next.run(req).await;
+        }
+    }
+
+    StatusCode::UNAUTHORIZED.into_response()
+}
+
+fn bearer_token(req: &Request) -> Option<String> {
+    req.headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(|s| s.to_string())
 }
 
 #[derive(Debug)]
@@ -371,6 +409,75 @@ async fn list_certs(State(state): State<AppState>) -> Json<Vec<CertSummary>> {
     Json(certs)
 }
 
+#[derive(Serialize)]
+struct ApiTokenSummary {
+    id: Uuid,
+    name: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    /// `None` until the token is used for the first time -- lets an
+    /// admin spot stale/unused tokens worth revoking.
+    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Deserialize)]
+struct CreateApiTokenRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ApiTokenCreated {
+    id: Uuid,
+    name: String,
+    /// The only time the plaintext is ever transmitted -- callers must
+    /// save it now, it can't be retrieved again (only the hash is
+    /// persisted; see `db::create_api_token`).
+    token: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn list_api_tokens(State(state): State<AppState>) -> Result<Json<Vec<ApiTokenSummary>>, ApiError> {
+    let tokens = crate::db::list_api_tokens(state.db()).await?;
+    Ok(Json(
+        tokens
+            .into_iter()
+            .map(|t| ApiTokenSummary {
+                id: t.id,
+                name: t.name,
+                created_at: t.created_at,
+                last_used_at: t.last_used_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn create_api_token(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiTokenRequest>,
+) -> Result<Json<ApiTokenCreated>, ApiError> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".into()));
+    }
+    let (token, hash) = auth::generate_api_token();
+    let id = Uuid::new_v4();
+    let created_at = chrono::Utc::now();
+    crate::db::create_api_token(state.db(), id, name, &hash, created_at).await?;
+    Ok(Json(ApiTokenCreated {
+        id,
+        name: name.to_string(),
+        token,
+        created_at,
+    }))
+}
+
+async fn delete_api_token(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+    let found = crate::db::delete_api_token(state.db(), id).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +726,161 @@ mod tests {
         assert_eq!(state.hosts().len(), 20);
         let loaded = crate::db::load_hosts(state.db()).await.unwrap();
         assert_eq!(loaded.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn creating_an_api_token_returns_the_plaintext_exactly_once() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"name":"ci pipeline"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "ci pipeline");
+        assert!(json["token"].as_str().unwrap().starts_with(auth::API_TOKEN_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_authenticates_protected_routes_without_a_session_cookie() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"name":"ci pipeline"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let token = body_json(create_resp).await["token"].as_str().unwrap().to_string();
+
+        let dash_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dash_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_bearer_token_is_rejected() {
+        let router = build_router(test_state().await);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header(header::AUTHORIZATION, "Bearer rpx_not-a-real-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_api_token_can_no_longer_authenticate() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"short-lived"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = body_json(create_resp).await;
+        let token = created["token"].as_str().unwrap().to_string();
+        let id = created["id"].as_str().unwrap().to_string();
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tokens/{id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn listed_tokens_never_include_the_plaintext_or_hash() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"ci pipeline"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tokens")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        let entry = &json.as_array().unwrap()[0];
+        assert_eq!(entry["name"], "ci pipeline");
+        assert!(entry.get("token").is_none());
+        assert!(entry.get("token_hash").is_none());
     }
 }

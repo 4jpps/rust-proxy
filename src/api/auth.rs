@@ -1,19 +1,54 @@
-//! Admin session authentication: argon2 password verification (never a
-//! plaintext comparison) plus a stateless HMAC-signed session cookie --
-//! same "no server-side session table" shape as jpps-store's `token.rs`,
-//! just scoped to this daemon's one admin account instead of many.
+//! Admin authentication, two independent mechanisms:
+//! - Session: argon2 password verification (never a plaintext comparison)
+//!   plus a stateless HMAC-signed cookie -- same "no server-side session
+//!   table" shape as jpps-store's `token.rs`, just scoped to this
+//!   daemon's one admin account instead of many. For the web UI.
+//! - API tokens: opaque random bearer credentials, hashed at rest in
+//!   sqlite (see `db::api_tokens`) and looked up by hash on every
+//!   request. For programmatic/CI use -- see `routes::require_admin`,
+//!   which accepts either mechanism on every protected endpoint.
 
 use argon2::password_hash::PasswordHash;
 use argon2::{Argon2, PasswordVerifier};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 pub const SESSION_COOKIE: &str = "rust_proxy_session";
 const SESSION_LIFETIME_SECS: i64 = 12 * 3600;
+
+/// Prefixed like GitHub/Stripe/GitLab tokens (`ghp_`, `sk_`, `glpat-`) so
+/// a token is recognizable at a glance (in logs, in a secrets scanner,
+/// in a config file) instead of looking like an arbitrary random string.
+pub const API_TOKEN_PREFIX: &str = "rpx_";
+
+/// Generates a new random API token and returns `(plaintext, hash)`. The
+/// plaintext is returned to the caller exactly once, at creation time,
+/// and is never persisted anywhere -- only the hash goes to sqlite (see
+/// `db::create_api_token`), so losing the plaintext means generating a
+/// new token, not a support request to recover it.
+pub fn generate_api_token() -> (String, String) {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = format!("{API_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes));
+    let hash = hash_api_token(&token);
+    (token, hash)
+}
+
+/// SHA-256, deliberately not argon2 -- API tokens are already a 256-bit
+/// random secret, not a low-entropy human password, so there's no
+/// offline-guessing risk a slow KDF would defend against, and a fast
+/// hash keyed by a DB lookup is the standard approach for this kind of
+/// credential (GitHub, GitLab, and Stripe all hash PATs/API keys this
+/// way, not with bcrypt/argon2).
+pub fn hash_api_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionPayload {
@@ -113,6 +148,23 @@ mod tests {
         assert_eq!(verify_session("secret-key", "not-a-valid-token"), None);
         assert_eq!(verify_session("secret-key", ""), None);
         assert_eq!(verify_session("secret-key", "a.b.c"), None);
+    }
+
+    #[test]
+    fn generated_api_tokens_are_prefixed_unique_and_hash_consistently() {
+        let (token_a, hash_a) = generate_api_token();
+        let (token_b, hash_b) = generate_api_token();
+        assert!(token_a.starts_with(API_TOKEN_PREFIX));
+        assert_ne!(token_a, token_b, "two generated tokens should never collide");
+        assert_ne!(hash_a, hash_b);
+        assert_eq!(hash_api_token(&token_a), hash_a, "hashing the same plaintext twice must be deterministic");
+    }
+
+    #[test]
+    fn different_api_tokens_hash_to_different_values() {
+        let hash_one = hash_api_token("rpx_one");
+        let hash_two = hash_api_token("rpx_two");
+        assert_ne!(hash_one, hash_two);
     }
 
     #[test]

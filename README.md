@@ -44,6 +44,80 @@ first boot. After that, sqlite (`admin.db_path`) is the source of
 truth and everything is managed from the admin UI, not by re-editing
 the file.
 
+## API
+
+Every route under `/api/*` except `/api/login`/`/api/logout` requires
+authentication, and accepts either of two independent credentials:
+
+- **Session cookie** -- what the web UI uses. `POST /api/login` with
+  `{"username": "...", "password": "..."}` sets an HTTP-only,
+  `SameSite=Lax` cookie good for 12 hours; `POST /api/logout` clears it.
+- **API token** -- `Authorization: Bearer <token>`, for scripts, CI
+  pipelines, or any other tool driving this instance without a browser.
+  A token is exactly as privileged as the admin session that created it
+  (there's no scope/permission system, matching this daemon's one-admin-
+  account model) and can reach every endpoint below, including token
+  management itself -- **treat a token like a password**: anyone holding
+  one can reconfigure the proxy and the firewall behind it.
+
+### Managing tokens
+
+Bootstrapping requires the web UI (or `curl` against `/api/login` with
+the admin password) once, to mint the first token -- there's no way to
+create a token without already having a valid credential.
+
+```sh
+# Sign in, keeping the session cookie, then mint a token:
+curl -c /tmp/cookies -X POST https://proxy.example.com/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"..."}'
+
+curl -b /tmp/cookies -X POST https://proxy.example.com/api/tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ci pipeline"}'
+# -> {"id":"...","name":"ci pipeline","token":"rpx_...","created_at":"..."}
+# The "token" field is shown exactly once -- save it now. Only its
+# SHA-256 hash is ever persisted (see db::create_api_token), so a lost
+# token means minting a new one, not recovering the old one.
+```
+
+| Method | Path             | Body                | Notes |
+|--------|------------------|----------------------|-------|
+| GET    | `/api/tokens`    | --                   | Lists `{id, name, created_at, last_used_at}` -- never the token or its hash. `last_used_at` is `null` until first use, so unused tokens are easy to spot and revoke. |
+| POST   | `/api/tokens`    | `{"name": "..."}`   | Creates a token; response includes the plaintext once. |
+| DELETE | `/api/tokens/:id`| --                   | Revokes immediately -- any request already using it fails on its very next call. |
+
+### Managing proxy hosts and firewall rules
+
+The same token works for everything the admin UI does. The request/
+response shapes match the `HostRequest`/`PortRuleRequest` fields in
+`src/api/routes.rs` (also visible in the web UI's own forms):
+
+| Method | Path                    | Body                                                                                     |
+|--------|-------------------------|-------------------------------------------------------------------------------------------|
+| GET    | `/api/dashboard`        | -- (host/port-rule/cert counts, configured `bind_ranges`)                                 |
+| GET    | `/api/hosts`            | --                                                                                         |
+| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","enabled"}` |
+| PUT    | `/api/hosts/:id`        | same shape as POST                                                                         |
+| DELETE | `/api/hosts/:id`        | --                                                                                         |
+| GET    | `/api/port-rules`       | --                                                                                         |
+| POST   | `/api/port-rules`       | `{"bind_ip","port_start","port_end","protocol","description","passthrough_target","enabled"}` |
+| PUT    | `/api/port-rules/:id`   | same shape as POST                                                                          |
+| DELETE | `/api/port-rules/:id`   | --                                                                                         |
+| GET    | `/api/certs`            | -- (`{domain, not_after, days_remaining}` per issued cert)                                |
+
+```sh
+curl -X POST https://proxy.example.com/api/hosts \
+  -H "Authorization: Bearer rpx_..." \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"app.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","websockets":true}'
+```
+
+Errors are `{"error": "message"}` with `400`/`404`/`500` as appropriate;
+`bind_ip` is validated against `network.bind_ranges` the same way the
+web UI's own submissions are -- there's no separate, looser code path
+for the token-authenticated API.
+
 ## Architecture
 
 - `config` -- TOML parsing + validation (bind IPs inside the configured
@@ -78,10 +152,12 @@ the file.
   wildcard when both are configured. dns-01 (required for wildcard
   certs -- CAs never offer http-01 for them) already covers this; no
   ACME changes were needed beyond record-name handling.
-- `api` -- Axum admin REST API (`routes`) behind argon2/HMAC session
-  auth (`auth`), plus the embedded (`include_str!`) single-page web UI
-  at `web/index.html`.
-- `db` -- sqlite persistence for hosts/port_rules via `sqlx`.
+- `api` -- Axum admin REST API (`routes`) behind dual auth (`auth`):
+  argon2/HMAC session cookies for the web UI, or a SHA-256-hashed-at-rest
+  bearer API token for everything else -- see the API section above.
+  Plus the embedded (`include_str!`) single-page web UI at
+  `web/index.html`.
+- `db` -- sqlite persistence for hosts/port_rules/api_tokens via `sqlx`.
 
 ## Deployment
 
@@ -112,6 +188,6 @@ ready for a real rollout.
 
 Scaffolded per the initial spec's implementation checklist; TLS
 listener behavior end-to-end (real handshake, SNI dispatch, a real
-Let's Encrypt + Cloudflare issuance) has not been verified against a
-real deployment yet -- only unit/mock/loopback-integration tested. See
-git log for what's been built in what order.
+Let's Encrypt issuance against a live DNS provider) has not been
+verified against a real deployment yet -- only unit/mock/loopback-
+integration tested. See git log for what's been built in what order.
