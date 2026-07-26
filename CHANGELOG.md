@@ -35,6 +35,16 @@
   its own `access_allow_ips`/`access_login` -- only the final response
   differs from a normal proxy host. See `config::RedirectTarget` and
   `proxy::http::redirect_target_response`.
+- Custom/uploaded certificates -- `POST /api/certs` publishes a
+  manually-provided cert/key pair for a domain, bypassing ACME entirely
+  (an internal CA's cert, a wildcard bought elsewhere). Rejected if a
+  host for that domain still has `acme_enabled = true`, since the next
+  renewal check would otherwise overwrite it. Also fixes a real gap this
+  surfaced: certs previously lived only in memory, so a restart forgot
+  every uploaded cert permanently and needlessly re-issued every
+  ACME-issued one against Let's Encrypt's rate limits; every cert is now
+  reloaded from `acme.cert_dir` at startup. See `acme::load_certs_from_disk`
+  and `api::routes::upload_cert`/`delete_cert`.
 
 ## [0.1.0] - 2026-07-26
 

@@ -30,7 +30,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/hosts/:id", axum::routing::put(update_host).delete(delete_host))
         .route("/api/port-rules", get(list_port_rules).post(create_port_rule))
         .route("/api/port-rules/:id", axum::routing::put(update_port_rule).delete(delete_port_rule))
-        .route("/api/certs", get(list_certs))
+        .route("/api/certs", get(list_certs).post(upload_cert))
+        .route("/api/certs/:domain", axum::routing::delete(delete_cert))
         .route("/api/tokens", get(list_api_tokens).post(create_api_token))
         .route("/api/tokens/:id", axum::routing::delete(delete_api_token))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
@@ -474,6 +475,52 @@ async fn list_certs(State(state): State<AppState>) -> Json<Vec<CertSummary>> {
     Json(certs)
 }
 
+#[derive(Deserialize)]
+struct UploadCertRequest {
+    domain: String,
+    /// Full chain PEM (leaf + any intermediates), same shape ACME
+    /// downloads -- see `acme::cert::build_cert_entry`.
+    fullchain_pem: String,
+    private_key_pem: String,
+}
+
+/// Publishes a manually-provided cert/key pair for `domain`, bypassing
+/// ACME entirely -- e.g. an internal CA's cert, or a wildcard bought
+/// elsewhere. Guarded against the obvious footgun: if a configured host
+/// for this domain still has `acme_enabled = true`, the next renewal
+/// check would otherwise silently overwrite this cert with an
+/// ACME-issued one.
+async fn upload_cert(State(state): State<AppState>, Json(body): Json<UploadCertRequest>) -> Result<Json<CertSummary>, ApiError> {
+    let domain = body.domain.trim().to_string();
+    crate::config::validate_domain(&domain).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if state.hosts().iter().any(|h| h.domain.eq_ignore_ascii_case(&domain) && h.acme_enabled) {
+        return Err(ApiError::BadRequest(format!(
+            "a host for {domain} still has acme_enabled=true -- disable ACME for it first, otherwise the next renewal check will overwrite this custom certificate"
+        )));
+    }
+    let entry = crate::acme::cert::build_cert_entry(&body.fullchain_pem, &body.private_key_pem).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    crate::acme::persist_cert_files(&state.acme().cert_dir, &domain, &body.fullchain_pem, &body.private_key_pem)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let not_after = entry.not_after;
+    state.upsert_cert(domain.clone(), entry);
+    Ok(Json(CertSummary {
+        domain,
+        not_after,
+        days_remaining: (not_after - chrono::Utc::now()).num_days(),
+    }))
+}
+
+async fn delete_cert(State(state): State<AppState>, Path(domain): Path<String>) -> Result<StatusCode, ApiError> {
+    if !state.remove_cert(&domain) {
+        return Err(ApiError::NotFound);
+    }
+    // Best-effort -- the in-memory map (already cleared above) is what
+    // actually controls whether this domain is servable; a stale/
+    // unremovable directory on disk is untidy but not unsafe.
+    let _ = std::fs::remove_dir_all(state.acme().cert_dir.join(&domain));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Serialize)]
 struct ApiTokenSummary {
     id: Uuid,
@@ -885,6 +932,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn self_signed_cert_json(domain: &str) -> serde_json::Value {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![domain.to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        serde_json::json!({
+            "domain": domain,
+            "fullchain_pem": cert.pem(),
+            "private_key_pem": key_pair.serialize_pem(),
+        })
+    }
+
+    #[tokio::test]
+    async fn upload_cert_persists_and_appears_in_the_cert_list() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let upload_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload_resp.status(), StatusCode::OK);
+        let created = body_json(upload_resp).await;
+        assert_eq!(created["domain"], "custom.example.com");
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/certs")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["domain"], "custom.example.com");
+    }
+
+    #[tokio::test]
+    async fn upload_cert_with_malformed_pem_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"custom.example.com","fullchain_pem":"not a pem","private_key_pem":"also not a pem"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_cert_is_rejected_when_a_host_still_has_acme_enabled() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"custom.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_cert_removes_it_and_repeated_delete_returns_404() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let delete_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/certs/custom.example.com")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+        let repeat_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/certs/custom.example.com")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeat_resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

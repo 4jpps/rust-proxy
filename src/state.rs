@@ -136,6 +136,17 @@ impl AppState {
         self.0.certs.store(Arc::new(next));
     }
 
+    /// Removes a cert from the live map (e.g. deleting a custom-uploaded
+    /// one via the admin API) -- returns whether it was present. TLS
+    /// dispatch (`proxy::tls::CertResolver`) reads this same map, so the
+    /// domain stops being servable the moment this returns.
+    pub fn remove_cert(&self, domain: &str) -> bool {
+        let mut next = (*self.0.certs.load_full()).clone();
+        let existed = next.remove(domain).is_some();
+        self.0.certs.store(Arc::new(next));
+        existed
+    }
+
     /// Publishes an http-01 key authorization for `token`, copy-on-write
     /// like `certs`/`hosts` -- reads (every plain-HTTP request on port
     /// 80) are far more frequent than writes (once per issuance attempt).
@@ -247,6 +258,18 @@ mod tests {
 
         state.remove_http01_challenge("token-1");
         assert_eq!(state.get_http01_challenge("token-1"), None);
+    }
+
+    #[tokio::test]
+    async fn remove_cert_deletes_it_and_reports_whether_it_existed() {
+        let state = test_state().await;
+        assert!(!state.remove_cert("example.com"), "nothing to remove yet");
+
+        state.upsert_cert("example.com".to_string(), crate::proxy::tls::self_signed_entry("example.com"));
+        assert!(state.certs().contains_key("example.com"));
+
+        assert!(state.remove_cert("example.com"));
+        assert!(!state.certs().contains_key("example.com"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

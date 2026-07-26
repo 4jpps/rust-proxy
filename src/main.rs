@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = state::AppState::new(cfg, db_pool, hosts, port_rules);
+    acme::load_certs_from_disk(&state)?;
 
     tokio::try_join!(
         proxy::run(state.clone()),

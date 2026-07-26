@@ -255,14 +255,22 @@ async fn complete_order(
 
 async fn publish_cert(state: &AppState, domain: &str, issued: &IssuedCert) -> Result<(), IssuanceError> {
     let entry = cert::build_cert_entry(&issued.chain_pem, &issued.key_pem)?;
-
-    let cert_dir = state.acme().cert_dir.join(domain);
-    std::fs::create_dir_all(&cert_dir)?;
-    write_secure(&cert_dir.join("fullchain.pem"), &issued.chain_pem)?;
-    write_secure(&cert_dir.join("privkey.pem"), &issued.key_pem)?;
-
+    persist_cert_files(&state.acme().cert_dir, domain, &issued.chain_pem, &issued.key_pem)?;
     state.upsert_cert(domain.to_string(), entry);
     tracing::info!(domain, "certificate issued and published");
+    Ok(())
+}
+
+/// Writes a cert+key pair to `<cert_dir>/<domain>/{fullchain,privkey}.pem`
+/// (0600) -- shared by the ACME issuance flow and the admin API's
+/// custom-cert upload (`api::routes::upload_cert`), since both need the
+/// exact same on-disk layout for `load_certs_from_disk` to find them
+/// again after a restart.
+pub(crate) fn persist_cert_files(cert_dir: &std::path::Path, domain: &str, chain_pem: &str, key_pem: &str) -> std::io::Result<()> {
+    let dir = cert_dir.join(domain);
+    std::fs::create_dir_all(&dir)?;
+    write_secure(&dir.join("fullchain.pem"), chain_pem)?;
+    write_secure(&dir.join("privkey.pem"), key_pem)?;
     Ok(())
 }
 
@@ -272,6 +280,47 @@ fn write_secure(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Loads every already-issued/uploaded cert from `cert_dir` into
+/// `state`'s in-memory map at startup. Without this, a restart would
+/// otherwise "forget" every cert (custom-uploaded ones permanently --
+/// nothing else remembers them -- and ACME-issued ones until the next
+/// renewal check re-issues them, wasting a real issuance against Let's
+/// Encrypt's rate limits for no reason). One subdirectory per domain,
+/// same layout `persist_cert_files` writes; a subdirectory missing
+/// either file, or containing something that fails to parse, is skipped
+/// with a warning rather than failing startup -- one bad/partial cert
+/// directory shouldn't take down the whole daemon.
+pub fn load_certs_from_disk(state: &AppState) -> std::io::Result<()> {
+    let cert_dir = &state.acme().cert_dir;
+    let entries = match std::fs::read_dir(cert_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let domain = entry.file_name().to_string_lossy().into_owned();
+        let dir = entry.path();
+        let (Ok(chain_pem), Ok(key_pem)) = (std::fs::read_to_string(dir.join("fullchain.pem")), std::fs::read_to_string(dir.join("privkey.pem"))) else {
+            continue;
+        };
+        match cert::build_cert_entry(&chain_pem, &key_pem) {
+            Ok(entry) => {
+                state.upsert_cert(domain.clone(), entry);
+                tracing::info!(domain, "loaded existing certificate from disk");
+            }
+            Err(err) => {
+                tracing::warn!(domain, error = %err, "failed to parse existing certificate on disk, skipping");
+            }
+        }
     }
     Ok(())
 }
@@ -490,5 +539,43 @@ mod tests {
         // immediately instead of timing out.
         let result = tokio::time::timeout(Duration::from_millis(300), handle).await;
         assert!(result.is_err(), "run_renewal_loop returned instead of retrying -- this would crash the whole daemon");
+    }
+
+    fn self_signed_pair(domain: &str) -> (String, String) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![domain.to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
+    #[tokio::test]
+    async fn load_certs_from_disk_restores_a_previously_persisted_cert() {
+        let state = test_state("https://example.invalid/directory".to_string()).await;
+        let (chain_pem, key_pem) = self_signed_pair("example.com");
+        persist_cert_files(&state.acme().cert_dir, "example.com", &chain_pem, &key_pem).unwrap();
+        assert!(state.certs().is_empty(), "sanity check: nothing loaded into memory yet");
+
+        load_certs_from_disk(&state).unwrap();
+        assert!(state.certs().contains_key("example.com"));
+    }
+
+    #[tokio::test]
+    async fn load_certs_from_disk_is_a_noop_when_cert_dir_does_not_exist_yet() {
+        let state = test_state("https://example.invalid/directory".to_string()).await;
+        // First boot: nothing has ever been issued, cert_dir doesn't
+        // exist on disk at all -- must not error.
+        load_certs_from_disk(&state).unwrap();
+        assert!(state.certs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_certs_from_disk_skips_a_directory_missing_one_of_the_two_files() {
+        let state = test_state("https://example.invalid/directory".to_string()).await;
+        let dir = state.acme().cert_dir.join("partial.example.com");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fullchain.pem"), "not-even-checked-since-privkey-is-missing").unwrap();
+
+        load_certs_from_disk(&state).unwrap();
+        assert!(state.certs().is_empty());
     }
 }

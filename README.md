@@ -88,6 +88,14 @@ own `access_allow_ips`/`access_login` -- domain matching, TLS, and
 access control are identical to a proxy host, only the final response
 differs.
 
+A host doesn't have to use ACME at all -- set `acme_enabled = false` and
+upload a cert manually via `POST /api/certs` (an internal CA's cert, a
+wildcard bought elsewhere). Uploading is rejected if a host for that
+domain still has `acme_enabled = true`, since the next renewal check
+would otherwise silently overwrite it. Every cert (ACME-issued or
+uploaded) is written to `acme.cert_dir` and reloaded from there on
+startup, so a restart never re-issues or "forgets" one.
+
 ## API
 
 Every route under `/api/*` except `/api/login`/`/api/logout` requires
@@ -148,7 +156,9 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 | POST   | `/api/port-rules`       | `{"bind_ip","port_start","port_end","protocol","description","passthrough_target","enabled"}` |
 | PUT    | `/api/port-rules/:id`   | same shape as POST                                                                          |
 | DELETE | `/api/port-rules/:id`   | --                                                                                         |
-| GET    | `/api/certs`            | -- (`{domain, not_after, days_remaining}` per issued cert)                                |
+| GET    | `/api/certs`            | -- (`{domain, not_after, days_remaining}` per issued/uploaded cert)                       |
+| POST   | `/api/certs`            | `{"domain","fullchain_pem","private_key_pem"}` -- upload a custom cert (see Configuration) |
+| DELETE | `/api/certs/:domain`    | --                                                                                         |
 
 ```sh
 curl -X POST https://proxy.example.com/api/hosts \
@@ -186,6 +196,11 @@ for the token-authenticated API.
   which one a given host actually uses (see Configuration above).
   `run_renewal_loop` checks every ACME-enabled host every 12h and
   re-issues anything within `acme.renew_before_days` of expiry.
+  `load_certs_from_disk` restores every already-issued/uploaded cert
+  from `acme.cert_dir` at startup (one subdirectory per domain, same
+  layout `persist_cert_files` writes) -- without it a restart would
+  forget a custom-uploaded cert entirely and needlessly re-issue every
+  ACME one.
 - `proxy` -- the data plane: `router` (pure host-matching), `tls`
   (SNI cert dispatch reading live state), `http` (forwarding + WebSocket
   upgrade passthrough + a `redirect` host's response), `access` (pure

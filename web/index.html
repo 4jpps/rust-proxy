@@ -88,7 +88,17 @@
   </form>
 
   <h2>Certificates</h2>
-  <table id="certs-table"><thead><tr><th>Domain</th><th>Expires</th><th>Days left</th></tr></thead><tbody></tbody></table>
+  <table id="certs-table"><thead><tr><th>Domain</th><th>Expires</th><th>Days left</th><th></th></tr></thead><tbody></tbody></table>
+  <p style="font-size:0.85rem;max-width:60ch">ACME-issued certs appear here automatically. Upload a custom one (an
+    internal CA's cert, a wildcard bought elsewhere) for a host with
+    ACME disabled -- otherwise the next renewal check overwrites it.</p>
+  <form class="inline" id="cert-form">
+    <input type="text" name="domain" placeholder="domain" required>
+    <textarea name="fullchain_pem" placeholder="full chain PEM (leaf + intermediates)" rows="3" style="flex:1 1 100%;font-family:monospace;font-size:0.8rem" required></textarea>
+    <textarea name="private_key_pem" placeholder="private key PEM" rows="3" style="flex:1 1 100%;font-family:monospace;font-size:0.8rem" required></textarea>
+    <button type="submit">Upload certificate</button>
+    <span class="error" id="cert-error"></span>
+  </form>
 
   <h2>API tokens</h2>
   <p style="font-size:0.85rem;max-width:60ch">Bearer tokens for driving this instance's REST API without a
@@ -258,10 +268,28 @@ async function refreshCerts() {
   tbody.innerHTML = '';
   for (const c of certs) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${esc(c.domain)}</td><td>${new Date(c.not_after).toLocaleDateString()}</td><td>${c.days_remaining}</td>`;
+    tr.innerHTML = `<td>${esc(c.domain)}</td><td>${new Date(c.not_after).toLocaleDateString()}</td><td>${c.days_remaining}</td>
+      <td><button class="danger" data-domain="${esc(c.domain)}">Delete</button></td>`;
+    tr.querySelector('button').addEventListener('click', async () => {
+      await api(`/api/certs/${encodeURIComponent(c.domain)}`, { method: 'DELETE' });
+      refreshCerts();
+    });
     tbody.appendChild(tr);
   }
 }
+
+document.getElementById('cert-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    domain: fd.get('domain'),
+    fullchain_pem: fd.get('fullchain_pem'),
+    private_key_pem: fd.get('private_key_pem'),
+  };
+  const resp = await api('/api/certs', { method: 'POST', body: JSON.stringify(body) });
+  if (resp.ok) { e.target.reset(); document.getElementById('cert-error').textContent = ''; refreshCerts(); }
+  else { document.getElementById('cert-error').textContent = (await resp.json()).error || 'failed'; }
+});
 
 async function refreshTokens() {
   const tokens = await (await api('/api/tokens')).json();
