@@ -191,3 +191,8 @@ listener behavior end-to-end (real handshake, SNI dispatch, a real
 Let's Encrypt issuance against a live DNS provider) has not been
 verified against a real deployment yet -- only unit/mock/loopback-
 integration tested. See git log for what's been built in what order.
+
+## License
+
+MIT -- see [LICENSE](LICENSE). Contributions (new DNS providers
+especially) welcome.

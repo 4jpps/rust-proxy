@@ -3,7 +3,9 @@ name = "rust-proxy"
 version = "0.1.0"
 edition = "2021"
 description = "Lightweight L7 reverse proxy daemon with native ACME, dynamic nftables orchestration, and a web admin UI"
-license = "Proprietary"
+license = "MIT"
+authors = ["Jeff Parrish PC Services <https://www.jpps.us>"]
+repository = "https://gitlab.jpps.us/jpps/proxy"
 
 [[bin]]
 name = "rust-proxy"
