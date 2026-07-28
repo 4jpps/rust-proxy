@@ -84,10 +84,26 @@ package:amd64-deb:
     - mv target/debian/*.deb rust-proxy-amd64.deb
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        # gitlab.jpps.us is Cloudflare-tunnel-fronted, and that tunnel
+        # path stalls/corrupts uploads above a few MB (see the global
+        # CLAUDE.md's "Bypassing the Cloudflare tunnel" section). Route
+        # through ci-relay's SSH port-forward straight to the VM's
+        # local nginx instead of over the public URL.
+        # GITLAB_RELAY_SSH_KEY is a group-level file variable for a
+        # dedicated `ci-relay` user whose authorized_keys entry is
+        # locked to `permitopen="127.0.0.1:80"` with no shell -- it
+        # can only relay to nginx, nothing else.
+        mkdir -p ~/.ssh
+        grep -qF "172.16.60.141 ssh-ed25519" ~/.ssh/known_hosts 2>/dev/null || \
+          echo "172.16.60.141 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMhN9SFlktJjOM7IVr0gfTPTug9OCbfcqt983cHwn5Hh" >> ~/.ssh/known_hosts
+        cp "${GITLAB_RELAY_SSH_KEY}" ~/.ssh/ci_relay_key
+        chmod 600 ~/.ssh/ci_relay_key
+        ssh -o BatchMode=yes -i ~/.ssh/ci_relay_key -L 18080:127.0.0.1:80 -N -f ci-relay@172.16.60.141
         curl --fail --silent --show-error \
+          --header "Host: gitlab.jpps.us" \
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
           --upload-file rust-proxy-amd64.deb \
-          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rust-proxy/${CI_COMMIT_TAG}/rust-proxy-amd64.deb"
+          "http://127.0.0.1:18080/api/v4/projects/${CI_PROJECT_ID}/packages/generic/rust-proxy/${CI_COMMIT_TAG}/rust-proxy-amd64.deb"
       fi
     - |
       mkdir -p ~/.ssh
@@ -128,11 +144,24 @@ release:
       if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
         NOTES="(no CHANGELOG.md entry found for $VERSION)"
       fi
+      # Asset link uses the real public URL (what a user clicks on the
+      # Release page); the releases POST below tunnels through
+      # ci-relay instead, since that's the slow/large request that
+      # actually stalls over the Cloudflare-fronted public path (see
+      # the global CLAUDE.md's "Bypassing the Cloudflare tunnel"
+      # section).
       PKG_URL="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/rust-proxy/$CI_COMMIT_TAG/rust-proxy-amd64.deb"
       ASSETS=$(jq -n --arg url "$PKG_URL" '{links: [{name: "Linux amd64 .deb", url: $url, link_type: "package"}]}')
+      mkdir -p ~/.ssh
+      grep -qF "172.16.60.141 ssh-ed25519" ~/.ssh/known_hosts 2>/dev/null || \
+        echo "172.16.60.141 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMhN9SFlktJjOM7IVr0gfTPTug9OCbfcqt983cHwn5Hh" >> ~/.ssh/known_hosts
+      cp "${GITLAB_RELAY_SSH_KEY}" ~/.ssh/ci_relay_key
+      chmod 600 ~/.ssh/ci_relay_key
+      ssh -o BatchMode=yes -i ~/.ssh/ci_relay_key -L 18080:127.0.0.1:80 -N -f ci-relay@172.16.60.141
       curl --fail --silent --show-error \
+        --header "Host: gitlab.jpps.us" \
         --header "JOB-TOKEN: $CI_JOB_TOKEN" \
         --header "Content-Type: application/json" \
         --data "$(jq -n --arg tag "$CI_COMMIT_TAG" --arg notes "$NOTES" --argjson assets "$ASSETS" \
                     '{name: ("rust-proxy " + $tag), tag_name: $tag, description: $notes, assets: $assets}')" \
-        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+        "http://127.0.0.1:18080/api/v4/projects/$CI_PROJECT_ID/releases"
