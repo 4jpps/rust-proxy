@@ -253,15 +253,18 @@ this project's [Releases](../../releases) page and to a small
 self-hosted apt repo:
 
 ```sh
-echo 'deb [trusted=yes] https://repo.jpps.us/stable /' | sudo tee /etc/apt/sources.list.d/jpps.list
+sudo mkdir -p /etc/apt/keyrings
+sudo curl -fsSL https://repo.jpps.us/repo-signing-key.asc -o /etc/apt/keyrings/jpps-repo.asc
+echo 'deb [signed-by=/etc/apt/keyrings/jpps-repo.asc] https://repo.jpps.us/stable /' | sudo tee /etc/apt/sources.list.d/jpps.list
 sudo apt update
 sudo apt install rust-proxy
 ```
 
-(`[trusted=yes]` because this repo isn't GPG-signed yet -- it's a
-small, flat, single-maintainer repo, not a general-purpose
-distribution; download over HTTPS still protects the transfer, just
-not the publisher's identity the way a signed repo would.)
+(The repo is GPG-signed -- `apt update` verifies `InRelease` against
+the key fetched above before trusting anything in it. See
+[`jpps/apt-repo-server`](https://gitlab.jpps.us/jpps/apt-repo-server)'s
+README for the full setup, including how to add both the `stable` and
+`testing` channels at once.)
 
 `postinst` creates the `rust-proxy` system user and, on first install,
 either interactively prompts for initial configuration (admin
