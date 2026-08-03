@@ -39,6 +39,11 @@ arc-swap = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 bytes = "1"
 async-trait = "0.1"
+# Namecheap's DNS API is XML-only (every other provider here is JSON) --
+# a real dependency, not a per-provider SDK: same "thin direct client"
+# philosophy, just parsing a different wire format for the one provider
+# that requires it.
+quick-xml = "0.36"
 
 hmac = "0.12"
 sha2 = "0.10"

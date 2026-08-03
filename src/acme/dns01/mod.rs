@@ -4,15 +4,18 @@
 //! key-authorization digest that becomes the record's content (provider-
 //! agnostic, lives here rather than in any one provider module).
 //!
-//! Providers: [`cloudflare`], [`digitalocean`], [`hetzner`]. Each is a
-//! thin, direct-`reqwest` client against that provider's own REST API (no
-//! provider SDK crates) implementing the same three-call shape: find the
-//! zone that owns a domain, create a TXT record in it, delete a TXT
-//! record from it.
+//! Providers: [`cloudflare`], [`digitalocean`], [`duckdns`], [`godaddy`],
+//! [`hetzner`], [`namecheap`]. Each is a thin, direct-`reqwest` client
+//! against that provider's own REST API (no provider SDK crates)
+//! implementing the same three-call shape: find the zone that owns a
+//! domain, create a TXT record in it, delete a TXT record from it.
 
 pub mod cloudflare;
 pub mod digitalocean;
+pub mod duckdns;
+pub mod godaddy;
 pub mod hetzner;
+pub mod namecheap;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -22,7 +25,10 @@ use super::jws::{b64url, AccountKey};
 
 pub use cloudflare::CloudflareDns01;
 pub use digitalocean::DigitalOceanDns01;
+pub use duckdns::DuckDnsDns01;
+pub use godaddy::GoDaddyDns01;
 pub use hetzner::HetznerDns01;
+pub use namecheap::NamecheapDns01;
 
 #[derive(Debug, Error)]
 pub enum Dns01Error {

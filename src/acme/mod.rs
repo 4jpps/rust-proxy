@@ -22,7 +22,7 @@ use thiserror::Error;
 use crate::config::{AcmeChallengeType, DnsProviderKind, ProxyHost};
 use crate::state::AppState;
 use client::{AcmeClient, AcmeError};
-use dns01::{acme_challenge_record_name, dns01_txt_value, CloudflareDns01, DigitalOceanDns01, Dns01Error, DnsProvider, HetznerDns01};
+use dns01::{acme_challenge_record_name, dns01_txt_value, CloudflareDns01, DigitalOceanDns01, Dns01Error, DnsProvider, DuckDnsDns01, GoDaddyDns01, HetznerDns01, NamecheapDns01};
 use jws::{AccountKey, JwsError};
 use types::{Authorization, AuthorizationStatus, OrderStatus};
 
@@ -350,7 +350,11 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
     let dns01: Box<dyn DnsProvider> = match state.acme().dns_provider {
         DnsProviderKind::Cloudflare => Box::new(CloudflareDns01::new(http.clone(), state.acme().dns_api_token.clone())),
         DnsProviderKind::DigitalOcean => Box::new(DigitalOceanDns01::new(http.clone(), state.acme().dns_api_token.clone())),
+        DnsProviderKind::DuckDns => Box::new(DuckDnsDns01::new(http.clone(), state.acme().dns_api_token.clone())),
+        DnsProviderKind::GoDaddy => Box::new(GoDaddyDns01::new(http.clone(), state.acme().dns_api_token.clone())),
         DnsProviderKind::Hetzner => Box::new(HetznerDns01::new(http.clone(), state.acme().dns_api_token.clone())),
+        DnsProviderKind::Namecheap => Box::new(NamecheapDns01::new(http.clone(), state.acme().dns_api_token.clone())),
+        DnsProviderKind::Route53 => todo!("wired up once Route53Dns01 exists"),
     };
 
     // Account setup failing (blank/invalid contact_email or

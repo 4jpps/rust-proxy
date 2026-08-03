@@ -78,6 +78,10 @@ pub enum DnsProviderKind {
     Cloudflare,
     DigitalOcean,
     Hetzner,
+    DuckDns,
+    GoDaddy,
+    Namecheap,
+    Route53,
 }
 
 impl Default for DnsProviderKind {
