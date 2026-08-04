@@ -16,6 +16,7 @@ pub mod duckdns;
 pub mod godaddy;
 pub mod hetzner;
 pub mod namecheap;
+pub mod route53;
 mod sigv4;
 
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ pub use duckdns::DuckDnsDns01;
 pub use godaddy::GoDaddyDns01;
 pub use hetzner::HetznerDns01;
 pub use namecheap::NamecheapDns01;
+pub use route53::Route53Dns01;
 
 #[derive(Debug, Error)]
 pub enum Dns01Error {
