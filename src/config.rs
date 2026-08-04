@@ -112,7 +112,13 @@ pub struct AcmeConfig {
     /// API token with Zone:DNS:Edit, a DigitalOcean personal access
     /// token, or a Hetzner DNS API token. All three providers use a
     /// single bearer/header token, so one field covers all of them
-    /// instead of a per-provider config block.
+    /// instead of a per-provider config block. Defaults to empty
+    /// (not required) -- omitting it entirely is the deliberate,
+    /// documented way to skip seeding a "default" DNS credential from
+    /// config.toml and manage credentials from the admin UI/setup
+    /// wizard instead (see `main.rs`'s blank-token check and
+    /// `deploy/config.toml.example`).
+    #[serde(default)]
     pub dns_api_token: String,
     #[serde(default = "default_cert_dir")]
     pub cert_dir: PathBuf,

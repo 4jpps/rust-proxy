@@ -172,6 +172,12 @@ struct SetupRequest {
 /// `admin_identity()`) at request time and refuses with 409 if an
 /// identity already exists by either path -- this must never be
 /// replayable against an already-configured instance to hijack it.
+/// That in-memory check alone isn't race-free against two concurrent
+/// `POST /api/setup` calls both racing past it (the argon2 hash below
+/// alone takes 100ms+), so the actual arbiter is
+/// `db::create_admin_identity_if_absent`'s atomic `INSERT ... ON
+/// CONFLICT DO NOTHING` against the DB's own single-row constraint --
+/// only the request that actually inserts the row gets to publish it.
 async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>) -> Result<StatusCode, ApiError> {
     if state.admin_identity().is_some() {
         return Err(ApiError::Conflict("this instance is already configured".into()));
@@ -181,7 +187,10 @@ async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>) ->
     }
     let password_hash = auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
     let session_secret = generate_session_secret();
-    crate::db::save_admin_identity(state.db(), &body.username, &password_hash, &session_secret).await?;
+    let created = crate::db::create_admin_identity_if_absent(state.db(), &body.username, &password_hash, &session_secret).await?;
+    if !created {
+        return Err(ApiError::Conflict("this instance is already configured".into()));
+    }
     state.set_admin_identity(crate::state::AdminIdentity {
         username: body.username.clone(),
         password_hash,
@@ -719,7 +728,18 @@ async fn create_dns_credential(State(state): State<AppState>, Json(body): Json<C
     }))
 }
 
+/// Refuses to delete a credential that any live host still references
+/// by ID -- otherwise the reference silently dangles (deletion has no
+/// FK/cascade) and that host's next renewal fails with no fallback:
+/// `validate_dns_credential_choice`'s "exactly one credential means use
+/// it implicitly" rule only ever applies when a host has NO explicit
+/// `dns_credential_id`, so an orphaned explicit reference doesn't
+/// recover even if only one credential is left afterward.
 async fn delete_dns_credential(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+    let still_in_use = state.hosts().iter().any(|h| h.dns_credential_id == Some(id));
+    if still_in_use {
+        return Err(ApiError::Conflict("one or more hosts still reference this DNS credential -- repoint or delete them first".into()));
+    }
     let found = crate::db::delete_dns_credential(state.db(), id).await?;
     if !found {
         return Err(ApiError::NotFound);
@@ -736,7 +756,17 @@ async fn validate_dns_credential_choice(state: &AppState, host: &ProxyHost) -> R
     if crate::acme::resolve_challenge_type(host) != crate::acme::ChallengeMethod::Dns01 {
         return Ok(());
     }
-    if host.dns_credential_id.is_some() {
+    if let Some(id) = host.dns_credential_id {
+        // An explicit ID must actually resolve -- a typo'd/deleted
+        // credential must never be accepted here only to fail silently
+        // at renewal time hours later (the whole point of this
+        // function). Deliberately does NOT fall back to the
+        // exactly-one-credential-exists rule below even if that would
+        // resolve unambiguously: an explicit choice that no longer
+        // exists is a configuration error to surface, not paper over.
+        if crate::db::get_dns_credential(state.db(), id).await?.is_none() {
+            return Err(ApiError::BadRequest(format!("{} references a DNS credential that no longer exists", host.domain)));
+        }
         return Ok(());
     }
     let count = crate::db::list_dns_credentials(state.db()).await?.len();
@@ -1376,6 +1406,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repeat_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_dns_credential_still_referenced_by_a_host_is_refused() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns-credentials")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cred_id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+
+        let host_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01","dns_credential_id":"{cred_id}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(host_resp.status(), StatusCode::OK);
+
+        let delete_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/dns-credentials/{cred_id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::CONFLICT, "a host still points at this credential by ID");
+    }
+
+    #[tokio::test]
+    async fn creating_a_dns01_host_with_a_dns_credential_id_that_does_not_exist_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let bogus_id = uuid::Uuid::new_v4();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01","dns_credential_id":"{bogus_id}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -36,9 +36,19 @@ allowed_ips = []
 # `rust-proxy hash-password 'your-real-password'`) -- when set here,
 # config.toml always wins over whatever the wizard/DB has, on every
 # read.
+#
+# /etc/rust-proxy is installed read-only (750, root:rust-proxy) to the
+# rust-proxy user the daemon runs as -- db_path (and acme's cert_dir/
+# account_key_path below) must point somewhere the daemon can actually
+# write, hence /var/lib/rust-proxy rather than config.rs's own
+# /etc/rust-proxy/... defaults. postinst creates and chowns this
+# directory to rust-proxy:rust-proxy for exactly this.
+db_path = "/var/lib/rust-proxy/rust-proxy.db"
 
 [acme]
 contact_email = "admin@example.com"
+cert_dir = "/var/lib/rust-proxy/certs"
+account_key_path = "/var/lib/rust-proxy/acme-account.key"
 # dns_provider/dns_api_token are also deliberately omitted here -- add a
 # named DNS-01 credential from the admin UI's "DNS credentials" section
 # (or the setup wizard's optional step) instead. Uncomment below only if

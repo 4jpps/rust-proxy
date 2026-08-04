@@ -389,6 +389,28 @@ pub async fn save_admin_identity(pool: &SqlitePool, username: &str, password_has
     Ok(())
 }
 
+/// Like `save_admin_identity`, but `ON CONFLICT(id) DO NOTHING` instead
+/// of upserting -- used by the first-launch setup wizard (`POST
+/// /api/setup`), where two concurrent requests both observing
+/// `state.admin_identity() == None` must not both succeed (the second
+/// one silently overwriting the first's account, or the first's
+/// already-issued session becoming invalid underneath it). Returns
+/// whether this call actually created the row: the DB's own uniqueness
+/// (the `CHECK (id = 1)` single-row constraint) is the race-free
+/// arbiter, not the caller's earlier `admin_identity()` read.
+pub async fn create_admin_identity_if_absent(pool: &SqlitePool, username: &str, password_hash: &str, session_secret: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO admin_identity (id, username, password_hash, session_secret) VALUES (1, ?, ?, ?) \
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(username)
+    .bind(password_hash)
+    .bind(session_secret)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, \
@@ -840,5 +862,16 @@ mod tests {
         assert_eq!(row.username, "admin2");
         assert_eq!(row.password_hash, "hash-2");
         assert_eq!(row.session_secret, "secret-2");
+    }
+
+    #[tokio::test]
+    async fn create_admin_identity_if_absent_only_ever_creates_the_first_one() {
+        let pool = memory_pool().await;
+        assert!(create_admin_identity_if_absent(&pool, "admin", "hash-1", "secret-1").await.unwrap());
+        assert!(!create_admin_identity_if_absent(&pool, "attacker", "hash-2", "secret-2").await.unwrap());
+
+        let row = load_admin_identity(&pool).await.unwrap().unwrap();
+        assert_eq!(row.username, "admin", "the second call must not have overwritten the first");
+        assert_eq!(row.password_hash, "hash-1");
     }
 }

@@ -26,11 +26,26 @@ pub struct CertEntry {
 /// `config.toml` (when all three of its fields are set) or from the
 /// `admin_identity` DB table (set by the first-launch setup wizard).
 /// See `AppState::admin_identity`'s doc comment for the precedence rule.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AdminIdentity {
     pub username: String,
     pub password_hash: String,
     pub session_secret: String,
+}
+
+/// Hand-written, not derived -- `password_hash`/`session_secret` are
+/// live secrets (an argon2 hash is enough to offline-crack a weak
+/// password; the session secret signs every admin session) and must
+/// never appear in a log line or panic message via an incidental
+/// `{:?}`, matching `db::DnsCredential`'s same redaction choice.
+impl std::fmt::Debug for AdminIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminIdentity")
+            .field("username", &self.username)
+            .field("password_hash", &"<redacted>")
+            .field("session_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 struct Inner {
