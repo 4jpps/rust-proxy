@@ -57,6 +57,9 @@
       <option value="http01">http-01 (needs port 80 reachable, no DNS credentials)</option>
       <option value="dns01">dns-01 (needs a configured DNS provider)</option>
     </select>
+    <select name="dns_credential_id" title="Which named DNS credential to use for dns-01 (only relevant when the challenge type resolves to dns-01). Leave on 'auto' to use the single configured credential, if there's exactly one.">
+      <option value="">dns credential: auto (only if exactly one exists)</option>
+    </select>
     <input type="text" name="access_allow_ips" placeholder="allowed IPs/CIDRs, comma-separated (optional)" title="Access list: IP allow list. Empty means unrestricted.">
     <input type="text" name="access_login_username" placeholder="login username (optional)" title="Gate this host behind a login page. Leave blank for no login gate.">
     <input type="password" name="access_login_password" placeholder="login password">
@@ -98,6 +101,27 @@
     <textarea name="private_key_pem" placeholder="private key PEM" rows="3" style="flex:1 1 100%;font-family:monospace;font-size:0.8rem" required></textarea>
     <button type="submit">Upload certificate</button>
     <span class="error" id="cert-error"></span>
+  </form>
+
+  <h2>DNS credentials</h2>
+  <p style="font-size:0.85rem;max-width:60ch">Named DNS-01 credentials for ACME issuance -- a host set to the
+    <code>dns01</code> challenge type picks one by name below. If exactly one exists, a host with no explicit
+    choice uses it automatically; with zero or several, you must pick one.</p>
+  <table id="dns-credentials-table"><thead><tr><th>Name</th><th>Provider</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
+  <form class="inline" id="dns-credential-form">
+    <input type="text" name="name" placeholder="name (e.g. &quot;prod-cloudflare&quot;)" required>
+    <select name="provider">
+      <option value="cloudflare">Cloudflare</option>
+      <option value="digitalocean">DigitalOcean</option>
+      <option value="hetzner">Hetzner</option>
+      <option value="duckdns">DuckDNS</option>
+      <option value="godaddy">GoDaddy</option>
+      <option value="namecheap">Namecheap (token: api_user:api_key:client_ip)</option>
+      <option value="route53">Route53 (token: access_key_id:secret_access_key)</option>
+    </select>
+    <input type="text" name="token" placeholder="API token / credential string" required>
+    <button type="submit">Add credential</button>
+    <span class="error" id="dns-credential-error"></span>
   </form>
 
   <h2>API tokens</h2>
@@ -168,7 +192,7 @@ document.getElementById('logout-btn').addEventListener('click', async () => {
 });
 
 async function refreshAll() {
-  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens()]);
+  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshDnsCredentials()]);
 }
 
 async function refreshDashboard() {
@@ -181,6 +205,11 @@ async function refreshDashboard() {
 }
 
 async function refreshHosts() {
+  const credSelect = document.querySelector('#host-form select[name=dns_credential_id]');
+  const creds = await (await api('/api/dns-credentials')).json();
+  credSelect.innerHTML = '<option value="">dns credential: auto (only if exactly one exists)</option>' +
+    creds.map(c => `<option value="${esc(c.id)}">${esc(c.name)} (${esc(c.provider)})</option>`).join('');
+
   const hosts = await (await api('/api/hosts')).json();
   const tbody = document.querySelector('#hosts-table tbody');
   tbody.innerHTML = '';
@@ -213,11 +242,13 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
   const loginUsername = fd.get('access_login_username');
   const loginPassword = fd.get('access_login_password');
   const redirectTarget = fd.get('redirect_target');
+  const dnsCredentialId = fd.get('dns_credential_id');
   const body = {
     domain: fd.get('domain'), bind_ip: fd.get('bind_ip'), bind_port: Number(fd.get('bind_port')),
     upstream: fd.get('upstream'), websockets: fd.get('websockets') === 'on',
     force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
     acme_challenge_type: fd.get('acme_challenge_type'),
+    dns_credential_id: dnsCredentialId ? dnsCredentialId : null,
     access_allow_ips: allowIps,
     access_login: loginUsername ? { username: loginUsername, password: loginPassword } : null,
     redirect: redirectTarget
@@ -328,6 +359,32 @@ document.getElementById('token-form').addEventListener('submit', async (e) => {
 document.getElementById('token-reveal-dismiss').addEventListener('click', () => {
   document.getElementById('token-reveal').style.display = 'none';
   document.getElementById('token-reveal-value').textContent = '';
+});
+
+async function refreshDnsCredentials() {
+  const creds = await (await api('/api/dns-credentials')).json();
+  const tbody = document.querySelector('#dns-credentials-table tbody');
+  tbody.innerHTML = '';
+  for (const c of creds) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${esc(c.name)}</td><td>${esc(c.provider)}</td><td>${new Date(c.created_at).toLocaleString()}</td>
+      <td><button class="danger" data-id="${c.id}">Delete</button></td>`;
+    tr.querySelector('button').addEventListener('click', async () => {
+      if (!confirm(`Delete DNS credential "${c.name}"? Any host still using it for dns-01 will fail its next renewal.`)) return;
+      await api(`/api/dns-credentials/${c.id}`, { method: 'DELETE' });
+      refreshDnsCredentials();
+    });
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById('dns-credential-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = { name: fd.get('name'), provider: fd.get('provider'), token: fd.get('token') };
+  const resp = await api('/api/dns-credentials', { method: 'POST', body: JSON.stringify(body) });
+  if (resp.ok) { e.target.reset(); document.getElementById('dns-credential-error').textContent = ''; refreshDnsCredentials(); }
+  else { document.getElementById('dns-credential-error').textContent = (await resp.json()).error || 'failed'; }
 });
 
 // Probe session state on load.
