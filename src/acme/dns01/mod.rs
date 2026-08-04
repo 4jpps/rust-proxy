@@ -121,10 +121,38 @@ pub(crate) fn join_api_errors<'a>(messages: impl IntoIterator<Item = &'a str>) -
     }
 }
 
+/// Constructs the right `DnsProvider` for `kind`, given an already-built
+/// `reqwest::Client` and a credential's `token` string (whatever shape
+/// that provider's own `new()` expects -- see each provider module's
+/// doc comment). Used by `acme::resolve_dns_credential` to build a
+/// provider per host at issuance/renewal time, since credentials are
+/// now DB-backed and multi-row rather than one global startup value.
+pub fn build_provider(kind: crate::config::DnsProviderKind, http: reqwest::Client, token: String) -> Box<dyn DnsProvider> {
+    use crate::config::DnsProviderKind;
+    match kind {
+        DnsProviderKind::Cloudflare => Box::new(CloudflareDns01::new(http, token)),
+        DnsProviderKind::DigitalOcean => Box::new(DigitalOceanDns01::new(http, token)),
+        DnsProviderKind::Hetzner => Box::new(HetznerDns01::new(http, token)),
+        DnsProviderKind::DuckDns => Box::new(DuckDnsDns01::new(http, token)),
+        DnsProviderKind::GoDaddy => Box::new(GoDaddyDns01::new(http, token)),
+        DnsProviderKind::Namecheap => Box::new(NamecheapDns01::new(http, token)),
+        DnsProviderKind::Route53 => Box::new(Route53Dns01::new(http, token)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::acme::jws::AccountKey;
+
+    #[test]
+    fn build_provider_dispatches_every_provider_kind_without_panicking() {
+        use crate::config::DnsProviderKind::*;
+        let http = reqwest::Client::new();
+        for kind in [Cloudflare, DigitalOcean, Hetzner, DuckDns, GoDaddy, Namecheap, Route53] {
+            let _: Box<dyn DnsProvider> = build_provider(kind, http.clone(), "token".to_string());
+        }
+    }
 
     #[test]
     fn txt_value_is_deterministic_for_the_same_token_and_key() {

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::config::{AcmeChallengeType, HostAuth, PortRule, Protocol, ProxyHost, RedirectStatus, RedirectTarget};
+use crate::config::{AcmeChallengeType, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost, RedirectStatus, RedirectTarget};
 
 pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let url = if db_path.as_os_str() == ":memory:" {
@@ -107,6 +107,27 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // `token` holds whatever that row's `provider` needs -- a single
+    // bearer token for most providers, or a colon-packed multi-field
+    // credential (Namecheap, Route53) -- see each provider module's own
+    // doc comment in `acme::dns01`. `name` is UNIQUE so `seed_default_
+    // dns_credential`'s `INSERT OR IGNORE` (keyed on the literal name
+    // "default") is idempotent across restarts without a separate
+    // existence check.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS dns_credentials (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL,
+            token TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -176,6 +197,122 @@ pub async fn delete_api_token(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx:
 
 fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
+}
+
+pub struct DnsCredentialMeta {
+    pub id: Uuid,
+    pub name: String,
+    pub provider: DnsProviderKind,
+    pub created_at: DateTime<Utc>,
+}
+
+pub struct DnsCredential {
+    pub id: Uuid,
+    pub name: String,
+    pub provider: DnsProviderKind,
+    pub token: String,
+    pub created_at: DateTime<Utc>,
+}
+
+fn dns_provider_to_str(provider: DnsProviderKind) -> &'static str {
+    match provider {
+        DnsProviderKind::Cloudflare => "cloudflare",
+        DnsProviderKind::DigitalOcean => "digitalocean",
+        DnsProviderKind::Hetzner => "hetzner",
+        DnsProviderKind::DuckDns => "duckdns",
+        DnsProviderKind::GoDaddy => "godaddy",
+        DnsProviderKind::Namecheap => "namecheap",
+        DnsProviderKind::Route53 => "route53",
+    }
+}
+
+fn dns_provider_from_str(s: &str) -> DnsProviderKind {
+    match s {
+        "digitalocean" => DnsProviderKind::DigitalOcean,
+        "hetzner" => DnsProviderKind::Hetzner,
+        "duckdns" => DnsProviderKind::DuckDns,
+        "godaddy" => DnsProviderKind::GoDaddy,
+        "namecheap" => DnsProviderKind::Namecheap,
+        "route53" => DnsProviderKind::Route53,
+        _ => DnsProviderKind::Cloudflare,
+    }
+}
+
+pub async fn create_dns_credential(
+    pool: &SqlitePool,
+    id: Uuid,
+    name: &str,
+    provider: DnsProviderKind,
+    token: &str,
+    created_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO dns_credentials (id, name, provider, token, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(id.to_string())
+        .bind(name)
+        .bind(dns_provider_to_str(provider))
+        .bind(token)
+        .bind(created_at.to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Seeds a `"default"` credential from `config.toml`'s legacy
+/// `acme.dns_provider`/`acme.dns_api_token` fields, called once at
+/// startup (see `main.rs`) whenever `dns_api_token` is non-blank.
+/// `INSERT OR IGNORE` on the UNIQUE `name` column makes this idempotent
+/// across restarts, and -- deliberately -- never overwrites a row that
+/// already exists (an admin may have renamed or edited it since; the DB
+/// is the source of truth once a row exists at all).
+pub async fn seed_default_dns_credential(pool: &SqlitePool, provider: DnsProviderKind, token: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT OR IGNORE INTO dns_credentials (id, name, provider, token, created_at) VALUES (?, 'default', ?, ?, ?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(dns_provider_to_str(provider))
+        .bind(token)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_dns_credentials(pool: &SqlitePool) -> Result<Vec<DnsCredentialMeta>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, name, provider, created_at FROM dns_credentials ORDER BY created_at ASC")
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(DnsCredentialMeta {
+                id: Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4()),
+                name: row.get("name"),
+                provider: dns_provider_from_str(&row.get::<String, _>("provider")),
+                created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
+            })
+        })
+        .collect()
+}
+
+pub async fn get_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<Option<DnsCredential>, sqlx::Error> {
+    let row = sqlx::query("SELECT id, name, provider, token, created_at FROM dns_credentials WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| DnsCredential {
+        id,
+        name: row.get("name"),
+        provider: dns_provider_from_str(&row.get::<String, _>("provider")),
+        token: row.get("token"),
+        created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
+    }))
+}
+
+pub async fn dns_credential_name_exists(pool: &SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query("SELECT 1 FROM dns_credentials WHERE name = ?").bind(name).fetch_optional(pool).await?;
+    Ok(row.is_some())
+}
+
+pub async fn delete_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM dns_credentials WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
@@ -510,5 +647,76 @@ mod tests {
         assert!(delete_api_token(&pool, id).await.unwrap());
         assert!(list_api_tokens(&pool).await.unwrap().is_empty());
         assert!(!delete_api_token(&pool, id).await.unwrap(), "deleting again should report nothing was found");
+    }
+
+    #[tokio::test]
+    async fn dns_credentials_round_trip_through_sqlite() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_dns_credential(&pool, id, "prod-cloudflare", crate::config::DnsProviderKind::Cloudflare, "cf-token-value", Utc::now())
+            .await
+            .unwrap();
+
+        let metas = list_dns_credentials(&pool).await.unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].id, id);
+        assert_eq!(metas[0].name, "prod-cloudflare");
+        assert_eq!(metas[0].provider, crate::config::DnsProviderKind::Cloudflare);
+
+        let full = get_dns_credential(&pool, id).await.unwrap().unwrap();
+        assert_eq!(full.token, "cf-token-value");
+    }
+
+    #[tokio::test]
+    async fn dns_credential_not_found_returns_none() {
+        let pool = memory_pool().await;
+        assert!(get_dns_credential(&pool, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_dns_credential_removes_it_and_reports_whether_it_existed() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_dns_credential(&pool, id, "prod-cloudflare", crate::config::DnsProviderKind::Cloudflare, "cf-token", Utc::now())
+            .await
+            .unwrap();
+
+        assert!(delete_dns_credential(&pool, id).await.unwrap());
+        assert!(list_dns_credentials(&pool).await.unwrap().is_empty());
+        assert!(!delete_dns_credential(&pool, id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dns_credential_name_exists_reflects_current_rows() {
+        let pool = memory_pool().await;
+        assert!(!dns_credential_name_exists(&pool, "prod-cloudflare").await.unwrap());
+        create_dns_credential(&pool, Uuid::new_v4(), "prod-cloudflare", crate::config::DnsProviderKind::Cloudflare, "tok", Utc::now())
+            .await
+            .unwrap();
+        assert!(dns_credential_name_exists(&pool, "prod-cloudflare").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn seed_default_dns_credential_is_idempotent_across_restarts() {
+        let pool = memory_pool().await;
+        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "hetzner-token").await.unwrap();
+        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "hetzner-token").await.unwrap();
+
+        let metas = list_dns_credentials(&pool).await.unwrap();
+        assert_eq!(metas.len(), 1, "seeding twice (e.g. two restarts) must not create a duplicate 'default' row");
+        assert_eq!(metas[0].name, "default");
+    }
+
+    #[tokio::test]
+    async fn seed_default_dns_credential_does_not_overwrite_a_user_renamed_or_edited_default() {
+        let pool = memory_pool().await;
+        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "original-token").await.unwrap();
+        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "a-different-token-from-a-later-config-edit")
+            .await
+            .unwrap();
+
+        let metas = list_dns_credentials(&pool).await.unwrap();
+        let full = get_dns_credential(&pool, metas[0].id).await.unwrap().unwrap();
+        assert_eq!(full.token, "original-token", "seeding is INSERT OR IGNORE -- the DB row, once created, is the source of truth");
     }
 }
