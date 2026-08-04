@@ -138,6 +138,7 @@ mod tests {
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         }

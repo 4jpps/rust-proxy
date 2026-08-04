@@ -176,6 +176,14 @@ pub struct ProxyHost {
     /// after the IP allow list, before the request reaches the upstream.
     #[serde(default)]
     pub access_login: Option<HostAuth>,
+    /// Which named `dns_credentials` DB row (see `db::create_dns_credential`)
+    /// to use for this host's dns-01 issuance. `None` means either this
+    /// host never needs dns-01 (http-01, or ACME disabled), or -- when it
+    /// does need dns-01 -- fall back to the single configured credential
+    /// if there's exactly one; with zero or more than one, that's a
+    /// validation/runtime error (see `acme::resolve_dns_credential`).
+    #[serde(default)]
+    pub dns_credential_id: Option<Uuid>,
     /// When set, this host answers every matched request with a redirect
     /// to `RedirectTarget::target` instead of proxying to `upstream`.
     /// Domain matching, TLS/ACME issuance, the firewall rule, and access
@@ -520,6 +528,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         });
@@ -542,6 +551,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         });
@@ -563,6 +573,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         });
@@ -584,6 +595,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         });
@@ -605,6 +617,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: Some(RedirectTarget {
                 target: "https://new.example.com".into(),
                 preserve_path: true,
@@ -630,6 +643,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: Some(RedirectTarget {
                 target: "new.example.com".into(),
                 preserve_path: true,
@@ -714,6 +728,7 @@ dns_api_token = "token-placeholder"
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 access_allow_ips: vec![],
                 access_login: None,
+                dns_credential_id: None,
                 redirect: None,
                 enabled: true,
             });
@@ -740,6 +755,7 @@ dns_api_token = "token-placeholder"
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
                 access_allow_ips: vec![],
                 access_login: None,
+                dns_credential_id: None,
                 redirect: None,
                 enabled: true,
             });
@@ -762,6 +778,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         });
@@ -793,6 +810,7 @@ dns_api_token = "token-placeholder"
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         });

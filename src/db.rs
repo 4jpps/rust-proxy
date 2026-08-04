@@ -51,6 +51,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             redirect_target TEXT,
             redirect_preserve_path INTEGER NOT NULL DEFAULT 1,
             redirect_status TEXT NOT NULL DEFAULT 'permanent',
+            dns_credential_id TEXT,
             enabled INTEGER NOT NULL
         )
         "#,
@@ -70,6 +71,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_target TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_preserve_path INTEGER NOT NULL DEFAULT 1").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_status TEXT NOT NULL DEFAULT 'permanent'").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN dns_credential_id TEXT").execute(pool).await;
 
     sqlx::query(
         r#"
@@ -319,7 +321,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, \
          access_allow_ips, access_login_username, access_login_password_hash, \
-         redirect_target, redirect_preserve_path, redirect_status, enabled FROM hosts",
+         redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -351,6 +353,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                     _ => RedirectStatus::Permanent,
                 },
             });
+            let dns_credential_id = row.get::<Option<String>, _>("dns_credential_id").and_then(|s| Uuid::parse_str(&s).ok());
             Ok(ProxyHost {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 domain: row.get("domain"),
@@ -363,6 +366,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 acme_challenge_type: challenge_type,
                 access_allow_ips,
                 access_login,
+                dns_credential_id,
                 redirect,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
@@ -398,8 +402,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, \
              acme_challenge_type, access_allow_ips, access_login_username, access_login_password_hash, \
-             redirect_target, redirect_preserve_path, redirect_status, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -416,6 +420,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(redirect_target)
         .bind(redirect_preserve_path)
         .bind(redirect_status)
+        .bind(h.dns_credential_id.map(|id| id.to_string()))
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -495,6 +500,7 @@ mod tests {
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
             access_allow_ips: vec![],
             access_login: None,
+            dns_credential_id: None,
             redirect: None,
             enabled: true,
         }
@@ -566,6 +572,26 @@ mod tests {
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert_eq!(loaded[0].redirect, host.redirect);
+    }
+
+    #[tokio::test]
+    async fn dns_credential_id_round_trips_through_sqlite() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.dns_credential_id = Some(Uuid::new_v4());
+        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert_eq!(loaded[0].dns_credential_id, host.dns_credential_id);
+    }
+
+    #[tokio::test]
+    async fn dns_credential_id_defaults_to_none_when_absent() {
+        let pool = memory_pool().await;
+        save_hosts(&pool, std::slice::from_ref(&sample_host())).await.unwrap();
+
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert!(loaded[0].dns_credential_id.is_none());
     }
 
     #[tokio::test]

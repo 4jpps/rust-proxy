@@ -273,6 +273,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
         access_login,
+        dns_credential_id: None, // Task 7 threads this through HostRequest
         redirect: body.redirect,
         enabled: body.enabled,
     };
@@ -305,6 +306,7 @@ async fn update_host(
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
         access_login,
+        dns_credential_id: None, // Task 7 threads this through HostRequest
         redirect: body.redirect,
         enabled: body.enabled,
     };
