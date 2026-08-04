@@ -34,6 +34,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/certs/:domain", axum::routing::delete(delete_cert))
         .route("/api/tokens", get(list_api_tokens).post(create_api_token))
         .route("/api/tokens/:id", axum::routing::delete(delete_api_token))
+        .route("/api/dns-credentials", get(list_dns_credentials).post(create_dns_credential))
+        .route("/api/dns-credentials/:id", axum::routing::delete(delete_dns_credential))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
@@ -97,6 +99,7 @@ fn bearer_token(req: &Request) -> Option<String> {
 enum ApiError {
     BadRequest(String),
     NotFound,
+    Conflict(String),
     Internal(String),
 }
 
@@ -105,6 +108,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
@@ -199,6 +203,8 @@ struct HostRequest {
     /// stored raw.
     #[serde(default)]
     access_login: Option<HostLoginRequest>,
+    #[serde(default)]
+    dns_credential_id: Option<Uuid>,
     /// When set, this host redirects instead of proxying -- see
     /// `config::RedirectTarget`. No password/hashing involved, so this
     /// is deserialized straight from the request with no separate DTO.
@@ -273,10 +279,11 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
         access_login,
-        dns_credential_id: None, // Task 7 threads this through HostRequest
+        dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
         enabled: body.enabled,
     };
+    validate_dns_credential_choice(&state, &host).await?;
     let to_insert = host.clone();
     mutate_hosts(&state, move |hosts| {
         hosts.push(to_insert);
@@ -306,10 +313,11 @@ async fn update_host(
         acme_challenge_type: body.acme_challenge_type,
         access_allow_ips,
         access_login,
-        dns_credential_id: None, // Task 7 threads this through HostRequest
+        dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
         enabled: body.enabled,
     };
+    validate_dns_credential_choice(&state, &updated).await?;
     let to_store = updated.clone();
     let found = mutate_hosts(&state, move |hosts| match hosts.iter_mut().find(|h| h.id == id) {
         Some(existing) => {
@@ -592,6 +600,92 @@ async fn delete_api_token(State(state): State<AppState>, Path(id): Path<Uuid>) -
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Serialize)]
+struct DnsCredentialSummary {
+    id: Uuid,
+    name: String,
+    provider: crate::config::DnsProviderKind,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+struct CreateDnsCredentialRequest {
+    name: String,
+    provider: crate::config::DnsProviderKind,
+    token: String,
+}
+
+async fn list_dns_credentials(State(state): State<AppState>) -> Result<Json<Vec<DnsCredentialSummary>>, ApiError> {
+    let creds = crate::db::list_dns_credentials(state.db()).await?;
+    Ok(Json(
+        creds
+            .into_iter()
+            .map(|c| DnsCredentialSummary {
+                id: c.id,
+                name: c.name,
+                provider: c.provider,
+                created_at: c.created_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn create_dns_credential(State(state): State<AppState>, Json(body): Json<CreateDnsCredentialRequest>) -> Result<Json<DnsCredentialSummary>, ApiError> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".into()));
+    }
+    if body.token.trim().is_empty() {
+        return Err(ApiError::BadRequest("token must not be empty".into()));
+    }
+    if crate::db::dns_credential_name_exists(state.db(), name).await? {
+        return Err(ApiError::BadRequest(format!("a DNS credential named \"{name}\" already exists")));
+    }
+    let id = Uuid::new_v4();
+    let created_at = chrono::Utc::now();
+    crate::db::create_dns_credential(state.db(), id, name, body.provider, &body.token, created_at).await?;
+    Ok(Json(DnsCredentialSummary {
+        id,
+        name: name.to_string(),
+        provider: body.provider,
+        created_at,
+    }))
+}
+
+async fn delete_dns_credential(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+    let found = crate::db::delete_dns_credential(state.db(), id).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rejects creating/updating a dns-01 host with no way to pick a DNS
+/// credential unambiguously -- see `acme::resolve_dns_credential`'s doc
+/// comment for the same "None falls back only when there's exactly one"
+/// rule this mirrors, surfaced here as an immediate 400 instead of a
+/// renewal-time failure discovered hours later.
+async fn validate_dns_credential_choice(state: &AppState, host: &ProxyHost) -> Result<(), ApiError> {
+    if crate::acme::resolve_challenge_type(host) != crate::acme::ChallengeMethod::Dns01 {
+        return Ok(());
+    }
+    if host.dns_credential_id.is_some() {
+        return Ok(());
+    }
+    let count = crate::db::list_dns_credentials(state.db()).await?.len();
+    match count {
+        0 => Err(ApiError::BadRequest(format!(
+            "{} needs a dns-01 DNS credential but none are configured -- add one first",
+            host.domain
+        ))),
+        1 => Ok(()),
+        _ => Err(ApiError::BadRequest(format!(
+            "{} needs a dns-01 DNS credential and multiple are configured -- set dns_credential_id explicitly",
+            host.domain
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +966,256 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_dns_credential_persists_and_appears_in_the_list_without_the_token() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns-credentials")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let created = body_json(create_resp).await;
+        assert_eq!(created["name"], "prod-hetzner");
+        assert!(created.get("token").is_none(), "the credential's secret token must never be returned, even on creation");
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dns-credentials")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["name"], "prod-hetzner");
+        assert_eq!(json[0]["provider"], "hetzner");
+        assert!(json[0].get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_dns_credential_with_a_duplicate_name_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        for _ in 0..2 {
+            let _ = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/dns-credentials")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, cookie.clone())
+                        .body(axum::body::Body::from(r#"{"name":"dup","provider":"hetzner","token":"tok"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dns-credentials")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json.as_array().unwrap().len(), 1, "the second create with a duplicate name must have been rejected, not silently duplicated");
+    }
+
+    #[tokio::test]
+    async fn delete_dns_credential_removes_it_and_repeated_delete_returns_404() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns-credentials")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+
+        let delete_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/dns-credentials/{id}"))
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+        let repeat_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/dns-credentials/{id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeat_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dns_credential_endpoints_require_authentication() {
+        let router = build_router(test_state().await);
+        let resp = router
+            .oneshot(Request::builder().uri("/api/dns-credentials").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn creating_a_dns01_host_with_no_credential_and_none_configured_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn creating_a_dns01_host_with_no_credential_and_exactly_one_configured_succeeds() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns-credentials")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"only-one","provider":"hetzner","token":"tok"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn creating_a_dns01_host_with_no_credential_and_multiple_configured_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        for name in ["one", "two"] {
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/dns-credentials")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, cookie.clone())
+                        .body(axum::body::Body::from(format!(r#"{{"name":"{name}","provider":"hetzner","token":"tok"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn creating_an_http01_host_needs_no_dns_credential_at_all() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"http01"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
