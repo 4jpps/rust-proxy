@@ -74,7 +74,8 @@ priority = "optional"
 extended-description = """\
 A lightweight L7 reverse proxy daemon: HTTP/WebSocket reverse proxying \
 with SNI-based TLS, a native RFC 8555 ACME client (dns-01 via a \
-pluggable DNS provider -- Cloudflare, DigitalOcean, or Hetzner), \
+pluggable, multi-credential DNS provider -- Cloudflare, DigitalOcean, \
+Hetzner, DuckDNS, GoDaddy, Namecheap, or Route53), \
 dynamic default-DROP nftables firewall orchestration, arbitrary \
 TCP/UDP port passthrough, and a small embedded web admin UI with a \
 REST API (session or bearer-token auth). Built as an open, \

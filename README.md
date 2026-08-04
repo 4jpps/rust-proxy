@@ -4,8 +4,9 @@ A lightweight L7 reverse proxy daemon in Rust, built as an open,
 self-hostable alternative to Nginx Proxy Manager: HTTP/1.1+HTTP/2 and
 WebSocket reverse proxying with SNI-based TLS, a native RFC 8555 ACME
 client (dns-01 via a
-pluggable DNS provider -- Cloudflare, DigitalOcean, or Hetzner today --
-or http-01, needing no DNS credentials at all), dynamic default-DROP
+pluggable, multi-credential DNS provider -- Cloudflare, DigitalOcean,
+Hetzner, DuckDNS, GoDaddy, Namecheap, or Route53 today -- or http-01,
+needing no DNS credentials at all), dynamic default-DROP
 nftables firewall orchestration, arbitrary TCP/UDP port passthrough,
 and a small embedded web admin UI. Runs on anything from a single
 dedicated IP to a full subnet block -- see Configuration below.
@@ -23,16 +24,35 @@ persistence tests run against an in-memory sqlite database.
 
 ## Configuration
 
-Copy `deploy/config.toml.example` to `/etc/rust-proxy/config.toml` and
-fill in `admin.session_secret` (`openssl rand -hex 32`),
-`admin.admin_password_hash` (`rust-proxy hash-password '...'`), and
-`acme.dns_api_token` for whichever `acme.dns_provider` you use
-(`cloudflare`, the default if omitted; `digitalocean`; or `hetzner` --
-all three take a single bearer/header API token, see the comments in
-`deploy/config.toml.example`). Adding another provider means one new
+Copy `deploy/config.toml.example` to `/etc/rust-proxy/config.toml` -- its
+`[admin]`/`[acme]` sections are safe to run as-is (loopback-only admin
+UI, no admin account or DNS credential set), since the admin identity
+and any number of named DNS-01 credentials are normally created and
+managed from the admin UI (or the first-launch setup wizard it serves
+when unconfigured) and stored in sqlite, not `config.toml`. Each proxy
+host with `acme_enabled` and a dns-01 challenge type picks a named
+credential via `dns_credential_id` (falls back to the sole configured
+credential if there's exactly one and the host doesn't set it
+explicitly). Supported providers: `cloudflare`, `digitalocean`,
+`hetzner`, `duckdns`, `godaddy`, `namecheap`, and `route53` -- see the
+"DNS credentials" section of the admin UI for what each provider's
+credential string needs (most are a single bearer/header API token;
+Namecheap and Route53 pack multiple colon-delimited fields into that
+same string, documented there). Adding another provider means one new
 file under `src/acme/dns01/` implementing the `DnsProvider` trait
 (`find_zone`/`create_txt_record`/`delete_txt_record`) plus a new
 `DnsProviderKind` variant -- PRs for more providers welcome.
+
+Prefer to manage the admin identity and/or a DNS credential as part of
+`config.toml` instead of through the DB-backed admin UI/wizard? Set
+`admin.session_secret` (`openssl rand -hex 32`), `admin.admin_username`,
+and `admin.admin_password_hash` (`rust-proxy hash-password '...'`) there
+together -- all three or none, a partial set is rejected at startup --
+and/or `acme.dns_provider`/`acme.dns_api_token` for a single seeded
+"default" credential. Whichever of those you set in `config.toml`
+always takes precedence over whatever the wizard or admin UI has
+stored, on every read, not just at first boot.
+
 `network.bind_ranges` is optional
 and empty by default -- unrestricted, bind to whatever address the
 environment actually has, whether that's a single dedicated IP, a full
@@ -266,15 +286,25 @@ the key fetched above before trusting anything in it. See
 README for the full setup, including how to add both the `stable` and
 `testing` channels at once.)
 
-`postinst` creates the `rust-proxy` system user and, on first install,
-either interactively prompts for initial configuration (admin
-credentials, DNS provider/token) or -- if run non-interactively, e.g.
-`apt-get install -y` in a script -- generates a random admin password
-and prints it once. Either way you get a real `/etc/rust-proxy/config.toml`
-and a running service; edit the file and `systemctl restart rust-proxy`
-to change anything afterward. An unattended install without ACME
-credentials on hand still works -- it just can't issue certs until
-`acme.dns_api_token` is filled in.
+`postinst` creates the `rust-proxy` system user, installs a working
+default `/etc/rust-proxy/config.toml` on first install (loopback-only
+admin UI on port 8080, no admin account or DNS credential yet), and
+starts the service. Visit the admin UI once (`http://127.0.0.1:8080/`,
+or wherever you've pointed `admin.bind_ip` after editing the config) to
+finish setup -- it walks you through creating the admin account and,
+optionally, an initial DNS-01 credential, both stored in the runtime
+database rather than the config file. An install with no DNS credential
+added yet still works -- it just can't issue dns-01 certs until one is
+added, either through the wizard or later from the admin UI's "DNS
+credentials" section.
+
+Prefer to manage the admin identity/DNS credential as part of
+`config.toml` instead of through the DB-backed wizard? Set
+`admin.session_secret`/`admin.admin_username`/`admin.admin_password_hash`
+(all three together -- a partial set is rejected at startup) and/or
+`acme.dns_provider`/`acme.dns_api_token` there; whichever of those you
+set in `config.toml` always takes precedence over whatever the wizard
+or admin UI has stored, on every read, not just at first boot.
 
 Or download a specific release's `.deb` directly and `dpkg -i` it, or
 build/install manually:

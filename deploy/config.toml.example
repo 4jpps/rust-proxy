@@ -1,5 +1,7 @@
-# Copy to /etc/rust-proxy/config.toml (root:rust-proxy, mode 640 -- it
-# holds admin.session_secret and acme.cloudflare_api_token).
+# Copy to /etc/rust-proxy/config.toml (root:rust-proxy, mode 640 -- if
+# you opt to set admin.session_secret/admin_password_hash or
+# acme.dns_api_token here instead of via the admin UI, this file holds
+# real secrets).
 #
 # hosts/port_rules below only matter on first boot, to seed an empty
 # database -- after that, manage them from the admin UI at
@@ -13,30 +15,40 @@
 # bind_ranges = ["10.0.0.0/29"]
 
 [admin]
-bind_ip = "10.0.0.1"
+# Safe, working defaults -- this file is installed verbatim as a fresh
+# install's real config.toml (see postinst), so these must work
+# out of the box, not be "replace me" placeholders. Change bind_ip to a
+# real LAN/subnet address (and widen allowed_ips to match) once you're
+# ready to reach the admin UI from more than just this host.
+bind_ip = "127.0.0.1"
 bind_port = 8080
 # Only these source IPs/CIDRs may reach the admin UI/API -- enforced by
-# nftables, not just the application. Leave empty to restrict to
+# nftables, not just the application. Empty (the default) restricts to
 # loopback-only (see nftables::generator's fallback).
-allowed_ips = ["10.0.0.1/32"]
-# Generate with: openssl rand -hex 32
-session_secret = "change-me-generate-a-real-random-value"
-admin_username = "admin"
-# Generate with: rust-proxy hash-password 'your-real-password'
-admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE$WITHREALHASH"
+allowed_ips = []
+# admin.session_secret/admin_username/admin_password_hash are
+# deliberately omitted -- leaving all three unset (never just one or
+# two -- config validation rejects a partial set) means the admin UI
+# serves a first-launch setup wizard instead, which creates the admin
+# account and writes it to the runtime database. Set all three here
+# only if you'd rather manage the admin identity as part of this file
+# (session_secret: `openssl rand -hex 32`; admin_password_hash:
+# `rust-proxy hash-password 'your-real-password'`) -- when set here,
+# config.toml always wins over whatever the wizard/DB has, on every
+# read.
 
 [acme]
 contact_email = "admin@example.com"
-# dns_provider defaults to "cloudflare" if omitted. Also supported:
-# "digitalocean", "hetzner". All three use a single bearer/header API
-# token, so dns_api_token covers whichever one you pick below.
-# dns_provider = "cloudflare"
+# dns_provider/dns_api_token are also deliberately omitted here -- add a
+# named DNS-01 credential from the admin UI's "DNS credentials" section
+# (or the setup wizard's optional step) instead. Uncomment below only if
+# you'd rather seed a single "default" credential from this file at
+# first boot (same all-or-nothing precedence as the admin fields above
+# doesn't apply here -- this is a single field, either set or not):
 #
-# Cloudflare: an API token (not the legacy Global API Key) scoped to
-#   Zone:DNS:Edit for the zone(s) you'll issue certs under.
-# DigitalOcean: a personal access token with write access.
-# Hetzner: a DNS API token from the Hetzner DNS Console.
-dns_api_token = "your-dns-provider-api-token-with-dns-edit-scope"
+# dns_provider = "cloudflare"  # also: "digitalocean", "hetzner", "duckdns", "godaddy", "namecheap", "route53"
+# dns_api_token = "your-dns-provider-api-token-with-dns-edit-scope"
+#
 # directory_url defaults to Let's Encrypt production -- point this at
 # https://acme-staging-v02.api.letsencrypt.org/directory while testing,
 # to avoid production rate limits.
