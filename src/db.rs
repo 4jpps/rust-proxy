@@ -201,6 +201,7 @@ fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
 }
 
+#[derive(Debug)]
 pub struct DnsCredentialMeta {
     pub id: Uuid,
     pub name: String,
@@ -208,12 +209,34 @@ pub struct DnsCredentialMeta {
     pub created_at: DateTime<Utc>,
 }
 
+/// Deliberately no `Debug` derive that would print `token` -- this type
+/// holds a live secret (see `get_dns_credential`), and an accidental
+/// `{:?}`/`.unwrap()` on it anywhere (logs, a panic message) must never
+/// leak it. `#[derive(Debug)]` was added back for `DnsCredentialError`
+/// (below)'s `#[error(transparent)] Db(#[from] sqlx::Error)` bound and
+/// `resolve_dns_credential`'s own tests, which only ever call
+/// `.unwrap_err()` on the `Result<DnsCredential, _>` -- that bound
+/// requires `T: Debug` even though the Ok value is never actually
+/// printed on that path, so a hand-written impl that never prints
+/// `token` is used instead of the derive.
 pub struct DnsCredential {
     pub id: Uuid,
     pub name: String,
     pub provider: DnsProviderKind,
     pub token: String,
     pub created_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for DnsCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsCredential")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("token", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 fn dns_provider_to_str(provider: DnsProviderKind) -> &'static str {

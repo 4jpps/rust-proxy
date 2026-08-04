@@ -64,6 +64,15 @@ async fn main() -> anyhow::Result<()> {
         port_rules = cfg.port_rules.clone();
     }
 
+    // config.toml's dns_provider/dns_api_token (if set) seed a "default"
+    // dns_credentials row, idempotently -- zero config.toml changes
+    // needed for an existing single-provider deployment. Omitted/blank
+    // dns_api_token means no implicit row; credentials must then come
+    // from the DB (admin UI or setup wizard) instead.
+    if !cfg.acme.dns_api_token.trim().is_empty() {
+        db::seed_default_dns_credential(&db_pool, cfg.acme.dns_provider, &cfg.acme.dns_api_token).await?;
+    }
+
     let state = state::AppState::new(cfg, db_pool, hosts, port_rules);
     acme::load_certs_from_disk(&state)?;
 

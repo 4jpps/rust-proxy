@@ -22,9 +22,42 @@ use thiserror::Error;
 use crate::config::{AcmeChallengeType, DnsProviderKind, ProxyHost};
 use crate::state::AppState;
 use client::{AcmeClient, AcmeError};
-use dns01::{acme_challenge_record_name, dns01_txt_value, CloudflareDns01, DigitalOceanDns01, Dns01Error, DnsProvider, DuckDnsDns01, GoDaddyDns01, HetznerDns01, NamecheapDns01};
+use dns01::{acme_challenge_record_name, dns01_txt_value, Dns01Error, DnsProvider};
 use jws::{AccountKey, JwsError};
 use types::{Authorization, AuthorizationStatus, OrderStatus};
+
+#[derive(Debug, Error)]
+pub enum DnsCredentialError {
+    #[error("host {0} needs a dns-01 DNS credential but dns_credential_id is unset and no DNS credentials are configured -- add one first")]
+    NoneConfigured(String),
+    #[error("host {0} needs a dns-01 DNS credential but dns_credential_id is unset and multiple DNS credentials exist -- set dns_credential_id explicitly")]
+    Ambiguous(String),
+    #[error("host {0}'s dns_credential_id does not match any existing DNS credential")]
+    NotFound(String),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Resolves which `dns_credentials` DB row a host should use for dns-01
+/// issuance. `Some(id)` always wins outright. `None` falls back to "the
+/// single configured credential" only when it's genuinely unambiguous
+/// (exactly one row exists) -- zero or multiple rows with no explicit
+/// choice is a clear error rather than a silent wrong guess.
+pub async fn resolve_dns_credential(pool: &sqlx::SqlitePool, domain: &str, dns_credential_id: Option<uuid::Uuid>) -> Result<crate::db::DnsCredential, DnsCredentialError> {
+    match dns_credential_id {
+        Some(id) => crate::db::get_dns_credential(pool, id).await?.ok_or_else(|| DnsCredentialError::NotFound(domain.to_string())),
+        None => {
+            let metas = crate::db::list_dns_credentials(pool).await?;
+            match metas.len() {
+                0 => Err(DnsCredentialError::NoneConfigured(domain.to_string())),
+                1 => Ok(crate::db::get_dns_credential(pool, metas[0].id)
+                    .await?
+                    .expect("just listed this row, it cannot have vanished between the two queries")),
+                _ => Err(DnsCredentialError::Ambiguous(domain.to_string())),
+            }
+        }
+    }
+}
 
 /// Which ACME challenge type actually gets used for one host --
 /// `AcmeChallengeType::Auto` resolves here rather than being stored
@@ -105,6 +138,8 @@ pub enum IssuanceError {
     Timeout(&'static str),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    DnsCredential(#[from] DnsCredentialError),
 }
 
 /// Runs the full issue/renew flow for one host: order -> dns-01 or
@@ -113,12 +148,7 @@ pub enum IssuanceError {
 /// map for SNI dispatch. Whichever challenge fulfillment was published
 /// (a DNS TXT record, or an in-memory http-01 token) is always cleaned
 /// up on the way out, success or failure.
-pub async fn issue_certificate(
-    state: &AppState,
-    client: &AcmeClient,
-    dns01: &dyn DnsProvider,
-    host: &ProxyHost,
-) -> Result<(), IssuanceError> {
+pub async fn issue_certificate(state: &AppState, client: &AcmeClient, http: &reqwest::Client, host: &ProxyHost) -> Result<(), IssuanceError> {
     let domain = &host.domain;
     let (order_url, order) = client.new_order(&[domain.to_string()]).await?;
     let authz_url = order
@@ -128,7 +158,11 @@ pub async fn issue_certificate(
     let authz = client.get_authorization(authz_url).await?;
 
     let issued = match resolve_challenge_type(host) {
-        ChallengeMethod::Dns01 => issue_via_dns01(client, dns01, domain, &authz, authz_url, &order_url, &order.finalize).await?,
+        ChallengeMethod::Dns01 => {
+            let credential = resolve_dns_credential(state.db(), domain, host.dns_credential_id).await?;
+            let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
+            issue_via_dns01(client, dns01.as_ref(), domain, &authz, authz_url, &order_url, &order.finalize).await?
+        }
         ChallengeMethod::Http01 => issue_via_http01(state, client, domain, &authz, authz_url, &order_url, &order.finalize).await?,
     };
     publish_cert(state, domain, &issued).await
@@ -347,15 +381,6 @@ where
 /// missing entirely, e.g. first boot).
 pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
     let http = reqwest::Client::new();
-    let dns01: Box<dyn DnsProvider> = match state.acme().dns_provider {
-        DnsProviderKind::Cloudflare => Box::new(CloudflareDns01::new(http.clone(), state.acme().dns_api_token.clone())),
-        DnsProviderKind::DigitalOcean => Box::new(DigitalOceanDns01::new(http.clone(), state.acme().dns_api_token.clone())),
-        DnsProviderKind::DuckDns => Box::new(DuckDnsDns01::new(http.clone(), state.acme().dns_api_token.clone())),
-        DnsProviderKind::GoDaddy => Box::new(GoDaddyDns01::new(http.clone(), state.acme().dns_api_token.clone())),
-        DnsProviderKind::Hetzner => Box::new(HetznerDns01::new(http.clone(), state.acme().dns_api_token.clone())),
-        DnsProviderKind::Namecheap => Box::new(NamecheapDns01::new(http.clone(), state.acme().dns_api_token.clone())),
-        DnsProviderKind::Route53 => todo!("wired up once Route53Dns01 exists"),
-    };
 
     // Account setup failing (blank/invalid contact_email or
     // dns_api_token, Let's Encrypt briefly unreachable, ...) must
@@ -380,7 +405,7 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
 
     loop {
         for host in state.hosts().iter().filter(|h| h.acme_enabled && h.enabled) {
-            if let Err(err) = renew_if_needed(&state, &client, dns01.as_ref(), host).await {
+            if let Err(err) = renew_if_needed(&state, &client, &http, host).await {
                 tracing::error!(domain = %host.domain, error = %err, "certificate issuance/renewal failed");
             }
         }
@@ -395,12 +420,7 @@ async fn init_acme_client(state: &AppState) -> Result<AcmeClient, IssuanceError>
     Ok(client)
 }
 
-async fn renew_if_needed(
-    state: &AppState,
-    client: &AcmeClient,
-    dns01: &dyn DnsProvider,
-    host: &ProxyHost,
-) -> Result<(), IssuanceError> {
+async fn renew_if_needed(state: &AppState, client: &AcmeClient, http: &reqwest::Client, host: &ProxyHost) -> Result<(), IssuanceError> {
     let renew_before = chrono::Duration::days(state.acme().renew_before_days);
     let needs_issuance = match state.certs().get(&host.domain) {
         Some(entry) => entry.not_after - chrono::Utc::now() < renew_before,
@@ -410,7 +430,7 @@ async fn renew_if_needed(
         return Ok(());
     }
     tracing::info!(domain = %host.domain, "issuing/renewing certificate");
-    issue_certificate(state, client, dns01, host).await
+    issue_certificate(state, client, http, host).await
 }
 
 #[cfg(test)]
@@ -481,6 +501,60 @@ mod tests {
         let mut h = host("example.com", true, AcmeChallengeType::Http01);
         h.acme_enabled = false;
         assert!(!opens_port_80_for_acme(&h));
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_credential_uses_the_single_existing_credential_when_none_is_specified() {
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "only-one", DnsProviderKind::Hetzner, "tok", chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let cred = resolve_dns_credential(&pool, "example.com", None).await.unwrap();
+        assert_eq!(cred.name, "only-one");
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_credential_errors_when_none_exist_and_none_is_specified() {
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let err = resolve_dns_credential(&pool, "example.com", None).await.unwrap_err();
+        assert!(matches!(err, DnsCredentialError::NoneConfigured(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_credential_errors_when_ambiguous_and_none_is_specified() {
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "one", DnsProviderKind::Hetzner, "tok1", chrono::Utc::now())
+            .await
+            .unwrap();
+        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "two", DnsProviderKind::Cloudflare, "tok2", chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let err = resolve_dns_credential(&pool, "example.com", None).await.unwrap_err();
+        assert!(matches!(err, DnsCredentialError::Ambiguous(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_credential_uses_the_explicitly_specified_credential_even_when_others_exist() {
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let wanted_id = uuid::Uuid::new_v4();
+        crate::db::create_dns_credential(&pool, wanted_id, "wanted", DnsProviderKind::Hetzner, "tok1", chrono::Utc::now())
+            .await
+            .unwrap();
+        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "other", DnsProviderKind::Cloudflare, "tok2", chrono::Utc::now())
+            .await
+            .unwrap();
+
+        let cred = resolve_dns_credential(&pool, "example.com", Some(wanted_id)).await.unwrap();
+        assert_eq!(cred.name, "wanted");
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_credential_errors_when_the_specified_id_does_not_exist() {
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let err = resolve_dns_credential(&pool, "example.com", Some(uuid::Uuid::new_v4())).await.unwrap_err();
+        assert!(matches!(err, DnsCredentialError::NotFound(_)));
     }
 
     async fn test_state(directory_url: String) -> AppState {
