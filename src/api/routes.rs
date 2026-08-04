@@ -62,10 +62,13 @@ async fn admin_ui() -> Response {
 /// account model. Treat a token like a password: anyone holding one can
 /// reconfigure the proxy and the firewall behind it.
 async fn require_admin(State(state): State<AppState>, cookies: Cookies, req: Request, next: Next) -> Response {
+    let Some(identity) = state.admin_identity() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let session_ok = cookies
         .get(auth::SESSION_COOKIE)
         .map(|c| c.value().to_string())
-        .and_then(|t| auth::verify_session(&state.admin().session_secret, &t))
+        .and_then(|t| auth::verify_session(&identity.session_secret, &t))
         .is_some();
     if session_ok {
         return next.run(req).await;
@@ -128,11 +131,13 @@ struct LoginRequest {
 }
 
 async fn login(State(state): State<AppState>, cookies: Cookies, Json(body): Json<LoginRequest>) -> Response {
-    let admin = state.admin();
-    if body.username != admin.admin_username || !auth::verify_password(&body.password, &admin.admin_password_hash) {
+    let Some(identity) = state.admin_identity() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if body.username != identity.username || !auth::verify_password(&body.password, &identity.password_hash) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let token = auth::sign_session(&admin.session_secret, &body.username);
+    let token = auth::sign_session(&identity.session_secret, &body.username);
     let mut cookie = Cookie::new(auth::SESSION_COOKIE, token);
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax);
@@ -703,9 +708,9 @@ mod tests {
                 bind_ip: "10.0.0.1".parse().unwrap(),
                 bind_port: 8080,
                 allowed_ips: vec![],
-                session_secret: "test-secret-key".into(),
-                admin_username: "admin".into(),
-                admin_password_hash: auth::hash_password("correct-password").unwrap(),
+                session_secret: Some("test-secret-key".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -721,7 +726,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![])
+        AppState::new(cfg, pool, vec![], vec![], None)
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {

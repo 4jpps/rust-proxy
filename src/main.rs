@@ -73,7 +73,13 @@ async fn main() -> anyhow::Result<()> {
         db::seed_default_dns_credential(&db_pool, cfg.acme.dns_provider, &cfg.acme.dns_api_token).await?;
     }
 
-    let state = state::AppState::new(cfg, db_pool, hosts, port_rules);
+    let db_admin_identity = db::load_admin_identity(&db_pool).await?.map(|row| state::AdminIdentity {
+        username: row.username,
+        password_hash: row.password_hash,
+        session_secret: row.session_secret,
+    });
+
+    let state = state::AppState::new(cfg, db_pool, hosts, port_rules, db_admin_identity);
     acme::load_certs_from_disk(&state)?;
 
     tokio::try_join!(

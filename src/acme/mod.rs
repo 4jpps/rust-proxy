@@ -566,9 +566,9 @@ mod tests {
                 bind_ip: "127.0.0.1".parse().unwrap(),
                 bind_port: 8080,
                 allowed_ips: vec![],
-                session_secret: "test-secret".into(),
-                admin_username: "admin".into(),
-                admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                session_secret: Some("test-secret".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -584,7 +584,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![])
+        AppState::new(cfg, pool, vec![], vec![], None)
     }
 
     // The bug this guards against: a blank/invalid `acme.contact_email`

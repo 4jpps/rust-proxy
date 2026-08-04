@@ -130,6 +130,25 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Single-row table (id is always 1, enforced by the CHECK constraint
+    // -- `save_admin_identity` always upserts that one row via
+    // `ON CONFLICT`). Holds the admin identity set by the first-launch
+    // setup wizard; only consulted when config.toml omits
+    // session_secret/admin_username/admin_password_hash entirely -- see
+    // `state::AppState::admin_identity`.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS admin_identity (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            session_secret TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -338,6 +357,36 @@ pub async fn dns_credential_name_exists(pool: &SqlitePool, name: &str) -> Result
 pub async fn delete_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM dns_credentials WHERE id = ?").bind(id.to_string()).execute(pool).await?;
     Ok(result.rows_affected() > 0)
+}
+
+pub struct AdminIdentityRow {
+    pub username: String,
+    pub password_hash: String,
+    pub session_secret: String,
+}
+
+pub async fn load_admin_identity(pool: &SqlitePool) -> Result<Option<AdminIdentityRow>, sqlx::Error> {
+    let row = sqlx::query("SELECT username, password_hash, session_secret FROM admin_identity WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| AdminIdentityRow {
+        username: r.get("username"),
+        password_hash: r.get("password_hash"),
+        session_secret: r.get("session_secret"),
+    }))
+}
+
+pub async fn save_admin_identity(pool: &SqlitePool, username: &str, password_hash: &str, session_secret: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO admin_identity (id, username, password_hash, session_secret) VALUES (1, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, session_secret = excluded.session_secret",
+    )
+    .bind(username)
+    .bind(password_hash)
+    .bind(session_secret)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
@@ -767,5 +816,29 @@ mod tests {
         let metas = list_dns_credentials(&pool).await.unwrap();
         let full = get_dns_credential(&pool, metas[0].id).await.unwrap().unwrap();
         assert_eq!(full.token, "original-token", "seeding is INSERT OR IGNORE -- the DB row, once created, is the source of truth");
+    }
+
+    #[tokio::test]
+    async fn admin_identity_round_trips_and_is_none_before_first_save() {
+        let pool = memory_pool().await;
+        assert!(load_admin_identity(&pool).await.unwrap().is_none());
+
+        save_admin_identity(&pool, "admin", "hashed-password", "session-secret").await.unwrap();
+        let row = load_admin_identity(&pool).await.unwrap().unwrap();
+        assert_eq!(row.username, "admin");
+        assert_eq!(row.password_hash, "hashed-password");
+        assert_eq!(row.session_secret, "session-secret");
+    }
+
+    #[tokio::test]
+    async fn saving_admin_identity_twice_replaces_the_single_row_rather_than_erroring() {
+        let pool = memory_pool().await;
+        save_admin_identity(&pool, "admin", "hash-1", "secret-1").await.unwrap();
+        save_admin_identity(&pool, "admin2", "hash-2", "secret-2").await.unwrap();
+
+        let row = load_admin_identity(&pool).await.unwrap().unwrap();
+        assert_eq!(row.username, "admin2");
+        assert_eq!(row.password_hash, "hash-2");
+        assert_eq!(row.session_secret, "secret-2");
     }
 }

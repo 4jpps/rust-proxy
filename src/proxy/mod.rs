@@ -223,7 +223,8 @@ async fn handle_https_request(
 
     if let Some(auth) = &host.access_login {
         let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
-            .map(|token| login::verify_session(&state.admin().session_secret, &host.domain, &token))
+            .zip(state.admin_identity())
+            .map(|(token, identity)| login::verify_session(&identity.session_secret, &host.domain, &token))
             .unwrap_or(false);
         if !has_valid_session {
             return Ok(handle_login_gate(&state, &host.domain, auth, req).await);
@@ -277,7 +278,14 @@ async fn handle_login_gate(
             return login_page_response(domain, "/", Some("invalid request"), hyper::StatusCode::BAD_REQUEST);
         };
         if login::verify_credentials(auth, &submission.username, &submission.password) {
-            let token = login::sign_session(&state.admin().session_secret, domain, &auth.username);
+            let Some(identity) = state.admin_identity() else {
+                // No admin identity resolved yet (e.g. instance awaiting
+                // first-launch setup) -- the host-level login gate
+                // derives its session-signing key from the same secret,
+                // so there's nothing to sign with.
+                return service_unavailable();
+            };
+            let token = login::sign_session(&identity.session_secret, domain, &auth.username);
             return login_success_response(&token);
         }
         return login_page_response(
@@ -418,6 +426,13 @@ fn forbidden() -> Response<BoxBody<Bytes, hyper::Error>> {
         .expect("static response is always valid")
 }
 
+fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
+        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static response is always valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,9 +488,9 @@ mod tests {
                 bind_ip: "127.0.0.1".parse().unwrap(),
                 bind_port: 8080,
                 allowed_ips: vec![],
-                session_secret: "test-secret".into(),
-                admin_username: "admin".into(),
-                admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                session_secret: Some("test-secret".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -491,7 +506,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let state = AppState::new(cfg, pool, vec![], vec![]);
+        let state = AppState::new(cfg, pool, vec![], vec![], None);
         state.upsert_cert(domain.to_string(), {
             let entry = tls::self_signed_entry(domain);
             entry

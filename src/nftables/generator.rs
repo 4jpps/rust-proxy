@@ -118,9 +118,9 @@ mod tests {
             bind_ip: "10.0.0.1".parse().unwrap(),
             bind_port: 8080,
             allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
-            session_secret: "test".into(),
-            admin_username: "admin".into(),
-            admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+            session_secret: Some("test".into()),
+            admin_username: Some("admin".into()),
+            admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
             db_path: std::path::PathBuf::from(":memory:"),
         }
     }

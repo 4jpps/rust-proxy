@@ -56,14 +56,21 @@ pub struct AdminConfig {
     /// posture (see `nftables`).
     #[serde(default)]
     pub allowed_ips: Vec<Ipv4Net>,
-    /// HMAC key signing admin session tokens. Required, no default --
-    /// same "refuse to start rather than guess a secret" stance as
-    /// jpps-store's ACCOUNT_SECRET.
-    pub session_secret: String,
-    pub admin_username: String,
+    /// HMAC key signing admin session tokens. `None` means "not set in
+    /// config.toml" -- the resolved admin identity then falls back to
+    /// whatever's in the `admin_identity` sqlite table (populated by the
+    /// first-launch setup wizard). When all three of these fields ARE
+    /// set in config.toml, config.toml always wins over the DB, on
+    /// every read, not just at first boot -- see
+    /// `state::AppState::admin_identity`.
+    #[serde(default)]
+    pub session_secret: Option<String>,
+    #[serde(default)]
+    pub admin_username: Option<String>,
     /// Argon2 PHC hash string (`argon2::password_hash`), never a plaintext
     /// password -- generate with `rust-proxy hash-password` (see main.rs).
-    pub admin_password_hash: String,
+    #[serde(default)]
+    pub admin_password_hash: Option<String>,
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
 }
@@ -321,14 +328,33 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_bind_ip(&self.network.bind_ranges, self.admin.bind_ip, "admin")?;
-        if self.admin.session_secret.trim().is_empty() {
-            return Err(ConfigError::Validation("admin.session_secret must not be empty".into()));
+        let identity_fields_set = [
+            self.admin.session_secret.is_some(),
+            self.admin.admin_username.is_some(),
+            self.admin.admin_password_hash.is_some(),
+        ]
+        .iter()
+        .filter(|set| **set)
+        .count();
+        if identity_fields_set != 0 && identity_fields_set != 3 {
+            return Err(ConfigError::Validation(
+                "admin.session_secret, admin.admin_username, and admin.admin_password_hash must either all be set or all omitted -- a partial admin identity in config.toml is not allowed".into(),
+            ));
         }
-        if self.admin.admin_username.trim().is_empty() {
-            return Err(ConfigError::Validation("admin.admin_username must not be empty".into()));
+        if let Some(secret) = &self.admin.session_secret {
+            if secret.trim().is_empty() {
+                return Err(ConfigError::Validation("admin.session_secret must not be empty if set".into()));
+            }
         }
-        if self.admin.admin_password_hash.trim().is_empty() {
-            return Err(ConfigError::Validation("admin.admin_password_hash must not be empty".into()));
+        if let Some(username) = &self.admin.admin_username {
+            if username.trim().is_empty() {
+                return Err(ConfigError::Validation("admin.admin_username must not be empty if set".into()));
+            }
+        }
+        if let Some(hash) = &self.admin.admin_password_hash {
+            if hash.trim().is_empty() {
+                return Err(ConfigError::Validation("admin.admin_password_hash must not be empty if set".into()));
+            }
         }
 
         // `seen_socket_binds` tracks exclusive claims on a raw (ip, port,
@@ -497,6 +523,27 @@ dns_api_token = "token-placeholder"
         let toml_str = base_toml().replace("test-secret-do-not-use-in-prod", "");
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn omitting_all_three_admin_identity_fields_is_valid() {
+        let toml_str = base_toml()
+            .replace(r#"session_secret = "test-secret-do-not-use-in-prod""#, "")
+            .replace(r#"admin_username = "admin""#, "")
+            .replace(r#"admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g""#, "");
+        let cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        assert!(cfg.admin.session_secret.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn setting_only_some_of_the_three_admin_identity_fields_is_rejected() {
+        let toml_str = base_toml().replace(r#"admin_username = "admin""#, "");
+        let cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        assert!(cfg.admin.admin_username.is_none());
+        assert!(cfg.admin.session_secret.is_some());
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
     }
 
     #[test]

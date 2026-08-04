@@ -22,6 +22,17 @@ pub struct CertEntry {
     pub not_after: chrono::DateTime<chrono::Utc>,
 }
 
+/// The daemon's resolved admin login identity -- either straight from
+/// `config.toml` (when all three of its fields are set) or from the
+/// `admin_identity` DB table (set by the first-launch setup wizard).
+/// See `AppState::admin_identity`'s doc comment for the precedence rule.
+#[derive(Clone, Debug)]
+pub struct AdminIdentity {
+    pub username: String,
+    pub password_hash: String,
+    pub session_secret: String,
+}
+
 struct Inner {
     network: NetworkConfig,
     admin: AdminConfig,
@@ -36,6 +47,15 @@ struct Inner {
     /// Tokens are opaque and global (not scoped per-host), so a plain
     /// lookup by token is all serving one needs -- no host matching.
     http01_challenges: ArcSwap<HashMap<String, String>>,
+    /// The DB-sourced identity, if any -- only ever consulted by
+    /// `admin_identity()` when config.toml's own three identity fields
+    /// are absent. `ArcSwap` (not a plain field) because the setup
+    /// wizard's `POST /api/setup` writes this at runtime, well after
+    /// `AppState` is constructed, and every in-flight/future request
+    /// must see the update immediately with no restart -- same
+    /// lock-free-read/copy-on-write pattern as `hosts`/`port_rules`/
+    /// `certs` above.
+    admin_identity_db: ArcSwap<Option<AdminIdentity>>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
     /// and `proxy::run`'s listener supervisor can both re-sync immediately
     /// instead of polling on a timer. `notify_waiters` (not `notify_one`)
@@ -58,7 +78,7 @@ impl AppState {
     /// `db` is expected to already hold whichever `hosts`/`port_rules`
     /// should be live at startup -- see `main.rs`'s "load from sqlite,
     /// seeding from config.toml only if the DB was empty" bootstrap.
-    pub fn new(cfg: Config, db: SqlitePool, hosts: Vec<ProxyHost>, port_rules: Vec<PortRule>) -> Self {
+    pub fn new(cfg: Config, db: SqlitePool, hosts: Vec<ProxyHost>, port_rules: Vec<PortRule>, initial_admin_identity: Option<AdminIdentity>) -> Self {
         Self(Arc::new(Inner {
             network: cfg.network,
             admin: cfg.admin,
@@ -67,6 +87,7 @@ impl AppState {
             port_rules: ArcSwap::from_pointee(port_rules),
             certs: ArcSwap::from_pointee(HashMap::new()),
             http01_challenges: ArcSwap::from_pointee(HashMap::new()),
+            admin_identity_db: ArcSwap::from_pointee(initial_admin_identity),
             config_dirty: Notify::new(),
             db,
             hosts_write_lock: Mutex::new(()),
@@ -92,6 +113,35 @@ impl AppState {
 
     pub fn admin(&self) -> &AdminConfig {
         &self.0.admin
+    }
+
+    /// Resolves the admin login identity: config.toml wins outright
+    /// whenever all three of its fields (`session_secret`,
+    /// `admin_username`, `admin_password_hash`) are set -- checked fresh
+    /// on every call, not just once at startup, per the deliberate
+    /// "config.toml always wins if present" precedence. Only when
+    /// config.toml omits all three does this fall back to whatever's
+    /// currently in the DB-backed `ArcSwap` (`None` on an unconfigured
+    /// first launch, until `set_admin_identity` is called).
+    pub fn admin_identity(&self) -> Option<AdminIdentity> {
+        let admin = &self.0.admin;
+        if let (Some(username), Some(password_hash), Some(session_secret)) = (&admin.admin_username, &admin.admin_password_hash, &admin.session_secret) {
+            return Some(AdminIdentity {
+                username: username.clone(),
+                password_hash: password_hash.clone(),
+                session_secret: session_secret.clone(),
+            });
+        }
+        (*self.0.admin_identity_db.load_full()).clone()
+    }
+
+    /// Publishes a newly-created (or updated) DB-backed admin identity,
+    /// visible to every subsequent `admin_identity()` call immediately --
+    /// used by the first-launch setup wizard (`POST /api/setup`). Has no
+    /// effect on what `admin_identity()` returns whenever config.toml
+    /// supplies its own identity (that branch is checked first, always).
+    pub fn set_admin_identity(&self, identity: AdminIdentity) {
+        self.0.admin_identity_db.store(Arc::new(Some(identity)));
     }
 
     pub fn acme(&self) -> &AcmeConfig {
@@ -182,9 +232,9 @@ mod tests {
                 bind_ip: "10.0.0.1".parse().unwrap(),
                 bind_port: 8080,
                 allowed_ips: vec![],
-                session_secret: "test-secret".into(),
-                admin_username: "admin".into(),
-                admin_password_hash: "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                session_secret: Some("test-secret".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -203,7 +253,7 @@ mod tests {
 
     async fn test_state() -> AppState {
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(test_config(), pool, vec![], vec![])
+        AppState::new(test_config(), pool, vec![], vec![], None)
     }
 
     #[tokio::test]
@@ -314,5 +364,60 @@ mod tests {
         // Whatever the last write happened to be, exactly one host should
         // be present -- no torn/partial state visible.
         assert_eq!(state.hosts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_identity_comes_from_config_when_config_supplies_all_three_fields() {
+        let state = test_state().await;
+        let identity = state.admin_identity().expect("test_config sets all three identity fields");
+        assert_eq!(identity.username, "admin");
+    }
+
+    #[tokio::test]
+    async fn admin_identity_is_none_when_config_omits_it_and_the_db_has_nothing_yet() {
+        let mut cfg = test_config();
+        cfg.admin.session_secret = None;
+        cfg.admin.admin_username = None;
+        cfg.admin.admin_password_hash = None;
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let state = AppState::new(cfg, pool, vec![], vec![], None);
+
+        assert!(state.admin_identity().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_admin_identity_is_visible_immediately_when_config_omits_its_own_identity() {
+        let mut cfg = test_config();
+        cfg.admin.session_secret = None;
+        cfg.admin.admin_username = None;
+        cfg.admin.admin_password_hash = None;
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let state = AppState::new(cfg, pool, vec![], vec![], None);
+
+        state.set_admin_identity(AdminIdentity {
+            username: "wizard-admin".into(),
+            password_hash: "hash".into(),
+            session_secret: "secret".into(),
+        });
+
+        let identity = state.admin_identity().expect("just set it");
+        assert_eq!(identity.username, "wizard-admin");
+    }
+
+    #[tokio::test]
+    async fn config_supplied_identity_always_wins_even_after_set_admin_identity_is_called() {
+        // The deliberate, non-default precedence choice: config.toml
+        // wins on every read, not just at first boot -- calling
+        // set_admin_identity (e.g. a stray leftover DB row from before
+        // config.toml was populated) must never override it.
+        let state = test_state().await;
+        state.set_admin_identity(AdminIdentity {
+            username: "db-admin".into(),
+            password_hash: "hash".into(),
+            session_secret: "secret".into(),
+        });
+
+        let identity = state.admin_identity().unwrap();
+        assert_eq!(identity.username, "admin", "config.toml's identity must still win");
     }
 }
