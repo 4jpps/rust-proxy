@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+- Multiple DNS-01 providers, DB-backed and multi-credential -- Namecheap
+  and AWS Route53 (a from-scratch AWS SigV4 request signer, verified
+  against AWS's own published test vectors) join the existing
+  Cloudflare/DigitalOcean/Hetzner/DuckDNS/GoDaddy set, for seven total.
+  `acme.dns_provider`/`acme.dns_api_token` in config.toml now only ever
+  seed a single optional "default" credential; DNS credentials
+  otherwise live in a new `dns_credentials` sqlite table, managed from
+  the admin UI's "DNS credentials" section (create/list/delete, one
+  named credential per row) or the first-launch setup wizard. Each
+  proxy host picks a credential explicitly via `dns_credential_id`, or
+  falls back to the sole configured credential when there's exactly
+  one and no explicit choice was made -- ambiguous/dangling references
+  are rejected at host-creation time rather than failing silently at
+  the next renewal. See `acme::dns01::{namecheap,route53,sigv4}`,
+  `acme::resolve_dns_credential`, and `api::routes`'s
+  `*_dns_credential` handlers.
+- Admin identity (username/password/session secret) is now optional in
+  config.toml -- omitting all three (a partial set is rejected at
+  startup) means the daemon serves a first-launch setup wizard from the
+  admin UI instead (`GET /api/setup-status`, `POST /api/setup`), which
+  creates the admin account -- and optionally an initial DNS
+  credential -- through the browser and stores it in a new
+  `admin_identity` sqlite table. config.toml's own identity fields, if
+  set, always take precedence over the DB on every read, not just at
+  first boot, so an operator who prefers managing this in the config
+  file isn't affected. Existing single-provider/single-credential
+  config.toml deployments keep working unchanged. See
+  `state::AppState::admin_identity`, `db::create_admin_identity_if_absent`,
+  and `web/index.html`'s setup wizard screen.
+- `postinst` no longer interactively prompts for or randomly generates
+  admin credentials -- the web setup wizard above covers that now, so a
+  fresh install just gets a working default `config.toml` (loopback-only
+  admin UI, no admin account or DNS credential yet) and a running
+  service. Visit the admin UI once to finish setup.
+- "Multiple SSL certificates" was already supported (per-domain
+  `ArcSwap<HashMap<String, CertEntry>>` in `state.rs`) -- no change
+  needed there, confirmed while scoping this release.
+
 - HTTP/2 support -- ALPN now offers `h2` alongside `http/1.1`, and the
   HTTPS listener uses `hyper-util`'s auto h1/h2 connection builder.
   Deliberately doesn't enable HTTP/2 Extended CONNECT (RFC 8441), so
