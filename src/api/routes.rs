@@ -40,6 +40,8 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(admin_ui))
+        .route("/api/setup-status", get(setup_status))
+        .route("/api/setup", post(setup))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .merge(protected)
@@ -144,6 +146,66 @@ async fn login(State(state): State<AppState>, cookies: Cookies, Json(body): Json
     cookie.set_path("/");
     cookies.add(cookie);
     StatusCode::OK.into_response()
+}
+
+#[derive(Serialize)]
+struct SetupStatusResponse {
+    configured: bool,
+}
+
+async fn setup_status(State(state): State<AppState>) -> Json<SetupStatusResponse> {
+    Json(SetupStatusResponse {
+        configured: state.admin_identity().is_some(),
+    })
+}
+
+#[derive(Deserialize)]
+struct SetupRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    dns_credential: Option<CreateDnsCredentialRequest>,
+}
+
+/// Creates the admin identity on a genuinely unconfigured instance.
+/// Checks the CURRENT resolved state (config.toml or DB, via
+/// `admin_identity()`) at request time and refuses with 409 if an
+/// identity already exists by either path -- this must never be
+/// replayable against an already-configured instance to hijack it.
+async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>) -> Result<StatusCode, ApiError> {
+    if state.admin_identity().is_some() {
+        return Err(ApiError::Conflict("this instance is already configured".into()));
+    }
+    if body.username.trim().is_empty() || body.password.is_empty() {
+        return Err(ApiError::BadRequest("username and password must not be empty".into()));
+    }
+    let password_hash = auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let session_secret = generate_session_secret();
+    crate::db::save_admin_identity(state.db(), &body.username, &password_hash, &session_secret).await?;
+    state.set_admin_identity(crate::state::AdminIdentity {
+        username: body.username.clone(),
+        password_hash,
+        session_secret,
+    });
+
+    if let Some(cred) = body.dns_credential {
+        let name = cred.name.trim();
+        if !name.is_empty() && !cred.token.trim().is_empty() && !crate::db::dns_credential_name_exists(state.db(), name).await? {
+            crate::db::create_dns_credential(state.db(), Uuid::new_v4(), name, cred.provider, &cred.token, chrono::Utc::now()).await?;
+        }
+    }
+    Ok(StatusCode::CREATED)
+}
+
+/// 32 bytes of real randomness, hex-encoded -- same strength as the
+/// `openssl rand -hex 32` convention the README documents for the
+/// config.toml path, generated with the `rand` crate (already a
+/// dependency), never hand-rolled.
+fn generate_session_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 async fn logout(cookies: Cookies) -> Response {
@@ -729,6 +791,37 @@ mod tests {
         AppState::new(cfg, pool, vec![], vec![], None)
     }
 
+    async fn unconfigured_test_state() -> AppState {
+        let cfg = Config {
+            network: NetworkConfig {
+                bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
+            },
+            admin: AdminConfig {
+                bind_ip: "10.0.0.1".parse().unwrap(),
+                bind_port: 8080,
+                allowed_ips: vec![],
+                session_secret: None,
+                admin_username: None,
+                admin_password_hash: None,
+                db_path: PathBuf::from(":memory:"),
+            },
+            acme: AcmeConfig {
+                directory_url: "https://example.invalid/directory".into(),
+                contact_email: "admin@example.com".into(),
+                dns_provider: crate::config::DnsProviderKind::Cloudflare,
+                dns_api_token: "".into(),
+                cert_dir: PathBuf::from("/tmp/certs"),
+                account_key_path: PathBuf::from("/tmp/account.key"),
+                renew_before_days: 30,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+        };
+        cfg.validate().expect("valid: all three identity fields omitted together");
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        AppState::new(cfg, pool, vec![], vec![], None)
+    }
+
     async fn body_json(resp: Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -821,6 +914,196 @@ mod tests {
             .await
             .unwrap();
         session_cookie_header(&resp)
+    }
+
+    async fn logged_in_cookie_with(router: &Router, username: &str, password: &str) -> String {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(format!(r#"{{"username":"{username}","password":"{password}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        session_cookie_header(&resp)
+    }
+
+    #[tokio::test]
+    async fn setup_status_reports_unconfigured_before_any_setup() {
+        let router = build_router(unconfigured_test_state().await);
+        let resp = router
+            .oneshot(Request::builder().uri("/api/setup-status").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn setup_status_reports_configured_once_config_supplies_an_identity() {
+        let router = build_router(test_state().await);
+        let resp = router
+            .oneshot(Request::builder().uri("/api/setup-status").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json = body_json(resp).await;
+        assert_eq!(json["configured"], true);
+    }
+
+    #[tokio::test]
+    async fn setup_creates_an_admin_identity_that_can_then_log_in() {
+        let router = build_router(unconfigured_test_state().await);
+
+        let setup_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"username":"admin","password":"a-real-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup_resp.status(), StatusCode::CREATED);
+
+        let login_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"username":"admin","password":"a-real-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn setup_cannot_be_replayed_once_the_instance_is_configured() {
+        let router = build_router(unconfigured_test_state().await);
+
+        for _ in 0..2 {
+            let _ = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/setup")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(r#"{"username":"admin","password":"a-real-password"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let second_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"username":"attacker","password":"hijack"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn setup_is_refused_when_config_toml_already_supplies_an_identity() {
+        let router = build_router(test_state().await);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"username":"attacker","password":"hijack"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_an_empty_password() {
+        let router = build_router(unconfigured_test_state().await);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"username":"admin","password":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn setup_can_optionally_create_an_initial_dns_credential() {
+        let router = build_router(unconfigured_test_state().await);
+
+        let setup_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":"a-real-password","dns_credential":{"name":"default","provider":"hetzner","token":"tok"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup_resp.status(), StatusCode::CREATED);
+
+        let cookie = logged_in_cookie_with(&router, "admin", "a-real-password").await;
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dns-credentials")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["name"], "default");
+    }
+
+    #[tokio::test]
+    async fn login_is_rejected_before_setup_on_an_unconfigured_instance() {
+        let router = build_router(unconfigured_test_state().await);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"username":"admin","password":"anything"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
