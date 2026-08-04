@@ -131,9 +131,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
 
     // Single-row table (id is always 1, enforced by the CHECK constraint
-    // -- `save_admin_identity` always upserts that one row via
-    // `ON CONFLICT`). Holds the admin identity set by the first-launch
-    // setup wizard; only consulted when config.toml omits
+    // -- `create_admin_identity_if_absent` relies on it as the atomic
+    // arbiter for "has this instance been set up yet"). Holds the admin
+    // identity set by the first-launch setup wizard; only consulted
+    // when config.toml omits
     // session_secret/admin_username/admin_password_hash entirely -- see
     // `state::AppState::admin_identity`.
     sqlx::query(
@@ -376,27 +377,13 @@ pub async fn load_admin_identity(pool: &SqlitePool) -> Result<Option<AdminIdenti
     }))
 }
 
-pub async fn save_admin_identity(pool: &SqlitePool, username: &str, password_hash: &str, session_secret: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO admin_identity (id, username, password_hash, session_secret) VALUES (1, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, session_secret = excluded.session_secret",
-    )
-    .bind(username)
-    .bind(password_hash)
-    .bind(session_secret)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Like `save_admin_identity`, but `ON CONFLICT(id) DO NOTHING` instead
-/// of upserting -- used by the first-launch setup wizard (`POST
-/// /api/setup`), where two concurrent requests both observing
-/// `state.admin_identity() == None` must not both succeed (the second
-/// one silently overwriting the first's account, or the first's
-/// already-issued session becoming invalid underneath it). Returns
-/// whether this call actually created the row: the DB's own uniqueness
-/// (the `CHECK (id = 1)` single-row constraint) is the race-free
+/// `ON CONFLICT(id) DO NOTHING` -- used by the first-launch setup
+/// wizard (`POST /api/setup`), where two concurrent requests both
+/// observing `state.admin_identity() == None` must not both succeed
+/// (the second one silently overwriting the first's account, or the
+/// first's already-issued session becoming invalid underneath it).
+/// Returns whether this call actually created the row: the DB's own
+/// uniqueness (the `CHECK (id = 1)` single-row constraint) is the race-free
 /// arbiter, not the caller's earlier `admin_identity()` read.
 pub async fn create_admin_identity_if_absent(pool: &SqlitePool, username: &str, password_hash: &str, session_secret: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
@@ -845,23 +832,11 @@ mod tests {
         let pool = memory_pool().await;
         assert!(load_admin_identity(&pool).await.unwrap().is_none());
 
-        save_admin_identity(&pool, "admin", "hashed-password", "session-secret").await.unwrap();
+        create_admin_identity_if_absent(&pool, "admin", "hashed-password", "session-secret").await.unwrap();
         let row = load_admin_identity(&pool).await.unwrap().unwrap();
         assert_eq!(row.username, "admin");
         assert_eq!(row.password_hash, "hashed-password");
         assert_eq!(row.session_secret, "session-secret");
-    }
-
-    #[tokio::test]
-    async fn saving_admin_identity_twice_replaces_the_single_row_rather_than_erroring() {
-        let pool = memory_pool().await;
-        save_admin_identity(&pool, "admin", "hash-1", "secret-1").await.unwrap();
-        save_admin_identity(&pool, "admin2", "hash-2", "secret-2").await.unwrap();
-
-        let row = load_admin_identity(&pool).await.unwrap().unwrap();
-        assert_eq!(row.username, "admin2");
-        assert_eq!(row.password_hash, "hash-2");
-        assert_eq!(row.session_secret, "secret-2");
     }
 
     #[tokio::test]
