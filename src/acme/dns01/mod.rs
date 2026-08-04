@@ -16,6 +16,7 @@ pub mod duckdns;
 pub mod godaddy;
 pub mod hetzner;
 pub mod namecheap;
+mod sigv4;
 
 use async_trait::async_trait;
 use serde::Deserialize;
