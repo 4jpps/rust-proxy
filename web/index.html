@@ -18,7 +18,7 @@
   .stat { border: 1px solid #8884; border-radius: 6px; padding: 0.6rem 1rem; }
   .stat b { display: block; font-size: 1.4rem; }
   .danger { color: #c33; }
-  #login-screen, #app { display: none; }
+  #login-screen, #app, #setup-screen { display: none; }
   .error { color: #c33; font-size: 0.85rem; }
   label.chk { display: inline-flex; gap: 0.25rem; align-items: center; font-size: 0.85rem; }
 </style>
@@ -32,6 +32,36 @@
     <input type="password" name="password" placeholder="password" required>
     <button type="submit">Sign in</button>
     <span class="error" id="login-error"></span>
+  </form>
+</div>
+
+<div id="setup-screen">
+  <h1>rust-proxy first-time setup</h1>
+  <p style="font-size:0.85rem;max-width:60ch">No admin account is configured yet. Create one below -- optionally add
+    a DNS-01 credential now too (you can always add more, or skip this and add one later from the DNS Credentials
+    section).</p>
+  <form id="setup-form" class="inline" style="flex-direction:column;align-items:flex-start;gap:0.6rem">
+    <div class="inline">
+      <input type="text" name="username" placeholder="admin username" value="admin" required>
+      <input type="password" name="password" placeholder="admin password" required>
+      <input type="password" name="password_confirm" placeholder="confirm password" required>
+    </div>
+    <label class="chk"><input type="checkbox" id="setup-add-dns" name="add_dns"> Add a DNS-01 credential now</label>
+    <div class="inline" id="setup-dns-fields" style="display:none">
+      <input type="text" name="dns_name" placeholder="credential name (e.g. &quot;default&quot;)">
+      <select name="dns_provider">
+        <option value="cloudflare">Cloudflare</option>
+        <option value="digitalocean">DigitalOcean</option>
+        <option value="hetzner">Hetzner</option>
+        <option value="duckdns">DuckDNS</option>
+        <option value="godaddy">GoDaddy</option>
+        <option value="namecheap">Namecheap (token: api_user:api_key:client_ip)</option>
+        <option value="route53">Route53 (token: access_key_id:secret_access_key)</option>
+      </select>
+      <input type="text" name="dns_token" placeholder="API token / credential string">
+    </div>
+    <button type="submit">Create admin account</button>
+    <span class="error" id="setup-error"></span>
   </form>
 </div>
 
@@ -167,10 +197,17 @@ async function api(path, opts) {
 function showLogin() {
   document.getElementById('login-screen').style.display = 'block';
   document.getElementById('app').style.display = 'none';
+  document.getElementById('setup-screen').style.display = 'none';
+}
+function showSetup() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('setup-screen').style.display = 'block';
 }
 function showApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'block';
+  document.getElementById('setup-screen').style.display = 'none';
   refreshAll();
 }
 
@@ -189,6 +226,34 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 document.getElementById('logout-btn').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
   showLogin();
+});
+
+document.getElementById('setup-add-dns').addEventListener('change', (e) => {
+  document.getElementById('setup-dns-fields').style.display = e.target.checked ? 'flex' : 'none';
+});
+
+document.getElementById('setup-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const password = fd.get('password');
+  if (password !== fd.get('password_confirm')) {
+    document.getElementById('setup-error').textContent = 'passwords do not match';
+    return;
+  }
+  const body = { username: fd.get('username'), password };
+  if (fd.get('add_dns') === 'on' && fd.get('dns_name') && fd.get('dns_token')) {
+    body.dns_credential = { name: fd.get('dns_name'), provider: fd.get('dns_provider'), token: fd.get('dns_token') };
+  }
+  const resp = await fetch('/api/setup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (resp.ok) {
+    showLogin();
+  } else {
+    document.getElementById('setup-error').textContent = (await resp.json()).error || 'setup failed';
+  }
 });
 
 async function refreshAll() {
@@ -387,8 +452,22 @@ document.getElementById('dns-credential-form').addEventListener('submit', async 
   else { document.getElementById('dns-credential-error').textContent = (await resp.json()).error || 'failed'; }
 });
 
-// Probe session state on load.
-api('/api/dashboard').then(() => showApp()).catch(() => showLogin());
+// Probe session state on load -- but check whether this instance has
+// even been set up yet first, so a genuinely first-ever launch shows
+// the setup wizard instead of a login form for an account that
+// doesn't exist.
+fetch('/api/setup-status')
+  .then((r) => r.json())
+  .then((status) => {
+    if (!status.configured) {
+      showSetup();
+      return;
+    }
+    api('/api/dashboard').then(() => showApp()).catch(() => showLogin());
+  })
+  .catch(() => {
+    api('/api/dashboard').then(() => showApp()).catch(() => showLogin());
+  });
 </script>
 </body>
 </html>
