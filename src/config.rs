@@ -342,16 +342,29 @@ pub struct ProxyHost {
     /// there's no upstream request to rewrite the path of). A path that
     /// doesn't match `pattern` at all is forwarded unchanged, not
     /// rejected -- e.g. useful for mounting a whole external site's wiki
-    /// under a clean URL: pattern `^/([^/]+/[^/]+)/?$`, replacement
-    /// `/$1/-/wikis/Home`. Note the pattern there matches ONLY a bare,
-    /// exactly-two-segment path -- `regex` (RE2-based, no lookahead
-    /// support) can't express "and doesn't already start with the
-    /// target's own `-/` namespace", so a looser pattern that also
-    /// tried to preserve a deeper path would end up matching (and
-    /// mangling) the target's own already-rewritten URLs the moment a
-    /// visitor clicks a link on the resulting page -- confirmed as a
-    /// real bug in production (see proxy::mod's own test module for the
-    /// regression test).
+    /// under a clean URL: pattern `^/((?:jpps|kb9gxk)/[^/]+)/?$`,
+    /// replacement `/$1/-/wikis/Home` (this project's own wiki.jpps.us
+    /// host uses exactly this). Sharp edges worth understanding before
+    /// writing a pattern, all hit for real in production while building
+    /// this:
+    ///
+    /// - `regex` (RE2-based) has no lookahead support, so a pattern
+    ///   can't express "matches, but not if the path already starts with
+    ///   the target's own `-/` namespace" -- a looser pattern like
+    ///   `^/([^/]+/[^/]+)(?:/(.*))?$` (matches any two-segment-plus-rest
+    ///   path, trying to also preserve deeper links) ends up matching
+    ///   *and mangling* the target's own already-rewritten URLs the
+    ///   moment a visitor clicks a link on the resulting page.
+    /// - matching "any two-segment path" is dangerously broad on a
+    ///   real site: it also matches unrelated top-level paths like
+    ///   `/assets/app.css` or `/api/v4/version`, silently breaking the
+    ///   target's own static assets and API calls.
+    /// - the fix for both: anchor to an explicit allowlist of the real
+    ///   values the first segment can actually be (an alternation, e.g.
+    ///   `(?:jpps|kb9gxk)`), not "two segments" in the abstract -- this
+    ///   also stays correct automatically as the target adds new
+    ///   reserved top-level paths in the future, with nothing to update
+    ///   here unless a new real value is added to the alternation.
     #[serde(default)]
     pub path_rewrite: Option<PathRewrite>,
     #[serde(default = "default_true")]

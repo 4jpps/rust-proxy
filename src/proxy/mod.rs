@@ -567,21 +567,37 @@ mod tests {
         crate::config::PathRewrite { pattern: pattern.into(), replacement: replacement.into() }
     }
 
-    /// This is the exact pattern/replacement used for wiki.jpps.us in
-    /// production -- it deliberately matches ONLY a bare, exactly-two-segment
-    /// path (a GitLab `<namespace>/<project>` path), landing directly on
-    /// the wiki's real "Home" page slug in one hop. An earlier version
-    /// of this pattern also matched (and preserved) any deeper path,
-    /// which sounds more capable but is a real bug: `regex` (RE2-based,
-    /// no lookahead support) can't express "doesn't already start with
-    /// GitLab's own `-/` namespace", so it also matched -- and mangled --
-    /// GitLab's own already-correct `/-/wikis/<page>` URLs into
-    /// `/-/wikis/-/wikis/<page>` on the very next click, a real 404 hit
-    /// in production. Restricting the pattern to exactly two segments
-    /// makes that collision impossible: anything with a `/-/` in it has
-    /// more than two segments and simply doesn't match at all.
+    /// This is the exact pattern/replacement wiki.jpps.us uses in
+    /// production, landing a bare `jpps/<project>` path directly on that
+    /// project's wiki "Home" page slug in one hop. Two real production
+    /// bugs shaped this exact pattern, both worth understanding:
+    ///
+    /// - An earlier version matched ANY two-segment-plus-rest path
+    ///   (`^/([^/]+/[^/]+)(?:/(.*))?$`), trying to also preserve deeper
+    ///   links. `regex` (RE2-based, no lookahead support) can't express
+    ///   "doesn't already start with GitLab's own `-/` namespace", so it
+    ///   also matched -- and mangled -- GitLab's own already-correct
+    ///   `/-/wikis/<page>` URLs into `/-/wikis/-/wikis/<page>` the very
+    ///   next click, a real 404 in production.
+    /// - The next version narrowed that to exactly two segments
+    ///   (`^/([^/]+/[^/]+)/?$`), which fixed the above but is still
+    ///   dangerously broad on a real site: it also matches unrelated
+    ///   top-level paths like `/assets/app.css` or `/api/v4/version`,
+    ///   silently breaking GitLab's own static assets and API calls --
+    ///   also hit for real in production.
+    ///
+    /// Anchoring to an explicit allowlist of this instance's real
+    /// namespaces (alternation, not lookahead -- `regex` doesn't support
+    /// lookahead at all) fixes both: it can only ever match a real
+    /// `<namespace>/<project>` path for a namespace that's actually
+    /// listed, never an already-rewritten wiki URL (those have more
+    /// than two segments) and never an unrelated top-level path like
+    /// `/assets/...` (not a listed namespace). An allowlist also stays
+    /// correct automatically as GitLab adds new reserved top-level
+    /// paths in the future -- nothing to update here unless a new real
+    /// namespace is added.
     fn gitlab_wiki_rewrite() -> crate::config::PathRewrite {
-        path_rewrite(r"^/([^/]+/[^/]+)/?$", "/$1/-/wikis/Home")
+        path_rewrite(r"^/((?:jpps|kb9gxk)/[^/]+)/?$", "/$1/-/wikis/Home")
     }
 
     #[test]
@@ -601,6 +617,39 @@ mod tests {
         let mut req = Request::builder().uri("/jpps/rust-proxy/-/wikis/Getting-Started").body(()).unwrap();
         apply_path_rewrite(&mut req, &rw);
         assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/Getting-Started");
+    }
+
+    #[test]
+    fn apply_path_rewrite_does_not_touch_gitlab_asset_or_api_paths() {
+        // Regression test for the second real production bug described
+        // above -- a pattern matching "any two segments" also matches
+        // (and would break) GitLab's own site-wide static assets and API
+        // calls, which aren't project paths at all.
+        let rw = gitlab_wiki_rewrite();
+
+        let mut assets_req = Request::builder().uri("/assets/application-abc123.css").body(()).unwrap();
+        apply_path_rewrite(&mut assets_req, &rw);
+        assert_eq!(assets_req.uri().path(), "/assets/application-abc123.css");
+
+        let mut api_req = Request::builder().uri("/api/v4/version").body(()).unwrap();
+        apply_path_rewrite(&mut api_req, &rw);
+        assert_eq!(api_req.uri().path(), "/api/v4/version");
+    }
+
+    #[test]
+    fn apply_path_rewrite_sends_a_second_allowlisted_namespace_to_its_own_wiki() {
+        let rw = gitlab_wiki_rewrite();
+        let mut req = Request::builder().uri("/kb9gxk/web").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/kb9gxk/web/-/wikis/Home");
+    }
+
+    #[test]
+    fn apply_path_rewrite_does_not_touch_a_namespace_outside_the_allowlist() {
+        let rw = gitlab_wiki_rewrite();
+        let mut req = Request::builder().uri("/someone-else/their-project").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/someone-else/their-project");
     }
 
     #[test]

@@ -201,11 +201,12 @@
         <p class="hint">Rewrites the request path before it's sent to Upstream -- leave both blank unless you
           specifically need it. Pattern is a regular expression matched against the incoming path; replacement
           can use <code>$1</code>, <code>$2</code>, etc. for pattern's capture groups. Example: mount a GitLab
-          project's wiki at a clean URL with pattern <code>^/([^/]+/[^/]+)/?$</code> and replacement
-          <code>/$1/-/wikis/Home</code>. Match only the exact path(s) you mean to rewrite -- a pattern that's
-          too loose can end up matching (and mangling) the target site's own links once you're on the page.</p>
+          project's wiki at a clean URL with pattern <code>^/((?:jpps|kb9gxk)/[^/]+)/?$</code> and replacement
+          <code>/$1/-/wikis/Home</code>. Anchor the pattern to an explicit allowlist of the real value(s) it
+          should match -- e.g. real namespace names, not just "two segments" -- or it can end up matching (and
+          breaking) the target site's own assets/API calls or its own already-rewritten links.</p>
         <div class="field-grid">
-          <label class="wide"><span>Pattern</span><input type="text" name="path_rewrite_pattern" placeholder="^/([^/]+/[^/]+)/?$"></label>
+          <label class="wide"><span>Pattern</span><input type="text" name="path_rewrite_pattern" placeholder="^/((?:jpps|kb9gxk)/[^/]+)/?$"></label>
           <label class="wide"><span>Replacement</span><input type="text" name="path_rewrite_replacement" placeholder="/$1/-/wikis/Home"></label>
         </div>
       </fieldset>
