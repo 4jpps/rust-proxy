@@ -9,6 +9,7 @@
 //! per-row diffing.
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
@@ -109,24 +110,31 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         CREATE TABLE IF NOT EXISTS acl_ip_entries (
             id TEXT PRIMARY KEY,
             acl_list_id TEXT NOT NULL,
-            cidr TEXT NOT NULL
+            cidr TEXT NOT NULL,
+            description TEXT
         )
         "#,
     )
     .execute(pool)
     .await?;
+    // Pre-existing table from before `description` existed -- see the
+    // `hosts` table's identical comment above for why CREATE TABLE IF NOT
+    // EXISTS alone can't backfill an upgrade.
+    let _ = sqlx::query("ALTER TABLE acl_ip_entries ADD COLUMN description TEXT").execute(pool).await;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS acl_credentials (
             id TEXT PRIMARY KEY,
             acl_list_id TEXT NOT NULL,
             username TEXT NOT NULL,
-            password_hash TEXT NOT NULL
+            password_hash TEXT NOT NULL,
+            description TEXT
         )
         "#,
     )
     .execute(pool)
     .await?;
+    let _ = sqlx::query("ALTER TABLE acl_credentials ADD COLUMN description TEXT").execute(pool).await;
 
     migrate_legacy_host_access(pool).await?;
 
@@ -578,6 +586,131 @@ pub async fn add_acl_credentials(pool: &SqlitePool, acl_list_id: Uuid, credentia
             .await?;
     }
     Ok(())
+}
+
+/// A single `AclKind::IpAllow` entry, as returned to the admin UI for
+/// per-item display/edit/delete -- unlike the bulk-creation path above,
+/// this is used once a list already exists.
+#[derive(Debug, Clone, Serialize)]
+pub struct AclIpEntry {
+    pub id: Uuid,
+    pub cidr: String,
+    pub description: Option<String>,
+}
+
+/// A single `AclKind::Login` credential, deliberately without
+/// `password_hash` -- same reasoning as `HostAuth::password_hash` never
+/// being serialized back out over the admin API.
+#[derive(Debug, Clone, Serialize)]
+pub struct AclCredentialSummary {
+    pub id: Uuid,
+    pub username: String,
+    pub description: Option<String>,
+}
+
+pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>, sqlx::Error> {
+    let row = sqlx::query("SELECT id, name, kind, created_at FROM acl_lists WHERE id = ?").bind(id.to_string()).fetch_optional(pool).await?;
+    Ok(row.map(|row| AclList {
+        id,
+        name: row.get("name"),
+        kind: acl_kind_from_str(&row.get::<String, _>("kind")),
+        created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at")).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+    }))
+}
+
+pub async fn list_acl_ip_entries(pool: &SqlitePool, acl_list_id: Uuid) -> Result<Vec<AclIpEntry>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, cidr, description FROM acl_ip_entries WHERE acl_list_id = ? ORDER BY rowid ASC")
+        .bind(acl_list_id.to_string())
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| Ok(AclIpEntry { id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()), cidr: row.get("cidr"), description: row.get("description") }))
+        .collect()
+}
+
+/// Returns the new entry's id -- the API layer echoes it straight back so
+/// the just-added row can be targeted by a follow-up edit/delete without a
+/// round trip through `list_acl_ip_entries`.
+pub async fn add_acl_ip_entry(pool: &SqlitePool, acl_list_id: Uuid, cidr: &str, description: Option<&str>) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO acl_ip_entries (id, acl_list_id, cidr, description) VALUES (?, ?, ?, ?)")
+        .bind(id.to_string())
+        .bind(acl_list_id.to_string())
+        .bind(cidr)
+        .bind(description)
+        .execute(pool)
+        .await?;
+    Ok(id)
+}
+
+pub async fn update_acl_ip_entry(pool: &SqlitePool, entry_id: Uuid, cidr: &str, description: Option<&str>) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE acl_ip_entries SET cidr = ?, description = ? WHERE id = ?")
+        .bind(cidr)
+        .bind(description)
+        .bind(entry_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn delete_acl_ip_entry(pool: &SqlitePool, entry_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM acl_ip_entries WHERE id = ?").bind(entry_id.to_string()).execute(pool).await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn list_acl_credentials(pool: &SqlitePool, acl_list_id: Uuid) -> Result<Vec<AclCredentialSummary>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, username, description FROM acl_credentials WHERE acl_list_id = ? ORDER BY rowid ASC")
+        .bind(acl_list_id.to_string())
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| Ok(AclCredentialSummary { id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()), username: row.get("username"), description: row.get("description") }))
+        .collect()
+}
+
+pub async fn add_acl_credential(pool: &SqlitePool, acl_list_id: Uuid, username: &str, password_hash: &str, description: Option<&str>) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO acl_credentials (id, acl_list_id, username, password_hash, description) VALUES (?, ?, ?, ?, ?)")
+        .bind(id.to_string())
+        .bind(acl_list_id.to_string())
+        .bind(username)
+        .bind(password_hash)
+        .bind(description)
+        .execute(pool)
+        .await?;
+    Ok(id)
+}
+
+/// `password_hash` of `None` leaves the stored hash untouched -- lets an
+/// operator rename a credential's username or change its description
+/// without being forced to retype (and re-hash) a password that isn't
+/// changing.
+pub async fn update_acl_credential(pool: &SqlitePool, credential_id: Uuid, username: &str, password_hash: Option<&str>, description: Option<&str>) -> Result<bool, sqlx::Error> {
+    let result = match password_hash {
+        Some(hash) => {
+            sqlx::query("UPDATE acl_credentials SET username = ?, password_hash = ?, description = ? WHERE id = ?")
+                .bind(username)
+                .bind(hash)
+                .bind(description)
+                .bind(credential_id.to_string())
+                .execute(pool)
+                .await?
+        }
+        None => {
+            sqlx::query("UPDATE acl_credentials SET username = ?, description = ? WHERE id = ?")
+                .bind(username)
+                .bind(description)
+                .bind(credential_id.to_string())
+                .execute(pool)
+                .await?
+        }
+    };
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn delete_acl_credential(pool: &SqlitePool, credential_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM acl_credentials WHERE id = ?").bind(credential_id.to_string()).execute(pool).await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Error> {
@@ -1253,5 +1386,121 @@ mod tests {
         let certs = list_standalone_certs(&pool).await.unwrap();
         assert!(certs[0].organization.is_none());
         assert!(certs[0].organizational_unit.is_none());
+    }
+
+    /// Regression test for the same class of bug as
+    /// `run_migrations_adds_organization_columns_to_a_pre_existing_standalone_certs_table`
+    /// above, this time for `acl_ip_entries`/`acl_credentials`'s new
+    /// `description` column: manually recreates the pre-upgrade schema
+    /// (no `description` column) before running migrations, so the
+    /// `ALTER TABLE` path is actually exercised rather than masked by
+    /// `CREATE TABLE IF NOT EXISTS` starting fresh.
+    #[tokio::test]
+    async fn run_migrations_adds_description_columns_to_pre_existing_acl_tables() {
+        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE acl_lists (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, created_at TEXT NOT NULL)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE acl_ip_entries (id TEXT PRIMARY KEY, acl_list_id TEXT NOT NULL, cidr TEXT NOT NULL)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE acl_credentials (id TEXT PRIMARY KEY, acl_list_id TEXT NOT NULL, username TEXT NOT NULL, password_hash TEXT NOT NULL)").execute(&pool).await.unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now()).await.unwrap();
+        add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", Some("HQ subnet")).await.unwrap();
+        let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
+        assert_eq!(entries[0].description.as_deref(), Some("HQ subnet"));
+    }
+
+    #[tokio::test]
+    async fn acl_ip_entries_can_be_added_individually_and_listed() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now()).await.unwrap();
+
+        let id1 = add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", Some("HQ")).await.unwrap();
+        let id2 = add_acl_ip_entry(&pool, acl_id, "192.168.1.0/24", None).await.unwrap();
+
+        let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, id1);
+        assert_eq!(entries[0].cidr, "10.0.0.0/24");
+        assert_eq!(entries[0].description.as_deref(), Some("HQ"));
+        assert_eq!(entries[1].id, id2);
+        assert!(entries[1].description.is_none());
+    }
+
+    #[tokio::test]
+    async fn acl_ip_entry_update_and_delete_target_a_single_row() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now()).await.unwrap();
+        let id1 = add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", None).await.unwrap();
+        let id2 = add_acl_ip_entry(&pool, acl_id, "192.168.1.0/24", None).await.unwrap();
+
+        let updated = update_acl_ip_entry(&pool, id1, "10.0.0.0/16", Some("widened")).await.unwrap();
+        assert!(updated);
+        let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
+        assert_eq!(entries.iter().find(|e| e.id == id1).unwrap().cidr, "10.0.0.0/16");
+        assert_eq!(entries.iter().find(|e| e.id == id1).unwrap().description.as_deref(), Some("widened"));
+
+        let deleted = delete_acl_ip_entry(&pool, id2).await.unwrap();
+        assert!(deleted);
+        let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id1);
+
+        assert!(!delete_acl_ip_entry(&pool, id2).await.unwrap(), "deleting an already-deleted entry must report false, not error");
+    }
+
+    #[tokio::test]
+    async fn acl_credentials_can_be_added_individually_and_listed_without_password_hashes() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now()).await.unwrap();
+
+        let id = add_acl_credential(&pool, acl_id, "alice", "hashed-secret", Some("contractor")).await.unwrap();
+
+        let creds = list_acl_credentials(&pool, acl_id).await.unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].id, id);
+        assert_eq!(creds[0].username, "alice");
+        assert_eq!(creds[0].description.as_deref(), Some("contractor"));
+    }
+
+    #[tokio::test]
+    async fn acl_credential_update_without_a_new_password_preserves_the_existing_hash() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now()).await.unwrap();
+        let id = add_acl_credential(&pool, acl_id, "alice", "original-hash", None).await.unwrap();
+
+        let updated = update_acl_credential(&pool, id, "alice2", None, Some("renamed")).await.unwrap();
+        assert!(updated);
+
+        let resolved = resolve_acl_ids(&pool, &[acl_id]).await.unwrap();
+        assert_eq!(resolved.credentials[0].username, "alice2");
+        assert_eq!(resolved.credentials[0].password_hash, "original-hash", "an update with password_hash=None must not clobber the existing hash");
+        let creds = list_acl_credentials(&pool, acl_id).await.unwrap();
+        assert_eq!(creds[0].description.as_deref(), Some("renamed"));
+    }
+
+    #[tokio::test]
+    async fn acl_credential_delete_removes_a_single_row() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now()).await.unwrap();
+        let id1 = add_acl_credential(&pool, acl_id, "alice", "hash1", None).await.unwrap();
+        let _id2 = add_acl_credential(&pool, acl_id, "bob", "hash2", None).await.unwrap();
+
+        assert!(delete_acl_credential(&pool, id1).await.unwrap());
+        let creds = list_acl_credentials(&pool, acl_id).await.unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].username, "bob");
+    }
+
+    #[tokio::test]
+    async fn get_acl_list_returns_none_for_an_unknown_id() {
+        let pool = memory_pool().await;
+        assert!(get_acl_list(&pool, Uuid::new_v4()).await.unwrap().is_none());
     }
 }

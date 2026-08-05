@@ -37,7 +37,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/dns-credentials", get(list_dns_credentials).post(create_dns_credential))
         .route("/api/dns-credentials/:id", axum::routing::delete(delete_dns_credential))
         .route("/api/acls", get(list_acls).post(create_acl_list))
-        .route("/api/acls/:id", axum::routing::delete(delete_acl_list))
+        .route("/api/acls/:id", get(get_acl_list_detail).delete(delete_acl_list))
+        .route("/api/acls/:id/ip-entries", post(add_acl_ip_entry))
+        .route("/api/acls/:id/ip-entries/:entry_id", axum::routing::put(update_acl_ip_entry).delete(delete_acl_ip_entry))
+        .route("/api/acls/:id/credentials", post(add_acl_credential))
+        .route("/api/acls/:id/credentials/:credential_id", axum::routing::put(update_acl_credential).delete(delete_acl_credential))
         .route("/api/dns01-certs", get(list_standalone_certs).post(create_standalone_cert))
         .route("/api/dns01-certs/:id", axum::routing::delete(delete_standalone_cert))
         .route("/api/acme-settings", get(get_acme_settings).put(update_acme_settings))
@@ -542,6 +546,146 @@ async fn delete_acl_list(State(state): State<AppState>, Path(id): Path<Uuid>) ->
         return Err(ApiError::Conflict("one or more hosts still select this ACL -- remove it from them first".into()));
     }
     let found = crate::db::delete_acl_list(state.db(), id).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct AclListDetail {
+    id: Uuid,
+    name: String,
+    kind: crate::config::AclKind,
+    created_at: chrono::DateTime<chrono::Utc>,
+    ip_entries: Vec<crate::db::AclIpEntry>,
+    credentials: Vec<crate::db::AclCredentialSummary>,
+}
+
+/// Full detail for a single existing ACL, including its individual
+/// entries -- `list_acls` deliberately omits these (see `AclList`'s doc
+/// comment), so managing an already-created list's contents needs its
+/// own fetch.
+async fn get_acl_list_detail(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<AclListDetail>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+    let ip_entries = crate::db::list_acl_ip_entries(state.db(), id).await?;
+    let credentials = crate::db::list_acl_credentials(state.db(), id).await?;
+    Ok(Json(AclListDetail { id: list.id, name: list.name, kind: list.kind, created_at: list.created_at, ip_entries, credentials }))
+}
+
+#[derive(Deserialize)]
+struct AclIpEntryRequest {
+    cidr: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Blank/whitespace-only descriptions are normalized to `None` rather
+/// than stored as an empty string, so the UI's "no description set" and
+/// "described as empty string" don't become two indistinguishable states.
+fn normalize_description(description: Option<String>) -> Option<String> {
+    description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty())
+}
+
+async fn add_acl_ip_entry(State(state): State<AppState>, Path(id): Path<Uuid>, Json(body): Json<AclIpEntryRequest>) -> Result<Json<crate::db::AclIpEntry>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::IpAllow {
+        return Err(ApiError::BadRequest("this ACL is not an IP allow list".into()));
+    }
+    let cidr = normalize_cidr(&body.cidr)?;
+    let description = normalize_description(body.description);
+    let entry_id = crate::db::add_acl_ip_entry(state.db(), id, &cidr, description.as_deref()).await?;
+    Ok(Json(crate::db::AclIpEntry { id: entry_id, cidr, description }))
+}
+
+async fn update_acl_ip_entry(
+    State(state): State<AppState>,
+    Path((id, entry_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<AclIpEntryRequest>,
+) -> Result<Json<crate::db::AclIpEntry>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::IpAllow {
+        return Err(ApiError::BadRequest("this ACL is not an IP allow list".into()));
+    }
+    let cidr = normalize_cidr(&body.cidr)?;
+    let description = normalize_description(body.description);
+    let found = crate::db::update_acl_ip_entry(state.db(), entry_id, &cidr, description.as_deref()).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(crate::db::AclIpEntry { id: entry_id, cidr, description }))
+}
+
+async fn delete_acl_ip_entry(State(state): State<AppState>, Path((_id, entry_id)): Path<(Uuid, Uuid)>) -> Result<StatusCode, ApiError> {
+    let found = crate::db::delete_acl_ip_entry(state.db(), entry_id).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AddAclCredentialRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+async fn add_acl_credential(State(state): State<AppState>, Path(id): Path<Uuid>, Json(body): Json<AddAclCredentialRequest>) -> Result<Json<crate::db::AclCredentialSummary>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::Login {
+        return Err(ApiError::BadRequest("this ACL is not a login list".into()));
+    }
+    let username = body.username.trim();
+    if username.is_empty() || body.password.is_empty() {
+        return Err(ApiError::BadRequest("username and password must not be empty".into()));
+    }
+    let password_hash = auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let description = normalize_description(body.description);
+    let credential_id = crate::db::add_acl_credential(state.db(), id, username, &password_hash, description.as_deref()).await?;
+    Ok(Json(crate::db::AclCredentialSummary { id: credential_id, username: username.to_string(), description }))
+}
+
+#[derive(Deserialize)]
+struct UpdateAclCredentialRequest {
+    username: String,
+    /// Blank or absent means "keep the existing password" -- an operator
+    /// renaming a credential or editing its description shouldn't be
+    /// forced to retype (and re-hash) an unrelated password.
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+async fn update_acl_credential(
+    State(state): State<AppState>,
+    Path((id, credential_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<UpdateAclCredentialRequest>,
+) -> Result<Json<crate::db::AclCredentialSummary>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::Login {
+        return Err(ApiError::BadRequest("this ACL is not a login list".into()));
+    }
+    let username = body.username.trim();
+    if username.is_empty() {
+        return Err(ApiError::BadRequest("username must not be empty".into()));
+    }
+    let password_hash = match body.password.as_deref() {
+        Some(p) if !p.is_empty() => Some(auth::hash_password(p).map_err(|e| ApiError::Internal(e.to_string()))?),
+        _ => None,
+    };
+    let description = normalize_description(body.description);
+    let found = crate::db::update_acl_credential(state.db(), credential_id, username, password_hash.as_deref(), description.as_deref()).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(crate::db::AclCredentialSummary { id: credential_id, username: username.to_string(), description }))
+}
+
+async fn delete_acl_credential(State(state): State<AppState>, Path((_id, credential_id)): Path<(Uuid, Uuid)>) -> Result<StatusCode, ApiError> {
+    let found = crate::db::delete_acl_credential(state.db(), credential_id).await?;
     if !found {
         return Err(ApiError::NotFound);
     }
@@ -2655,6 +2799,238 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn create_acl(router: &Router, cookie: &str, body: &str) -> String {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn ip_entries_can_be_added_individually_to_an_existing_acl_and_appear_in_its_detail() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let acl_id = create_acl(&router, &cookie, r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#).await;
+
+        let add_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/acls/{acl_id}/ip-entries"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"cidr":"203.0.113.5","description":"remote office"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let added = body_json(add_resp).await;
+        assert_eq!(added["cidr"], "203.0.113.5/32", "a bare address must still be normalized to a /32, same as bulk creation");
+        assert_eq!(added["description"], "remote office");
+
+        let detail_resp = router
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/acls/{acl_id}")).header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let detail = body_json(detail_resp).await;
+        let entries = detail["ip_entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "the original bulk-created entry plus the individually-added one");
+        assert!(entries.iter().any(|e| e["cidr"] == "203.0.113.5/32" && e["description"] == "remote office"));
+    }
+
+    #[tokio::test]
+    async fn ip_entry_can_be_edited_and_deleted_individually() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let acl_id = create_acl(&router, &cookie, r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#).await;
+
+        let add_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/acls/{acl_id}/ip-entries"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"cidr":"192.168.1.0/24"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let entry_id = body_json(add_resp).await["id"].as_str().unwrap().to_string();
+
+        let update_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/acls/{acl_id}/ip-entries/{entry_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"cidr":"192.168.1.0/16","description":"widened"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_resp.status(), StatusCode::OK);
+        let updated = body_json(update_resp).await;
+        assert_eq!(updated["cidr"], "192.168.1.0/16");
+        assert_eq!(updated["description"], "widened");
+
+        let delete_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/acls/{acl_id}/ip-entries/{entry_id}"))
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+        let repeat_delete = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/acls/{acl_id}/ip-entries/{entry_id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeat_delete.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn adding_an_ip_entry_to_a_login_acl_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let acl_id = create_acl(&router, &cookie, r#"{"name":"viewers","kind":"login","credentials":[{"username":"alice","password":"s3cret"}]}"#).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/acls/{acl_id}/ip-entries"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"cidr":"10.0.0.0/24"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn credentials_can_be_added_individually_and_never_return_a_password_hash() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let acl_id = create_acl(&router, &cookie, r#"{"name":"viewers","kind":"login","credentials":[{"username":"alice","password":"s3cret"}]}"#).await;
+
+        let add_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/acls/{acl_id}/credentials"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"username":"bob","password":"hunter2","description":"contractor"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_resp.status(), StatusCode::OK);
+        let added = body_json(add_resp).await;
+        assert_eq!(added["username"], "bob");
+        assert_eq!(added["description"], "contractor");
+        assert!(added.get("password").is_none() && added.get("password_hash").is_none());
+
+        let detail_resp = router
+            .oneshot(Request::builder().uri(format!("/api/acls/{acl_id}")).header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let detail = body_json(detail_resp).await;
+        let creds = detail["credentials"].as_array().unwrap();
+        assert_eq!(creds.len(), 2);
+        assert!(creds.iter().all(|c| c.get("password_hash").is_none()));
+    }
+
+    #[tokio::test]
+    async fn credential_can_be_renamed_without_a_new_password_and_deleted() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let acl_id = create_acl(&router, &cookie, r#"{"name":"viewers","kind":"login","credentials":[{"username":"alice","password":"s3cret"}]}"#).await;
+
+        let detail_resp = router
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/acls/{acl_id}")).header(header::COOKIE, cookie.clone()).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let detail = body_json(detail_resp).await;
+        let credential_id = detail["credentials"][0]["id"].as_str().unwrap().to_string();
+
+        let update_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/acls/{acl_id}/credentials/{credential_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"username":"alice2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_resp.status(), StatusCode::OK);
+        assert_eq!(body_json(update_resp).await["username"], "alice2");
+
+        let delete_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/acls/{acl_id}/credentials/{credential_id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn get_acl_detail_for_an_unknown_id_is_404() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(Request::builder().uri(format!("/api/acls/{}", Uuid::new_v4())).header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

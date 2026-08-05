@@ -44,6 +44,14 @@
   .field-grid .wide { grid-column: 1 / -1; }
   .checks { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 0.6rem; }
   .form-actions { display: flex; gap: 0.5rem; align-items: center; margin-top: 1rem; }
+  .row-fields { display: flex; gap: 0.6rem; align-items: end; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .row-fields label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.82rem; flex: 1 1 160px; }
+  .row-fields label > span { opacity: 0.8; }
+  .overlay { position: fixed; inset: 0; background: #0008; display: flex; align-items: center;
+    justify-content: center; padding: 1rem; z-index: 10; }
+  .overlay-panel { background: Canvas; color: CanvasText; border: 1px solid #8884; border-radius: 8px;
+    padding: 1.2rem 1.4rem; max-width: 640px; width: 100%; max-height: 85vh; overflow-y: auto; }
+  #acl-manage-table { margin: 0.6rem 0; }
 </style>
 </head>
 <body>
@@ -322,9 +330,11 @@
           </select>
         </label>
       </div>
-      <div id="acl-ip-fields" class="field-grid">
-        <label class="wide"><span>Allowed source IPs/CIDRs, comma-separated</span>
-          <input type="text" name="ip_entries" placeholder="10.0.0.0/24, 203.0.113.5"></label>
+      <div id="acl-ip-fields">
+        <p class="hint">Add each allowed source IP/CIDR one at a time -- an optional description helps tell
+          entries apart later (e.g. "HQ subnet").</p>
+        <div id="acl-ip-rows"></div>
+        <button type="button" id="acl-add-ip-entry" style="margin-top:0.4rem">+ Add IP/CIDR</button>
       </div>
       <div id="acl-login-fields" style="display:none">
         <div id="acl-credential-rows"></div>
@@ -336,6 +346,24 @@
       </div>
     </form>
   </section>
+
+  <div id="acl-manage-overlay" class="overlay" style="display:none">
+    <div class="overlay-panel">
+      <h2 id="acl-manage-title">Manage ACL</h2>
+      <p class="hint" id="acl-manage-hint"></p>
+      <table id="acl-manage-table"><thead><tr id="acl-manage-thead"></tr></thead><tbody></tbody></table>
+      <form id="acl-manage-add-form">
+        <div id="acl-manage-add-fields" class="field-grid"></div>
+        <div class="form-actions">
+          <button type="submit">+ Add</button>
+          <span class="error" id="acl-manage-error"></span>
+        </div>
+      </form>
+      <div class="form-actions">
+        <button type="button" id="acl-manage-close">Close</button>
+      </div>
+    </div>
+  </div>
 
   <section class="tab-panel" id="tab-tokens">
     <h2>API tokens</h2>
@@ -883,23 +911,38 @@ let aclsById = {};
 
 document.getElementById('acl-kind-select').addEventListener('change', (e) => {
   const isLogin = e.target.value === 'login';
-  document.getElementById('acl-ip-fields').style.display = isLogin ? 'none' : 'grid';
+  document.getElementById('acl-ip-fields').style.display = isLogin ? 'none' : 'block';
   document.getElementById('acl-login-fields').style.display = isLogin ? 'block' : 'none';
 });
 
 function addAclCredentialRow() {
   const row = document.createElement('div');
-  row.className = 'field-grid';
-  row.style.marginTop = '0.4rem';
+  row.className = 'row-fields';
   row.innerHTML = `
     <label><span>Username</span><input type="text" class="acl-cred-username" placeholder="viewer"></label>
     <label><span>Password</span><input type="password" class="acl-cred-password"></label>
-    <button type="button" class="acl-cred-remove" style="align-self:end">Remove</button>`;
+    <button type="button" class="acl-cred-remove">Remove</button>`;
   row.querySelector('.acl-cred-remove').addEventListener('click', () => row.remove());
   document.getElementById('acl-credential-rows').appendChild(row);
 }
 document.getElementById('acl-add-credential').addEventListener('click', addAclCredentialRow);
 addAclCredentialRow();
+
+// Each row is one CIDR/IP added individually (mirrors the login
+// credential rows above) rather than one comma-separated text field --
+// matches how entries are added one at a time after creation too, via
+// the Manage overlay below.
+function addAclIpEntryRow() {
+  const row = document.createElement('div');
+  row.className = 'row-fields';
+  row.innerHTML = `
+    <label><span>IP/CIDR</span><input type="text" class="acl-ip-cidr" placeholder="10.0.0.0/24 or 203.0.113.5"></label>
+    <button type="button" class="acl-ip-remove">Remove</button>`;
+  row.querySelector('.acl-ip-remove').addEventListener('click', () => row.remove());
+  document.getElementById('acl-ip-rows').appendChild(row);
+}
+document.getElementById('acl-add-ip-entry').addEventListener('click', addAclIpEntryRow);
+addAclIpEntryRow();
 
 async function refreshAcls() {
   const acls = await (await api('/api/acls')).json();
@@ -911,8 +954,10 @@ async function refreshAcls() {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${esc(a.name)}</td><td>${a.kind === 'login' ? 'Login' : 'IP allow'}</td>
       <td>${new Date(a.created_at).toLocaleString()}</td>
-      <td><button class="danger" data-id="${a.id}">Delete</button></td>`;
-    tr.querySelector('button').addEventListener('click', async () => {
+      <td><button class="acl-manage-open" data-id="${a.id}">Manage entries</button>
+      <button class="danger" data-id="${a.id}">Delete</button></td>`;
+    tr.querySelector('.acl-manage-open').addEventListener('click', () => openAclManage(a));
+    tr.querySelector('.danger').addEventListener('click', async () => {
       if (!confirm(`Delete ACL "${a.name}"? Any host still selecting it must be updated first.`)) return;
       const resp = await api(`/api/acls/${a.id}`, { method: 'DELETE' });
       if (resp.ok) refreshAll();
@@ -938,20 +983,168 @@ document.getElementById('acl-form').addEventListener('submit', async (e) => {
       password: row.querySelector('.acl-cred-password').value,
     })).filter((c) => c.username || c.password);
   } else {
-    body.ip_entries = (fd.get('ip_entries') || '').split(',').map((s) => s.trim()).filter(Boolean);
+    body.ip_entries = Array.from(document.querySelectorAll('#acl-ip-rows .acl-ip-cidr')).map((i) => i.value.trim()).filter(Boolean);
   }
   const resp = await api('/api/acls', { method: 'POST', body: JSON.stringify(body) });
   if (resp.ok) {
     e.target.reset();
     document.getElementById('acl-credential-rows').innerHTML = '';
     addAclCredentialRow();
-    document.getElementById('acl-ip-fields').style.display = 'grid';
+    document.getElementById('acl-ip-rows').innerHTML = '';
+    addAclIpEntryRow();
+    document.getElementById('acl-ip-fields').style.display = 'block';
     document.getElementById('acl-login-fields').style.display = 'none';
     document.getElementById('acl-error').textContent = '';
     refreshAll();
   } else {
     document.getElementById('acl-error').textContent = (await resp.json()).error || 'failed';
   }
+});
+
+// Per-item management of an already-created ACL's contents: add one
+// entry at a time (with an optional description), and edit/delete any
+// individual entry in place -- unlike the create form above, this talks
+// to /api/acls/:id/ip-entries and /api/acls/:id/credentials directly
+// rather than the bulk create endpoint, since those are the only
+// endpoints that support editing/deleting a single already-persisted row.
+let aclManageState = { id: null, kind: null };
+
+function renderAclManageAddFields() {
+  const container = document.getElementById('acl-manage-add-fields');
+  if (aclManageState.kind === 'login') {
+    container.innerHTML = `
+      <label><span>Username</span><input type="text" id="acl-manage-add-username" required></label>
+      <label><span>Password</span><input type="password" id="acl-manage-add-password" required></label>
+      <label class="wide"><span>Description (optional)</span><input type="text" id="acl-manage-add-description"></label>`;
+  } else {
+    container.innerHTML = `
+      <label><span>IP/CIDR</span><input type="text" id="acl-manage-add-cidr" placeholder="10.0.0.0/24" required></label>
+      <label class="wide"><span>Description (optional)</span><input type="text" id="acl-manage-add-description"></label>`;
+  }
+}
+
+async function openAclManage(acl) {
+  aclManageState = { id: acl.id, kind: acl.kind };
+  document.getElementById('acl-manage-title').textContent = `Manage "${acl.name}"`;
+  document.getElementById('acl-manage-hint').textContent = acl.kind === 'login'
+    ? 'Each row is one username/password pair a login can use.'
+    : 'Each row is one allowed source IP/CIDR.';
+  document.getElementById('acl-manage-error').textContent = '';
+  renderAclManageAddFields();
+  document.getElementById('acl-manage-overlay').style.display = 'flex';
+  await loadAclManageEntries();
+}
+
+async function loadAclManageEntries() {
+  const resp = await api(`/api/acls/${aclManageState.id}`);
+  if (!resp.ok) {
+    document.getElementById('acl-manage-error').textContent = (await resp.json()).error || 'failed';
+    return;
+  }
+  const detail = await resp.json();
+  const thead = document.getElementById('acl-manage-thead');
+  const tbody = document.querySelector('#acl-manage-table tbody');
+  tbody.innerHTML = '';
+  if (aclManageState.kind === 'login') {
+    thead.innerHTML = '<th>Username</th><th>Description</th><th colspan="2"></th>';
+    for (const c of detail.credentials) tbody.appendChild(buildAclCredentialRow(c));
+  } else {
+    thead.innerHTML = '<th>CIDR</th><th>Description</th><th colspan="2"></th>';
+    for (const entry of detail.ip_entries) tbody.appendChild(buildAclIpEntryRow(entry));
+  }
+}
+
+function buildAclIpEntryRow(entry) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${esc(entry.cidr)}</td><td>${esc(entry.description || '')}</td>
+    <td><button class="acl-manage-edit">Edit</button></td>
+    <td><button class="danger acl-manage-delete">Delete</button></td>`;
+  tr.querySelector('.acl-manage-edit').addEventListener('click', () => {
+    tr.innerHTML = `<td colspan="4"><div class="row-fields">
+      <label><span>IP/CIDR</span><input type="text" class="acl-edit-cidr" value="${esc(entry.cidr)}"></label>
+      <label><span>Description</span><input type="text" class="acl-edit-description" value="${esc(entry.description || '')}"></label>
+      <button type="button" class="acl-edit-save">Save</button>
+      <button type="button" class="acl-edit-cancel">Cancel</button>
+    </div></td>`;
+    tr.querySelector('.acl-edit-save').addEventListener('click', async () => {
+      const body = { cidr: tr.querySelector('.acl-edit-cidr').value, description: tr.querySelector('.acl-edit-description').value || null };
+      const r = await api(`/api/acls/${aclManageState.id}/ip-entries/${entry.id}`, { method: 'PUT', body: JSON.stringify(body) });
+      if (r.ok) loadAclManageEntries();
+      else document.getElementById('acl-manage-error').textContent = (await r.json()).error || 'failed';
+    });
+    tr.querySelector('.acl-edit-cancel').addEventListener('click', loadAclManageEntries);
+  });
+  tr.querySelector('.acl-manage-delete').addEventListener('click', async () => {
+    if (!confirm(`Delete entry "${entry.cidr}"?`)) return;
+    const r = await api(`/api/acls/${aclManageState.id}/ip-entries/${entry.id}`, { method: 'DELETE' });
+    if (r.ok) loadAclManageEntries();
+    else document.getElementById('acl-manage-error').textContent = (await r.json()).error || 'failed';
+  });
+  return tr;
+}
+
+function buildAclCredentialRow(cred) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${esc(cred.username)}</td><td>${esc(cred.description || '')}</td>
+    <td><button class="acl-manage-edit">Edit</button></td>
+    <td><button class="danger acl-manage-delete">Delete</button></td>`;
+  tr.querySelector('.acl-manage-edit').addEventListener('click', () => {
+    tr.innerHTML = `<td colspan="4"><div class="row-fields">
+      <label><span>Username</span><input type="text" class="acl-edit-username" value="${esc(cred.username)}"></label>
+      <label><span>New password (blank keeps it)</span><input type="password" class="acl-edit-password"></label>
+      <label><span>Description</span><input type="text" class="acl-edit-description" value="${esc(cred.description || '')}"></label>
+      <button type="button" class="acl-edit-save">Save</button>
+      <button type="button" class="acl-edit-cancel">Cancel</button>
+    </div></td>`;
+    tr.querySelector('.acl-edit-save').addEventListener('click', async () => {
+      const password = tr.querySelector('.acl-edit-password').value;
+      const body = { username: tr.querySelector('.acl-edit-username').value, description: tr.querySelector('.acl-edit-description').value || null };
+      if (password) body.password = password;
+      const r = await api(`/api/acls/${aclManageState.id}/credentials/${cred.id}`, { method: 'PUT', body: JSON.stringify(body) });
+      if (r.ok) loadAclManageEntries();
+      else document.getElementById('acl-manage-error').textContent = (await r.json()).error || 'failed';
+    });
+    tr.querySelector('.acl-edit-cancel').addEventListener('click', loadAclManageEntries);
+  });
+  tr.querySelector('.acl-manage-delete').addEventListener('click', async () => {
+    if (!confirm(`Delete credential "${cred.username}"?`)) return;
+    const r = await api(`/api/acls/${aclManageState.id}/credentials/${cred.id}`, { method: 'DELETE' });
+    if (r.ok) loadAclManageEntries();
+    else document.getElementById('acl-manage-error').textContent = (await r.json()).error || 'failed';
+  });
+  return tr;
+}
+
+document.getElementById('acl-manage-add-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  let body, path;
+  if (aclManageState.kind === 'login') {
+    body = {
+      username: document.getElementById('acl-manage-add-username').value,
+      password: document.getElementById('acl-manage-add-password').value,
+      description: document.getElementById('acl-manage-add-description').value || null,
+    };
+    path = `/api/acls/${aclManageState.id}/credentials`;
+  } else {
+    body = {
+      cidr: document.getElementById('acl-manage-add-cidr').value,
+      description: document.getElementById('acl-manage-add-description').value || null,
+    };
+    path = `/api/acls/${aclManageState.id}/ip-entries`;
+  }
+  const resp = await api(path, { method: 'POST', body: JSON.stringify(body) });
+  if (resp.ok) {
+    e.target.reset();
+    document.getElementById('acl-manage-error').textContent = '';
+    loadAclManageEntries();
+  } else {
+    document.getElementById('acl-manage-error').textContent = (await resp.json()).error || 'failed';
+  }
+});
+
+document.getElementById('acl-manage-close').addEventListener('click', () => {
+  document.getElementById('acl-manage-overlay').style.display = 'none';
+  refreshAll();
 });
 
 // Probe session state on load -- but check whether this instance has
