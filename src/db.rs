@@ -181,6 +181,29 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // A DNS-01 certificate issued for a domain with no `hosts` row at
+    // all -- the whole point being a wildcard (`*.example.com`) can be
+    // issued once here and then every subdomain host just works via
+    // `proxy::tls::select_cert_for_sni`'s existing wildcard fallback,
+    // no per-host "attach" step needed. `domain` is UNIQUE so
+    // `create_standalone_cert` naturally rejects a duplicate instead of
+    // silently tracking the same domain twice under two ids.
+    // `dns_credential_id` is remembered (not just used once) so
+    // `acme::run_renewal_loop` can pick the same credential again on
+    // its next renewal check.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS standalone_certs (
+            id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL UNIQUE,
+            dns_credential_id TEXT,
+            created_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Single-row table (id is always 1, enforced by the CHECK constraint
     // -- `create_admin_identity_if_absent` relies on it as the atomic
     // arbiter for "has this instance been set up yet"). Holds the admin
@@ -408,6 +431,49 @@ pub async fn dns_credential_name_exists(pool: &SqlitePool, name: &str) -> Result
 
 pub async fn delete_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM dns_credentials WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    Ok(result.rows_affected() > 0)
+}
+
+#[derive(Debug, Clone)]
+pub struct StandaloneCert {
+    pub id: Uuid,
+    pub domain: String,
+    pub dns_credential_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn create_standalone_cert(pool: &SqlitePool, id: Uuid, domain: &str, dns_credential_id: Option<Uuid>, created_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO standalone_certs (id, domain, dns_credential_id, created_at) VALUES (?, ?, ?, ?)")
+        .bind(id.to_string())
+        .bind(domain)
+        .bind(dns_credential_id.map(|id| id.to_string()))
+        .bind(created_at.to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_standalone_certs(pool: &SqlitePool) -> Result<Vec<StandaloneCert>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, domain, dns_credential_id, created_at FROM standalone_certs ORDER BY created_at ASC").fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(StandaloneCert {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
+                domain: row.get("domain"),
+                dns_credential_id: row.get::<Option<String>, _>("dns_credential_id").and_then(|s| Uuid::parse_str(&s).ok()),
+                created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
+            })
+        })
+        .collect()
+}
+
+pub async fn standalone_cert_domain_exists(pool: &SqlitePool, domain: &str) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query("SELECT 1 FROM standalone_certs WHERE domain = ?").bind(domain).fetch_optional(pool).await?;
+    Ok(row.is_some())
+}
+
+pub async fn delete_standalone_cert(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM standalone_certs WHERE id = ?").bind(id.to_string()).execute(pool).await?;
     Ok(result.rows_affected() > 0)
 }
 

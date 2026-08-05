@@ -140,6 +140,8 @@ pub enum IssuanceError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     DnsCredential(#[from] DnsCredentialError),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
 }
 
 /// Runs the full issue/renew flow for one host: order -> dns-01 or
@@ -150,22 +152,51 @@ pub enum IssuanceError {
 /// up on the way out, success or failure.
 pub async fn issue_certificate(state: &AppState, client: &AcmeClient, http: &reqwest::Client, host: &ProxyHost) -> Result<(), IssuanceError> {
     let domain = &host.domain;
-    let (order_url, order) = client.new_order(&[domain.to_string()]).await?;
-    let authz_url = order
-        .authorizations
-        .first()
-        .ok_or_else(|| IssuanceError::NoAuthorization(domain.to_string()))?;
-    let authz = client.get_authorization(authz_url).await?;
+    let (order_url, order, authz, authz_url) = create_order_and_authz(client, domain).await?;
 
     let issued = match resolve_challenge_type(host) {
         ChallengeMethod::Dns01 => {
             let credential = resolve_dns_credential(state.db(), domain, host.dns_credential_id).await?;
             let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
-            issue_via_dns01(client, dns01.as_ref(), domain, &authz, authz_url, &order_url, &order.finalize).await?
+            issue_via_dns01(client, dns01.as_ref(), domain, &authz, &authz_url, &order_url, &order.finalize).await?
         }
-        ChallengeMethod::Http01 => issue_via_http01(state, client, domain, &authz, authz_url, &order_url, &order.finalize).await?,
+        ChallengeMethod::Http01 => issue_via_http01(state, client, domain, &authz, &authz_url, &order_url, &order.finalize).await?,
     };
     publish_cert(state, domain, &issued).await
+}
+
+/// Same dns-01 issuance flow as `issue_certificate`, but for a domain
+/// with no `ProxyHost` at all -- the standalone-cert feature this backs
+/// (`api::routes`'s `/api/dns01-certs`) exists specifically for
+/// wildcards: issue `*.example.com` once here, and every subdomain host
+/// under it just works via `proxy::tls::select_cert_for_sni`'s existing
+/// wildcard fallback, with no separate "attach this cert to that host"
+/// step needed. http-01 is never an option here (there's no host to
+/// open a port-80 listener for, and CAs refuse http-01 for a wildcard
+/// identifier anyway), so this always goes through dns-01.
+pub async fn issue_standalone_dns01_certificate(
+    state: &AppState,
+    client: &AcmeClient,
+    http: &reqwest::Client,
+    domain: &str,
+    dns_credential_id: Option<uuid::Uuid>,
+) -> Result<(), IssuanceError> {
+    let (order_url, order, authz, authz_url) = create_order_and_authz(client, domain).await?;
+    let credential = resolve_dns_credential(state.db(), domain, dns_credential_id).await?;
+    let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
+    let issued = issue_via_dns01(client, dns01.as_ref(), domain, &authz, &authz_url, &order_url, &order.finalize).await?;
+    publish_cert(state, domain, &issued).await
+}
+
+async fn create_order_and_authz(client: &AcmeClient, domain: &str) -> Result<(String, types::Order, Authorization, String), IssuanceError> {
+    let (order_url, order) = client.new_order(&[domain.to_string()]).await?;
+    let authz_url = order
+        .authorizations
+        .first()
+        .ok_or_else(|| IssuanceError::NoAuthorization(domain.to_string()))?
+        .clone();
+    let authz = client.get_authorization(&authz_url).await?;
+    Ok((order_url, order, authz, authz_url))
 }
 
 async fn issue_via_dns01(
@@ -409,11 +440,41 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
                 tracing::error!(domain = %host.domain, error = %err, "certificate issuance/renewal failed");
             }
         }
+        if let Err(err) = renew_standalone_certs_if_needed(&state, &client, &http).await {
+            tracing::error!(error = %err, "failed to check standalone DNS-01 certs for renewal");
+        }
         tokio::time::sleep(RENEWAL_CHECK_INTERVAL).await;
     }
 }
 
-async fn init_acme_client(state: &AppState) -> Result<AcmeClient, IssuanceError> {
+/// Same expiry check as `renew_if_needed`, applied to every tracked
+/// standalone cert (see `issue_standalone_dns01_certificate`) instead of
+/// a host's own domain -- these have no `ProxyHost.acme_enabled`/
+/// `enabled` gate to filter on, since there's no host at all.
+async fn renew_standalone_certs_if_needed(state: &AppState, client: &AcmeClient, http: &reqwest::Client) -> Result<(), IssuanceError> {
+    let renew_before = chrono::Duration::days(state.acme().renew_before_days);
+    for standalone in crate::db::list_standalone_certs(state.db()).await? {
+        let needs_issuance = match state.certs().get(&standalone.domain) {
+            Some(entry) => entry.not_after - chrono::Utc::now() < renew_before,
+            None => true,
+        };
+        if !needs_issuance {
+            continue;
+        }
+        tracing::info!(domain = %standalone.domain, "issuing/renewing standalone certificate");
+        if let Err(err) = issue_standalone_dns01_certificate(state, client, http, &standalone.domain, standalone.dns_credential_id).await {
+            tracing::error!(domain = %standalone.domain, error = %err, "standalone certificate issuance/renewal failed");
+        }
+    }
+    Ok(())
+}
+
+/// `pub` (not module-private) so `api::routes`'s standalone DNS-01 cert
+/// endpoint can build its own client and issue synchronously within the
+/// HTTP request, instead of only ever going through `run_renewal_loop`'s
+/// long-lived one -- a manually-triggered one-off issuance needs
+/// immediate success/failure feedback, not "check back within 12h".
+pub async fn init_acme_client(state: &AppState) -> Result<AcmeClient, IssuanceError> {
     let account_key = AccountKey::load_or_generate(&state.acme().account_key_path)?;
     let client = AcmeClient::new(&state.acme().directory_url, account_key).await?;
     client.new_account(&state.acme().contact_email).await?;

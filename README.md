@@ -111,6 +111,19 @@ as a single inline list/login gate did before. Managing the list itself
 per host that references it. Deleting an ACL still selected by a host
 is rejected -- clear it from every host first.
 
+A wildcard cert doesn't need a host to exist at all: `POST
+/api/dns01-certs` (`{"domain","dns_credential_id"}`, the latter
+optional under the same "auto only if exactly one exists" rule as
+`dns_credential_id` above) issues a dns-01 cert standalone, tracked for
+automatic renewal the same as a host's own. Every subdomain host
+created under that wildcard then just works with `acme_enabled` off --
+`proxy::tls::select_cert_for_sni` already falls back from an
+exact-domain match to a covering `*.parent` cert, so there's no
+separate "attach this cert to that host" step. Runs the real ACME flow
+synchronously in the request (DNS propagation wait included, so it can
+take up to a minute) rather than only through the background renewal
+loop, since a manual one-off issuance wants immediate feedback.
+
 A host can also be a pure redirect instead of a reverse proxy -- set
 `redirect` (`{"target", "preserve_path", "status"}`) and `upstream`
 becomes ignored/optional. `target` must be an absolute `http://`/
@@ -228,6 +241,9 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 | GET    | `/api/acls`             | -- (`{id, name, kind, created_at}` per ACL, never entries/credentials)                    |
 | POST   | `/api/acls`             | `{"name","kind"}` plus `"ip_entries"` (IP allow) or `"credentials"` (Login, `[{"username","password"}]`) |
 | DELETE | `/api/acls/:id`         | -- refused (409) while any host still selects it                                          |
+| GET    | `/api/dns01-certs`      | -- (`{id, domain, dns_credential_id, created_at}` per tracked standalone cert)             |
+| POST   | `/api/dns01-certs`      | `{"domain","dns_credential_id"}` -- issues synchronously (can take up to a minute); only persists on success |
+| DELETE | `/api/dns01-certs/:id`  | -- stops renewal tracking only; the already-issued cert keeps working                     |
 
 ```sh
 curl -X POST https://proxy.example.com/api/hosts \

@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- **Standalone DNS-01 certificates, decoupled from any host.** Built
+  for wildcards -- issuing `*.example.com` used to require creating a
+  throwaway `ProxyHost` just to get ACME to issue against that domain.
+  `POST /api/dns01-certs` (new "Standalone DNS-01 certificates" section
+  on the Certificates tab) issues a cert for any domain with no host at
+  all, synchronously within the request (the real ACME flow, DNS
+  propagation wait included, so it can take up to a minute -- the UI
+  disables the button and shows progress text meanwhile). Once issued,
+  every subdomain host under that wildcard just uses it automatically
+  with no separate "attach" step: `proxy::tls::select_cert_for_sni`
+  already falls back from an exact-domain match to a covering wildcard
+  cert, which this feature leans on rather than duplicating. The
+  tracking row (`standalone_certs` table) is only persisted after a
+  real successful issuance, so a failed one-off attempt doesn't linger
+  being silently retried against a domain that never got a cert;
+  `run_renewal_loop` renews every tracked standalone cert the same way
+  it renews a host's own. Verified against a real Let's Encrypt staging
+  round trip in a real browser (account registration reached, a real
+  ACME error returned and displayed, form re-enabled correctly). See
+  `acme::issue_standalone_dns01_certificate`, `db::StandaloneCert`, and
+  `api::routes`'s `/api/dns01-certs` handlers.
 - **Reusable, named ACLs replace per-host inline access control.** A
   host used to carry its own `access_allow_ips`/`access_login` fields
   directly -- sharing the same office IP range or login across five

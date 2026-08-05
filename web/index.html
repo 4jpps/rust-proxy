@@ -225,6 +225,29 @@
         <span class="error" id="cert-error"></span>
       </div>
     </form>
+
+    <h2>Standalone DNS-01 certificates</h2>
+    <p class="hint">Issue a certificate for a domain with no proxy host at all -- built for
+      wildcards (<code>*.example.com</code>): issue it once here, then any host you create under
+      that domain with ACME disabled just uses it automatically (no separate "attach" step --
+      TLS falls back from an exact-domain match to a covering wildcard cert). Tracked here so
+      it's renewed automatically, same as a host's own cert. Issuing runs the real ACME flow
+      (including a DNS propagation wait), so this can take up to a minute.</p>
+    <table id="standalone-certs-table"><thead><tr><th>Domain</th><th>DNS credential</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
+    <form id="standalone-cert-form">
+      <div class="field-grid">
+        <label><span>Domain</span><input type="text" name="domain" placeholder="*.example.com" required></label>
+        <label><span>DNS credential</span>
+          <select name="dns_credential_id">
+            <option value="">auto (only if exactly one exists)</option>
+          </select>
+        </label>
+      </div>
+      <div class="form-actions">
+        <button type="submit" id="standalone-cert-submit">Issue certificate</button>
+        <span class="error" id="standalone-cert-error"></span>
+      </div>
+    </form>
   </section>
 
   <section class="tab-panel" id="tab-dns">
@@ -454,11 +477,13 @@ document.getElementById('tabs').addEventListener('click', (e) => {
 });
 
 async function refreshAll() {
-  // refreshAcls populates aclsById, which refreshHosts reads to render
-  // the Access column and the host form's ACL picker -- must resolve
-  // first, not run concurrently with it.
-  await refreshAcls();
-  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshDnsCredentials()]);
+  // refreshAcls populates aclsById (read by refreshHosts for the Access
+  // column/picker) and refreshDnsCredentials populates dnsCredsById and
+  // both dns_credential_id selects (read by refreshHosts and
+  // refreshStandaloneCerts) -- both must resolve before anything that
+  // reads them, not run concurrently with it.
+  await Promise.all([refreshAcls(), refreshDnsCredentials()]);
+  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts()]);
 }
 
 async function refreshDashboard() {
@@ -508,13 +533,6 @@ function setHostFormMode(host) {
 document.getElementById('host-form-cancel').addEventListener('click', () => setHostFormMode(null));
 
 async function refreshHosts() {
-  const credSelect = document.querySelector('#host-form select[name=dns_credential_id]');
-  const selectedCred = credSelect.value;
-  const creds = await (await api('/api/dns-credentials')).json();
-  credSelect.innerHTML = '<option value="">auto (only if exactly one exists)</option>' +
-    creds.map(c => `<option value="${esc(c.id)}">${esc(c.name)} (${esc(c.provider)})</option>`).join('');
-  credSelect.value = selectedCred;
-
   const hosts = await (await api('/api/hosts')).json();
   const tbody = document.querySelector('#hosts-table tbody');
   tbody.innerHTML = '';
@@ -669,8 +687,14 @@ document.getElementById('token-reveal-dismiss').addEventListener('click', () => 
   document.getElementById('token-reveal-value').textContent = '';
 });
 
+// Keyed by id, refreshed by refreshDnsCredentials() -- refreshStandaloneCerts
+// reads this to show a human name instead of a raw id.
+let dnsCredsById = {};
+
 async function refreshDnsCredentials() {
   const creds = await (await api('/api/dns-credentials')).json();
+  dnsCredsById = Object.fromEntries(creds.map((c) => [c.id, c]));
+
   const tbody = document.querySelector('#dns-credentials-table tbody');
   tbody.innerHTML = '';
   for (const c of creds) {
@@ -684,7 +708,57 @@ async function refreshDnsCredentials() {
     });
     tbody.appendChild(tr);
   }
+
+  for (const select of [document.querySelector('#host-form select[name=dns_credential_id]'), document.querySelector('#standalone-cert-form select[name=dns_credential_id]')]) {
+    const selected = select.value;
+    select.innerHTML = '<option value="">auto (only if exactly one exists)</option>' +
+      creds.map((c) => `<option value="${esc(c.id)}">${esc(c.name)} (${esc(c.provider)})</option>`).join('');
+    select.value = selected;
+  }
 }
+
+async function refreshStandaloneCerts() {
+  const certs = await (await api('/api/dns01-certs')).json();
+  const tbody = document.querySelector('#standalone-certs-table tbody');
+  tbody.innerHTML = '';
+  for (const c of certs) {
+    const cred = c.dns_credential_id && dnsCredsById[c.dns_credential_id] ? dnsCredsById[c.dns_credential_id].name : 'auto';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${esc(c.domain)}</td><td>${esc(cred)}</td><td>${new Date(c.created_at).toLocaleString()}</td>
+      <td><button class="danger" data-id="${c.id}">Stop tracking</button></td>`;
+    tr.querySelector('button').addEventListener('click', async () => {
+      if (!confirm(`Stop tracking "${c.domain}" for automatic renewal? The already-issued certificate keeps working until it expires.`)) return;
+      await api(`/api/dns01-certs/${c.id}`, { method: 'DELETE' });
+      refreshStandaloneCerts();
+    });
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById('standalone-cert-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const dnsCredentialId = fd.get('dns_credential_id');
+  const body = { domain: fd.get('domain'), dns_credential_id: dnsCredentialId ? dnsCredentialId : null };
+  const submitBtn = document.getElementById('standalone-cert-submit');
+  const errorEl = document.getElementById('standalone-cert-error');
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Issuing... (this can take up to a minute)';
+  errorEl.textContent = '';
+  try {
+    const resp = await api('/api/dns01-certs', { method: 'POST', body: JSON.stringify(body) });
+    if (resp.ok) {
+      e.target.reset();
+      refreshStandaloneCerts();
+      refreshCerts();
+    } else {
+      errorEl.textContent = (await resp.json()).error || 'failed';
+    }
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Issue certificate';
+  }
+});
 
 document.getElementById('dns-credential-form').addEventListener('submit', async (e) => {
   e.preventDefault();

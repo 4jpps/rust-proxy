@@ -38,6 +38,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/dns-credentials/:id", axum::routing::delete(delete_dns_credential))
         .route("/api/acls", get(list_acls).post(create_acl_list))
         .route("/api/acls/:id", axum::routing::delete(delete_acl_list))
+        .route("/api/dns01-certs", get(list_standalone_certs).post(create_standalone_cert))
+        .route("/api/dns01-certs/:id", axum::routing::delete(delete_standalone_cert))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
@@ -837,6 +839,80 @@ async fn delete_dns_credential(State(state): State<AppState>, Path(id): Path<Uui
         return Err(ApiError::Conflict("one or more hosts still reference this DNS credential -- repoint or delete them first".into()));
     }
     let found = crate::db::delete_dns_credential(state.db(), id).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct StandaloneCertSummary {
+    id: Uuid,
+    domain: String,
+    dns_credential_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+struct CreateStandaloneCertRequest {
+    domain: String,
+    #[serde(default)]
+    dns_credential_id: Option<Uuid>,
+}
+
+async fn list_standalone_certs(State(state): State<AppState>) -> Result<Json<Vec<StandaloneCertSummary>>, ApiError> {
+    let certs = crate::db::list_standalone_certs(state.db()).await?;
+    Ok(Json(
+        certs
+            .into_iter()
+            .map(|c| StandaloneCertSummary { id: c.id, domain: c.domain, dns_credential_id: c.dns_credential_id, created_at: c.created_at })
+            .collect(),
+    ))
+}
+
+/// Issues a dns-01 certificate for a domain with no `ProxyHost` at all
+/// -- the point being a wildcard (`*.example.com`), issued once here so
+/// every subdomain host under it works via `proxy::tls`'s existing
+/// wildcard cert fallback with no separate per-host "attach" step.
+/// Runs the whole ACME flow synchronously within this request (real
+/// DNS propagation wait included, so this can take tens of seconds) so
+/// a manual one-off issuance gets immediate success/failure feedback
+/// instead of "check back within `run_renewal_loop`'s 12h cycle" --
+/// the tracking row (needed for future automatic renewal) is only
+/// persisted after issuance actually succeeds, so a failed attempt
+/// doesn't linger being silently retried on a domain that's never
+/// actually gotten a cert.
+async fn create_standalone_cert(State(state): State<AppState>, Json(body): Json<CreateStandaloneCertRequest>) -> Result<Json<StandaloneCertSummary>, ApiError> {
+    let domain = body.domain.trim();
+    crate::config::validate_domain(domain).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if crate::db::standalone_cert_domain_exists(state.db(), domain).await? {
+        return Err(ApiError::BadRequest(format!("a standalone certificate for \"{domain}\" is already tracked")));
+    }
+    if let Some(id) = body.dns_credential_id {
+        if crate::db::get_dns_credential(state.db(), id).await?.is_none() {
+            return Err(ApiError::BadRequest("dns_credential_id does not reference an existing DNS credential".into()));
+        }
+    }
+
+    let http = reqwest::Client::new();
+    let client = crate::acme::init_acme_client(&state).await.map_err(|e| ApiError::Internal(e.to_string()))?;
+    crate::acme::issue_standalone_dns01_certificate(&state, &client, &http, domain, body.dns_credential_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let id = Uuid::new_v4();
+    let created_at = chrono::Utc::now();
+    crate::db::create_standalone_cert(state.db(), id, domain, body.dns_credential_id, created_at).await?;
+    Ok(Json(StandaloneCertSummary { id, domain: domain.to_string(), dns_credential_id: body.dns_credential_id, created_at }))
+}
+
+/// Only removes the tracking row (so `run_renewal_loop` stops trying to
+/// renew it) -- the already-issued cert itself stays published and
+/// on-disk, same as `delete_cert`'s "domain no longer has a live
+/// ProxyHost" case; a host relying on it via the wildcard fallback must
+/// not lose TLS just because renewal tracking was removed.
+async fn delete_standalone_cert(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+    let found = crate::db::delete_standalone_cert(state.db(), id).await?;
     if !found {
         return Err(ApiError::NotFound);
     }
@@ -2352,6 +2428,170 @@ mod tests {
 
         let resp = router
             .oneshot(Request::builder().uri("/api/acls").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_standalone_cert_with_an_invalid_domain_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns01-certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"domain":"**.example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_standalone_cert_with_a_domain_already_tracked_is_rejected() {
+        let state = test_state().await;
+        crate::db::create_standalone_cert(state.db(), Uuid::new_v4(), "*.example.com", None, chrono::Utc::now()).await.unwrap();
+        let router = build_router(state);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns01-certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"domain":"*.example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_standalone_cert_with_a_nonexistent_dns_credential_id_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns01-certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(format!(r#"{{"domain":"*.example.com","dns_credential_id":"{}"}}"#, Uuid::new_v4())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_standalone_cert_returns_an_error_and_persists_nothing_when_acme_is_unreachable() {
+        // test_state()'s directory_url ("https://example.invalid/directory")
+        // is deliberately unreachable -- this exercises the real
+        // init_acme_client/issuance failure path without needing a full
+        // mocked ACME+DNS-provider round trip, and confirms the tracking
+        // row is only ever persisted after a real successful issuance
+        // (a failed one-off attempt must not linger being silently
+        // retried against a domain that never actually got a cert).
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns01-certs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"domain":"*.example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dns01-certs")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert!(json.as_array().unwrap().is_empty(), "a failed issuance must not leave a tracking row behind");
+    }
+
+    #[tokio::test]
+    async fn list_and_delete_standalone_certs_round_trip() {
+        let state = test_state().await;
+        let id = Uuid::new_v4();
+        crate::db::create_standalone_cert(state.db(), id, "*.example.com", None, chrono::Utc::now()).await.unwrap();
+        let router = build_router(state);
+        let cookie = logged_in_cookie(&router).await;
+
+        let list_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dns01-certs")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["domain"], "*.example.com");
+
+        let delete_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/dns01-certs/{id}"))
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+        let repeat_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/dns01-certs/{id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeat_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn standalone_cert_endpoints_require_authentication() {
+        let router = build_router(test_state().await);
+
+        let resp = router
+            .oneshot(Request::builder().uri("/api/dns01-certs").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
