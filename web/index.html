@@ -6,21 +6,44 @@
 <title>rust-proxy admin</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+  body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
   h1 { font-size: 1.3rem; }
-  h2 { font-size: 1.05rem; margin-top: 2rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.4rem; }
   table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }
   th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #8884; }
   form.inline { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.6rem; align-items: center; }
-  input[type=text], input[type=number], input[type=password], select { padding: 0.3rem; }
-  button { padding: 0.3rem 0.7rem; cursor: pointer; }
-  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  input[type=text], input[type=number], input[type=password], select { padding: 0.35rem; }
+  button { padding: 0.35rem 0.8rem; cursor: pointer; }
+  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0.8rem 0 0; }
   .stat { border: 1px solid #8884; border-radius: 6px; padding: 0.6rem 1rem; }
   .stat b { display: block; font-size: 1.4rem; }
   .danger { color: #c33; }
   #login-screen, #app, #setup-screen { display: none; }
   .error { color: #c33; font-size: 0.85rem; }
-  label.chk { display: inline-flex; gap: 0.25rem; align-items: center; font-size: 0.85rem; }
+  .hint { font-size: 0.85rem; opacity: 0.75; max-width: 70ch; }
+  label.chk { display: inline-flex; gap: 0.35rem; align-items: center; font-size: 0.85rem; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 0.2rem; border-bottom: 1px solid #8884; margin: 1.2rem 0 0; flex-wrap: wrap; }
+  .tab-btn { padding: 0.55rem 1rem; border: none; background: transparent; cursor: pointer;
+    border-bottom: 2px solid transparent; font-size: 0.92rem; color: inherit; opacity: 0.7; }
+  .tab-btn.active { border-bottom-color: currentColor; font-weight: 600; opacity: 1; }
+  .tab-panel { display: none; padding-top: 0.4rem; }
+  .tab-panel.active { display: block; }
+
+  /* Labeled field grid -- every input gets a real <label>, not just a
+     placeholder, grouped into <fieldset>s so a long form (the host
+     form especially) reads as sections instead of one undifferentiated
+     row of boxes. */
+  fieldset { border: 1px solid #8884; border-radius: 8px; padding: 0.8rem 1rem 1rem; margin: 0.8rem 0 0; }
+  legend { font-size: 0.8rem; padding: 0 0.4rem; opacity: 0.75; text-transform: uppercase; letter-spacing: 0.03em; }
+  .field-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.7rem 1rem; align-items: end; }
+  .field-grid > label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.82rem; }
+  .field-grid > label > span { opacity: 0.8; }
+  .field-grid > label > input, .field-grid > label > select { width: 100%; box-sizing: border-box; }
+  .field-grid .wide { grid-column: 1 / -1; }
+  .checks { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 0.6rem; }
+  .form-actions { display: flex; gap: 0.5rem; align-items: center; margin-top: 1rem; }
 </style>
 </head>
 <body>
@@ -37,7 +60,7 @@
 
 <div id="setup-screen">
   <h1>rust-proxy first-time setup</h1>
-  <p style="font-size:0.85rem;max-width:60ch">No admin account is configured yet. Create one below -- optionally add
+  <p class="hint">No admin account is configured yet. Create one below -- optionally add
     a DNS-01 credential now too (you can always add more, or skip this and add one later from the DNS Credentials
     section).</p>
   <form id="setup-form" class="inline" style="flex-direction:column;align-items:flex-start;gap:0.6rem">
@@ -67,112 +90,191 @@
 
 <div id="app">
   <h1>rust-proxy admin <button id="logout-btn" style="float:right">Sign out</button></h1>
-
   <div class="stats" id="stats"></div>
 
-  <h2>Proxy hosts</h2>
-  <table id="hosts-table"><thead><tr>
-    <th>Domain</th><th>Bind</th><th>Upstream / Redirect</th><th>WS</th><th>HTTPS redir</th><th>ACME</th><th>Challenge</th><th>Access</th><th>Enabled</th><th></th>
-  </tr></thead><tbody></tbody></table>
-  <form class="inline" id="host-form">
-    <input type="text" name="domain" placeholder="domain" required>
-    <input type="text" name="bind_ip" placeholder="bind ip" required>
-    <input type="number" name="bind_port" placeholder="port" value="443" required>
-    <input type="text" name="upstream" placeholder="upstream host:port (leave blank for a redirect host)">
-    <label class="chk"><input type="checkbox" name="websockets"> WS</label>
-    <label class="chk"><input type="checkbox" name="force_https" checked> HTTPS redirect</label>
-    <label class="chk"><input type="checkbox" name="acme_enabled" checked> ACME</label>
-    <select name="acme_challenge_type" title="ACME challenge type">
-      <option value="auto" selected>auto (http-01 if HTTPS redirect, else dns-01)</option>
-      <option value="http01">http-01 (needs port 80 reachable, no DNS credentials)</option>
-      <option value="dns01">dns-01 (needs a configured DNS provider)</option>
-    </select>
-    <select name="dns_credential_id" title="Which named DNS credential to use for dns-01 (only relevant when the challenge type resolves to dns-01). Leave on 'auto' to use the single configured credential, if there's exactly one.">
-      <option value="">dns credential: auto (only if exactly one exists)</option>
-    </select>
-    <input type="text" name="access_allow_ips" placeholder="allowed IPs/CIDRs, comma-separated (optional)" title="Access list: IP allow list. Empty means unrestricted.">
-    <input type="text" name="access_login_username" placeholder="login username (optional)" title="Gate this host behind a login page. Leave blank for no login gate.">
-    <input type="password" name="access_login_password" placeholder="login password">
-    <input type="text" name="redirect_target" placeholder="redirect target URL (optional, overrides upstream)" title="If set, this host redirects here instead of proxying to upstream, e.g. https://new.example.com">
-    <label class="chk"><input type="checkbox" name="redirect_preserve_path" checked> Preserve path</label>
-    <select name="redirect_status" title="Redirect status code">
-      <option value="permanent" selected>301 permanent</option>
-      <option value="temporary">302 temporary</option>
-    </select>
-    <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
-    <button type="submit">Add host</button>
-    <span class="error" id="host-error"></span>
-  </form>
+  <nav class="tabs" id="tabs">
+    <button type="button" class="tab-btn active" data-tab="hosts">Hosts</button>
+    <button type="button" class="tab-btn" data-tab="rules">Firewall Rules</button>
+    <button type="button" class="tab-btn" data-tab="certs">Certificates</button>
+    <button type="button" class="tab-btn" data-tab="dns">DNS Credentials</button>
+    <button type="button" class="tab-btn" data-tab="tokens">API Tokens</button>
+  </nav>
 
-  <h2>Firewall / port rules</h2>
-  <table id="rules-table"><thead><tr>
-    <th>Bind</th><th>Ports</th><th>Proto</th><th>Target</th><th>Description</th><th>Enabled</th><th></th>
-  </tr></thead><tbody></tbody></table>
-  <form class="inline" id="rule-form">
-    <input type="text" name="bind_ip" placeholder="bind ip" required>
-    <input type="number" name="port_start" placeholder="from port" required>
-    <input type="number" name="port_end" placeholder="to port" required>
-    <select name="protocol"><option value="tcp">tcp</option><option value="udp">udp</option></select>
-    <input type="text" name="passthrough_target" placeholder="passthrough target (optional)">
-    <input type="text" name="description" placeholder="description">
-    <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
-    <button type="submit">Add rule</button>
-    <span class="error" id="rule-error"></span>
-  </form>
+  <section class="tab-panel active" id="tab-hosts">
+    <h2>Proxy hosts</h2>
+    <table id="hosts-table"><thead><tr>
+      <th>Domain</th><th>Bind</th><th>Upstream / Redirect</th><th>WS</th><th>HTTPS redir</th><th>ACME</th><th>Challenge</th><th>Access</th><th>Enabled</th><th></th>
+    </tr></thead><tbody></tbody></table>
 
-  <h2>Certificates</h2>
-  <table id="certs-table"><thead><tr><th>Domain</th><th>Expires</th><th>Days left</th><th></th></tr></thead><tbody></tbody></table>
-  <p style="font-size:0.85rem;max-width:60ch">ACME-issued certs appear here automatically. Upload a custom one (an
-    internal CA's cert, a wildcard bought elsewhere) for a host with
-    ACME disabled -- otherwise the next renewal check overwrites it.</p>
-  <form class="inline" id="cert-form">
-    <input type="text" name="domain" placeholder="domain" required>
-    <textarea name="fullchain_pem" placeholder="full chain PEM (leaf + intermediates)" rows="3" style="flex:1 1 100%;font-family:monospace;font-size:0.8rem" required></textarea>
-    <textarea name="private_key_pem" placeholder="private key PEM" rows="3" style="flex:1 1 100%;font-family:monospace;font-size:0.8rem" required></textarea>
-    <button type="submit">Upload certificate</button>
-    <span class="error" id="cert-error"></span>
-  </form>
+    <h2 id="host-form-title">Add a host</h2>
+    <form id="host-form">
+      <fieldset>
+        <legend>Basics</legend>
+        <div class="field-grid">
+          <label><span>Domain</span><input type="text" name="domain" placeholder="app.example.com" required></label>
+          <label><span>Bind IP</span><input type="text" name="bind_ip" placeholder="10.0.0.2" required></label>
+          <label><span>Bind port</span><input type="number" name="bind_port" value="443" required></label>
+          <label class="wide"><span>Upstream (host:port) -- leave blank if this host is a pure redirect below</span>
+            <input type="text" name="upstream" placeholder="127.0.0.1:8000"></label>
+        </div>
+        <div class="checks">
+          <label class="chk"><input type="checkbox" name="websockets"> Proxy WebSocket upgrades</label>
+          <label class="chk"><input type="checkbox" name="force_https" checked> Redirect HTTP &rarr; HTTPS</label>
+          <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
+        </div>
+      </fieldset>
 
-  <h2>DNS credentials</h2>
-  <p style="font-size:0.85rem;max-width:60ch">Named DNS-01 credentials for ACME issuance -- a host set to the
-    <code>dns01</code> challenge type picks one by name below. If exactly one exists, a host with no explicit
-    choice uses it automatically; with zero or several, you must pick one.</p>
-  <table id="dns-credentials-table"><thead><tr><th>Name</th><th>Provider</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
-  <form class="inline" id="dns-credential-form">
-    <input type="text" name="name" placeholder="name (e.g. &quot;prod-cloudflare&quot;)" required>
-    <select name="provider">
-      <option value="cloudflare">Cloudflare</option>
-      <option value="digitalocean">DigitalOcean</option>
-      <option value="hetzner">Hetzner</option>
-      <option value="duckdns">DuckDNS</option>
-      <option value="godaddy">GoDaddy</option>
-      <option value="namecheap">Namecheap (token: api_user:api_key:client_ip)</option>
-      <option value="route53">Route53 (token: access_key_id:secret_access_key)</option>
-    </select>
-    <input type="text" name="token" placeholder="API token / credential string" required>
-    <button type="submit">Add credential</button>
-    <span class="error" id="dns-credential-error"></span>
-  </form>
+      <fieldset>
+        <legend>TLS / ACME</legend>
+        <div class="field-grid">
+          <label><span>Challenge type</span>
+            <select name="acme_challenge_type" title="ACME challenge type">
+              <option value="auto" selected>auto (http-01 if HTTPS redirect is on, else dns-01)</option>
+              <option value="http01">http-01 -- needs port 80 reachable, no DNS credentials</option>
+              <option value="dns01">dns-01 -- needs a configured DNS credential below</option>
+            </select>
+          </label>
+          <label><span>DNS credential (for dns-01)</span>
+            <select name="dns_credential_id" title="Which named DNS credential to use for dns-01. Leave on 'auto' to use the single configured credential, if there's exactly one.">
+              <option value="">auto (only if exactly one exists)</option>
+            </select>
+          </label>
+        </div>
+        <div class="checks">
+          <label class="chk"><input type="checkbox" name="acme_enabled" checked> Issue/renew a certificate automatically</label>
+        </div>
+      </fieldset>
 
-  <h2>API tokens</h2>
-  <p style="font-size:0.85rem;max-width:60ch">Bearer tokens for driving this instance's REST API without a
-    session -- CI pipelines, scripts, other tools. Send as
-    <code>Authorization: Bearer &lt;token&gt;</code>. A token can reach every
-    endpoint an admin session can, so treat it like a password. See the
-    README's API Tokens section for details.</p>
-  <table id="tokens-table"><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody></tbody></table>
-  <form class="inline" id="token-form">
-    <input type="text" name="name" placeholder="token name (e.g. \"ci pipeline\")" required>
-    <button type="submit">Create token</button>
-    <span class="error" id="token-error"></span>
-  </form>
-  <div id="token-reveal" style="display:none;margin-top:0.6rem;padding:0.6rem 1rem;border:1px solid #8884;border-radius:6px">
-    <b>New token (copy it now -- it won't be shown again):</b>
-    <div style="display:flex;gap:0.4rem;margin-top:0.4rem;align-items:center">
-      <code id="token-reveal-value" style="user-select:all;word-break:break-all"></code>
-      <button type="button" id="token-reveal-dismiss">Done</button>
+      <fieldset>
+        <legend>Access control (optional)</legend>
+        <div class="field-grid">
+          <label class="wide"><span>Allowed source IPs/CIDRs, comma-separated -- blank means unrestricted</span>
+            <input type="text" name="access_allow_ips" placeholder="10.0.0.0/24, 203.0.113.5"></label>
+          <label><span>Login username -- blank means no login gate</span>
+            <input type="text" name="access_login_username" placeholder="viewer"></label>
+          <label><span>Login password</span>
+            <input type="password" name="access_login_password" placeholder="(leave blank to keep unchanged when editing)"></label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Redirect (optional -- overrides Upstream above)</legend>
+        <div class="field-grid">
+          <label class="wide"><span>Redirect target URL</span>
+            <input type="text" name="redirect_target" placeholder="https://new.example.com" title="If set, this host redirects here instead of proxying to Upstream."></label>
+          <label><span>Status code</span>
+            <select name="redirect_status">
+              <option value="permanent" selected>301 permanent</option>
+              <option value="temporary">302 temporary</option>
+            </select>
+          </label>
+        </div>
+        <div class="checks">
+          <label class="chk"><input type="checkbox" name="redirect_preserve_path" checked> Append the visited path/query to the target</label>
+        </div>
+      </fieldset>
+
+      <div class="form-actions">
+        <button type="submit" id="host-form-submit">Add host</button>
+        <button type="button" id="host-form-cancel" style="display:none">Cancel edit</button>
+        <span class="error" id="host-error"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="tab-panel" id="tab-rules">
+    <h2>Firewall / port rules</h2>
+    <table id="rules-table"><thead><tr>
+      <th>Bind</th><th>Ports</th><th>Proto</th><th>Target</th><th>Description</th><th>Enabled</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <form id="rule-form">
+      <div class="field-grid">
+        <label><span>Bind IP</span><input type="text" name="bind_ip" placeholder="10.0.0.4" required></label>
+        <label><span>From port</span><input type="number" name="port_start" required></label>
+        <label><span>To port</span><input type="number" name="port_end" required></label>
+        <label><span>Protocol</span><select name="protocol"><option value="tcp">tcp</option><option value="udp">udp</option></select></label>
+        <label><span>Passthrough target (optional)</span><input type="text" name="passthrough_target" placeholder="127.0.0.1:21115" title="Leave blank to just open the firewall for a service already listening locally."></label>
+        <label class="wide"><span>Description</span><input type="text" name="description" placeholder="rustdesk tcp"></label>
+      </div>
+      <div class="checks"><label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label></div>
+      <div class="form-actions">
+        <button type="submit">Add rule</button>
+        <span class="error" id="rule-error"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="tab-panel" id="tab-certs">
+    <h2>Certificates</h2>
+    <table id="certs-table"><thead><tr><th>Domain</th><th>Expires</th><th>Days left</th><th></th></tr></thead><tbody></tbody></table>
+    <p class="hint">ACME-issued certs appear here automatically. Upload a custom one (an
+      internal CA's cert, a wildcard bought elsewhere) for a host with
+      ACME disabled -- otherwise the next renewal check overwrites it.</p>
+    <form id="cert-form">
+      <div class="field-grid">
+        <label class="wide"><span>Domain</span><input type="text" name="domain" placeholder="app.example.com" required></label>
+        <label class="wide"><span>Full chain PEM (leaf + intermediates)</span>
+          <textarea name="fullchain_pem" rows="3" style="font-family:monospace;font-size:0.8rem" required></textarea></label>
+        <label class="wide"><span>Private key PEM</span>
+          <textarea name="private_key_pem" rows="3" style="font-family:monospace;font-size:0.8rem" required></textarea></label>
+      </div>
+      <div class="form-actions">
+        <button type="submit">Upload certificate</button>
+        <span class="error" id="cert-error"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="tab-panel" id="tab-dns">
+    <h2>DNS credentials</h2>
+    <p class="hint">Named DNS-01 credentials for ACME issuance -- a host set to the
+      <code>dns01</code> challenge type picks one by name. If exactly one exists, a host with no explicit
+      choice uses it automatically; with zero or several, you must pick one.</p>
+    <table id="dns-credentials-table"><thead><tr><th>Name</th><th>Provider</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
+    <form id="dns-credential-form">
+      <div class="field-grid">
+        <label><span>Name</span><input type="text" name="name" placeholder="prod-cloudflare" required></label>
+        <label><span>Provider</span>
+          <select name="provider">
+            <option value="cloudflare">Cloudflare</option>
+            <option value="digitalocean">DigitalOcean</option>
+            <option value="hetzner">Hetzner</option>
+            <option value="duckdns">DuckDNS</option>
+            <option value="godaddy">GoDaddy</option>
+            <option value="namecheap">Namecheap (token: api_user:api_key:client_ip)</option>
+            <option value="route53">Route53 (token: access_key_id:secret_access_key)</option>
+          </select>
+        </label>
+        <label class="wide"><span>API token / credential string</span><input type="text" name="token" required></label>
+      </div>
+      <div class="form-actions">
+        <button type="submit">Add credential</button>
+        <span class="error" id="dns-credential-error"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="tab-panel" id="tab-tokens">
+    <h2>API tokens</h2>
+    <p class="hint">Bearer tokens for driving this instance's REST API without a
+      session -- CI pipelines, scripts, other tools. Send as
+      <code>Authorization: Bearer &lt;token&gt;</code>. A token can reach every
+      endpoint an admin session can, so treat it like a password. See the
+      README's API Tokens section for details.</p>
+    <table id="tokens-table"><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody></tbody></table>
+    <form id="token-form" class="inline">
+      <input type="text" name="name" placeholder="token name (e.g. &quot;ci pipeline&quot;)" required>
+      <button type="submit">Create token</button>
+      <span class="error" id="token-error"></span>
+    </form>
+    <div id="token-reveal" style="display:none;margin-top:0.6rem;padding:0.6rem 1rem;border:1px solid #8884;border-radius:6px">
+      <b>New token (copy it now -- it won't be shown again):</b>
+      <div style="display:flex;gap:0.4rem;margin-top:0.4rem;align-items:center">
+        <code id="token-reveal-value" style="user-select:all;word-break:break-all"></code>
+        <button type="button" id="token-reveal-dismiss">Done</button>
+      </div>
     </div>
-  </div>
+  </section>
 </div>
 
 <script>
@@ -256,6 +358,16 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
   }
 });
 
+// Tabs -- plain show/hide, no routing/URL state; the panels' own
+// refresh calls already all fire together in refreshAll(), so
+// switching tabs is purely a display concern.
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab-btn');
+  if (!btn) return;
+  for (const b of document.querySelectorAll('.tab-btn')) b.classList.toggle('active', b === btn);
+  for (const p of document.querySelectorAll('.tab-panel')) p.classList.toggle('active', p.id === `tab-${btn.dataset.tab}`);
+});
+
 async function refreshAll() {
   await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshDnsCredentials()]);
 }
@@ -269,11 +381,56 @@ async function refreshDashboard() {
     <div class="stat"><b>${d.bind_ranges.length ? d.bind_ranges.join(', ') : 'unrestricted'}</b>bind range${d.bind_ranges.length === 1 ? '' : 's'}</div>`;
 }
 
+// Holds the id of the host currently being edited, or null while
+// adding a new one -- toggles the form between POST /api/hosts (create)
+// and PUT /api/hosts/:id (update), which take the identical JSON body
+// shape (see api/routes.rs's HostRequest, used by both handlers).
+let editingHostId = null;
+
+function setHostFormMode(host) {
+  const form = document.getElementById('host-form');
+  editingHostId = host ? host.id : null;
+  document.getElementById('host-form-title').textContent = host ? `Editing ${host.domain}` : 'Add a host';
+  document.getElementById('host-form-submit').textContent = host ? 'Save changes' : 'Add host';
+  document.getElementById('host-form-cancel').style.display = host ? '' : 'none';
+  document.getElementById('host-error').textContent = '';
+
+  if (!host) {
+    form.reset();
+    return;
+  }
+  form.domain.value = host.domain;
+  form.bind_ip.value = host.bind_ip;
+  form.bind_port.value = host.bind_port;
+  form.upstream.value = host.upstream || '';
+  form.websockets.checked = host.websockets;
+  form.force_https.checked = host.force_https;
+  form.enabled.checked = host.enabled;
+  form.acme_enabled.checked = host.acme_enabled;
+  form.acme_challenge_type.value = host.acme_challenge_type;
+  form.dns_credential_id.value = host.dns_credential_id || '';
+  form.access_allow_ips.value = (host.access_allow_ips || []).join(', ');
+  form.access_login_username.value = host.access_login ? host.access_login.username : '';
+  // Password hashes are never sent back by the API (see HostAuth's
+  // #[serde(skip_serializing)]) -- left blank here always. Submitting
+  // with a login username but a blank password is rejected by the
+  // server, so an operator editing a login-gated host must re-type
+  // its password (or clear the username to remove the gate entirely).
+  form.access_login_password.value = '';
+  form.redirect_target.value = host.redirect ? host.redirect.target : '';
+  form.redirect_preserve_path.checked = host.redirect ? host.redirect.preserve_path : true;
+  form.redirect_status.value = host.redirect ? host.redirect.status : 'permanent';
+}
+
+document.getElementById('host-form-cancel').addEventListener('click', () => setHostFormMode(null));
+
 async function refreshHosts() {
   const credSelect = document.querySelector('#host-form select[name=dns_credential_id]');
+  const selectedCred = credSelect.value;
   const creds = await (await api('/api/dns-credentials')).json();
-  credSelect.innerHTML = '<option value="">dns credential: auto (only if exactly one exists)</option>' +
+  credSelect.innerHTML = '<option value="">auto (only if exactly one exists)</option>' +
     creds.map(c => `<option value="${esc(c.id)}">${esc(c.name)} (${esc(c.provider)})</option>`).join('');
+  credSelect.value = selectedCred;
 
   const hosts = await (await api('/api/hosts')).json();
   const tbody = document.querySelector('#hosts-table tbody');
@@ -291,9 +448,16 @@ async function refreshHosts() {
       <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
       <td>${esc(h.acme_challenge_type)}</td>
       <td>${access}</td>
-      <td>${h.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${h.id}">Delete</button></td>`;
-    tr.querySelector('button').addEventListener('click', async () => {
+      <td>${h.enabled ? 'yes' : 'no'}</td>
+      <td><button type="button" data-id="${h.id}" class="edit-host-btn">Edit</button> <button class="danger" data-id="${h.id}">Delete</button></td>`;
+    tr.querySelector('.edit-host-btn').addEventListener('click', () => {
+      setHostFormMode(h);
+      document.getElementById('host-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    tr.querySelector('.danger').addEventListener('click', async () => {
+      if (!confirm(`Delete host "${h.domain}"?`)) return;
       await api(`/api/hosts/${h.id}`, { method: 'DELETE' });
+      if (editingHostId === h.id) setHostFormMode(null);
       refreshAll();
     });
     tbody.appendChild(tr);
@@ -321,8 +485,10 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
       : null,
     enabled: fd.get('enabled') === 'on',
   };
-  const resp = await api('/api/hosts', { method: 'POST', body: JSON.stringify(body) });
-  if (resp.ok) { e.target.reset(); document.getElementById('host-error').textContent = ''; refreshAll(); }
+  const resp = editingHostId
+    ? await api(`/api/hosts/${editingHostId}`, { method: 'PUT', body: JSON.stringify(body) })
+    : await api('/api/hosts', { method: 'POST', body: JSON.stringify(body) });
+  if (resp.ok) { setHostFormMode(null); refreshAll(); }
   else { document.getElementById('host-error').textContent = (await resp.json()).error || 'failed'; }
 });
 

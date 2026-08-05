@@ -339,6 +339,36 @@ fn build_host_login(req: &Option<HostLoginRequest>) -> Result<Option<crate::conf
     }))
 }
 
+/// Same as `build_host_login`, but for `PUT /api/hosts/:id`: an
+/// explicitly-blank password means "keep whatever this host's login
+/// gate already had" rather than a validation error. `GET`/`PUT
+/// /api/hosts` never return a login gate's password hash (see
+/// `HostAuth::password_hash`'s `#[serde(skip_serializing)]`), so the
+/// admin UI's edit form can only ever prefill the username, never the
+/// password -- requiring a full re-type on every edit that touches any
+/// *other* field of a login-gated host would be a real usability trap,
+/// not just an inconvenience.
+fn build_host_login_for_update(req: &Option<HostLoginRequest>, existing: &Option<crate::config::HostAuth>) -> Result<Option<crate::config::HostAuth>, ApiError> {
+    let Some(req) = req else { return Ok(None) };
+    if req.username.trim().is_empty() {
+        return Err(ApiError::BadRequest("access_login requires a non-empty username".into()));
+    }
+    if req.password.is_empty() {
+        return match existing {
+            Some(existing) => Ok(Some(crate::config::HostAuth {
+                username: req.username.clone(),
+                password_hash: existing.password_hash.clone(),
+            })),
+            None => Err(ApiError::BadRequest("access_login requires a non-empty password (this host has no existing login gate to keep unchanged)".into())),
+        };
+    }
+    let password_hash = auth::hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Some(crate::config::HostAuth {
+        username: req.username.clone(),
+        password_hash,
+    }))
+}
+
 async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest>) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
     let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
@@ -376,7 +406,8 @@ async fn update_host(
 ) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
     let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
-    let access_login = build_host_login(&body.access_login)?;
+    let existing_access_login = state.hosts().iter().find(|h| h.id == id).and_then(|h| h.access_login.clone());
+    let access_login = build_host_login_for_update(&body.access_login, &existing_access_login)?;
     let updated = ProxyHost {
         id,
         domain: body.domain,
@@ -1284,6 +1315,148 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_host_with_a_blank_password_keeps_the_existing_login_gate_working() {
+        // The admin UI's edit form can only ever prefill a login gate's
+        // username, never its password (GET/PUT never return the hash) --
+        // this is the actual usability behavior that gap requires: a PUT
+        // that changes some other field (here, the username) but leaves
+        // password blank must keep the existing password working rather
+        // than erroring or silently clearing the gate.
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_login":{"username":"viewer","password":"original-password"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+        let original_hash = state.hosts().iter().find(|h| h.id.to_string() == id).unwrap().access_login.as_ref().unwrap().password_hash.clone();
+
+        let update_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/hosts/{id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_login":{"username":"renamed-viewer","password":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_resp.status(), StatusCode::OK);
+
+        let updated = state.hosts().iter().find(|h| h.id.to_string() == id).unwrap().clone();
+        let login = updated.access_login.as_ref().unwrap();
+        assert_eq!(login.username, "renamed-viewer", "the username change must still apply");
+        assert_eq!(login.password_hash, original_hash, "a blank password on update must keep the existing hash unchanged");
+        assert!(auth::verify_password("original-password", &login.password_hash), "the original password must still work");
+    }
+
+    #[tokio::test]
+    async fn update_host_with_a_new_password_replaces_the_existing_hash() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_login":{"username":"viewer","password":"original-password"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+
+        let update_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/hosts/{id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_login":{"username":"viewer","password":"a-brand-new-password"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_resp.status(), StatusCode::OK);
+
+        let updated = state.hosts().iter().find(|h| h.id.to_string() == id).unwrap().clone();
+        let login = updated.access_login.as_ref().unwrap();
+        assert!(auth::verify_password("a-brand-new-password", &login.password_hash));
+        assert!(!auth::verify_password("original-password", &login.password_hash), "the old password must no longer work");
+    }
+
+    #[tokio::test]
+    async fn update_host_with_a_blank_password_and_no_existing_login_gate_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+
+        let update_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/hosts/{id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "access_login":{"username":"viewer","password":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

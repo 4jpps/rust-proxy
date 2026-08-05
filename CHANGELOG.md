@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- Admin UI redesign -- the single long scrolling page is now organized
+  into tabs (Hosts, Firewall Rules, Certificates, DNS Credentials, API
+  Tokens), and every form field gets a real `<label>` grouped into
+  `<fieldset>`s (Basics/TLS-ACME/Access control/Redirect for the host
+  form) instead of one dense row of placeholder-only inputs. Hosts can
+  now be edited after creation (an "Edit" button per row prefills the
+  form and switches it to `PUT /api/hosts/:id`) -- the backend endpoint
+  already existed but the UI never used it. Fixed a real usability trap
+  this surfaced: a host's login-gate password is never returned by the
+  API (only the username), so an edit that touched any *other* field
+  used to force re-entering the password too or fail outright; `PUT
+  /api/hosts/:id` now treats an explicitly-blank password as "keep the
+  existing one" (`api::routes::build_host_login_for_update`), same
+  convention the placeholder text already promised.
 - Multiple DNS-01 providers, DB-backed and multi-credential -- Namecheap
   and AWS Route53 (a from-scratch AWS SigV4 request signer, verified
   against AWS's own published test vectors) join the existing
