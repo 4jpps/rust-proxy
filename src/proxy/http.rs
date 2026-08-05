@@ -105,6 +105,33 @@ pub async fn forward_http(
         }
     }
 
+    // A genuine HTTP/2 request's `req.uri()` is absolute-form (hyper/h2
+    // builds it from the `:scheme`/`:authority`/`:path` pseudo-headers,
+    // same reason the Host-header synthesis above has to exist at all)
+    // -- but the upstream connection below always speaks plain
+    // HTTP/1.1, where an absolute-form request line ("POST
+    // https://host/path HTTP/1.1") is syntactically legal yet means
+    // something different: it's specifically the form a client uses to
+    // address a forward proxy, not an origin server. Must be downgraded
+    // to origin-form (path+query only) before forwarding, done here
+    // (after the Host header above still had `req.uri().host()`/
+    // `port_u16()` available) or the outgoing request line silently
+    // carries the wrong semantics. Confirmed as a real bug via a real
+    // upstream (Proxmox's pveproxy) that rejected the resulting
+    // absolute-form POST outright with its own 400 ("invalid proxy
+    // uri") -- nginx (another real upstream, gitlab.jpps.us) tolerates
+    // an absolute-form request line silently, which is exactly why
+    // this went unnoticed until a POST to a stricter upstream hit it.
+    if req.uri().authority().is_some() {
+        if let Some(path_and_query) = req.uri().path_and_query().cloned() {
+            let mut parts = hyper::http::uri::Parts::default();
+            parts.path_and_query = Some(path_and_query);
+            if let Ok(origin_form) = hyper::Uri::from_parts(parts) {
+                *req.uri_mut() = origin_form;
+            }
+        }
+    }
+
     let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
     let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));
 
@@ -326,6 +353,7 @@ mod tests {
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     #[test]
@@ -659,6 +687,74 @@ mod tests {
             "real.example.com",
             "the upstream must still receive a Host header, synthesized from the h2 request's own :authority"
         );
+    }
+
+    /// Real production bug this guards against: forwarding a genuine
+    /// HTTP/2 client request (absolute-form `req.uri()`, e.g.
+    /// `https://pve.jpps.us/api2/json/access/ticket` -- see the
+    /// `_synthesizes_a_host_header_..._h2_..._` test above for why h2
+    /// requests carry an absolute URI at all) straight through to the
+    /// upstream's HTTP/1.1 connection produced an absolute-form request
+    /// line on the wire ("POST https://host/path HTTP/1.1"), which is
+    /// syntactically legal HTTP/1.1 but specifically means "this
+    /// request is addressed to a forward proxy," not an origin server.
+    /// Confirmed live: Proxmox's `pveproxy` rejected exactly this shape
+    /// of forwarded POST outright with its own `400 invalid proxy uri`
+    /// (a real origin server correctly refusing to guess what an
+    /// absolute-form POST addressed to it as if it were a proxy should
+    /// mean) -- while GET requests to the same path and nginx-backed
+    /// upstreams (gitlab.jpps.us) both silently tolerated it, which is
+    /// exactly why this went unnoticed until a POST hit a stricter
+    /// upstream. This test inspects the literal bytes written to the
+    /// upstream socket (not `Request::uri()` as re-parsed by a hyper
+    /// H1 *server*, which could silently normalize the very thing under
+    /// test) to prove the request line is origin-form on the wire.
+    #[tokio::test]
+    async fn forward_http_downgrades_an_h2_requests_absolute_form_uri_to_origin_form_for_the_http1_upstream() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request_text = String::from_utf8_lossy(&buf[..n]);
+            let request_line = request_text.lines().next().unwrap_or("");
+            let response = if request_line == "POST /api2/json/access/ticket HTTP/1.1" {
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+            } else {
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n"
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let opts = UpstreamOptions { websockets_enabled: false, https: false, tls_verify: true, upstream_host_port: "unused:0", preserve_host: true };
+                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+            });
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .unwrap();
+        });
+
+        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(tcp);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io).await.unwrap();
+        tokio::spawn(conn);
+
+        // Absolute-form URI, exactly what a real HTTP/2 client (every
+        // modern browser) sends -- hyper's h2 client builds the request
+        // from this directly, no literal Host header involved.
+        let req =
+            Request::builder().method("POST").uri("https://pve.jpps.us/api2/json/access/ticket").body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        assert_eq!(resp.status(), 200, "upstream only returns 200 if it saw an origin-form request line -- see the mock's own check");
     }
 
     fn self_signed_server_config(domain: &str) -> rustls::ServerConfig {
