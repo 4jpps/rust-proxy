@@ -1939,6 +1939,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots 0.26.11",
  "wiremock",
  "x509-parser",
 ]

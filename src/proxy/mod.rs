@@ -16,6 +16,7 @@ pub mod login;
 pub mod passthrough;
 pub mod router;
 pub mod tls;
+pub mod upstream_tls;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -251,7 +252,14 @@ async fn handle_https_request(
         return Ok(bad_gateway());
     };
 
-    match http::forward_http(req, upstream, host.websockets).await {
+    let opts = http::UpstreamOptions {
+        websockets_enabled: host.websockets,
+        https: host.upstream_https,
+        tls_verify: host.upstream_tls_verify,
+        upstream_host_port: &host.upstream,
+        preserve_host: host.upstream_preserve_host,
+    };
+    match http::forward_http(req, upstream, opts).await {
         Ok(resp) => Ok(resp),
         Err(err) => {
             tracing::warn!(domain = %host.domain, error = %err, "upstream request failed");
@@ -574,6 +582,9 @@ mod tests {
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: "127.0.0.1:1".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: false,
             acme_enabled: false,
@@ -780,6 +791,9 @@ mod tests {
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: String::new(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: false,
             acme_enabled: false,

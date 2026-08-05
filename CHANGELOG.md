@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+- **HTTPS upstreams, including self-signed ones.** A host's `upstream`
+  was always plain HTTP, even when the internal service behind it spoke
+  TLS itself. Three new per-host settings: `upstream_https` (default
+  `false`, unchanged behavior) makes `forward_http` speak TLS to the
+  upstream over a real `tokio-rustls` client connection instead of
+  plain TCP; `upstream_tls_verify` (default `true`) verifies the
+  upstream's certificate chain against the bundled Mozilla root store
+  (`webpki-roots`, no OpenSSL/system cert store needed) -- set `false`
+  to accept a self-signed or otherwise untrusted upstream cert (the
+  connection is still encrypted, just not authenticated, so this only
+  makes sense for an upstream already reached over a network this proxy
+  otherwise trusts); `upstream_preserve_host` (default `true`) forwards
+  the client's original `Host` header unmodified as before, or `false`
+  rewrites it to the upstream's own `host:port` for a backend that
+  expects to see its own hostname rather than the public-facing one.
+  Verified with real TLS handshakes end-to-end: a real self-signed
+  upstream is reached when verification is off, genuinely rejected when
+  it's on, and the `Host` rewrite is confirmed against what the
+  upstream actually receives -- not just that the code compiles. See
+  `proxy::upstream_tls` and `proxy::http::UpstreamOptions`.
+- **The admin UI now surfaces an existing certificate when adding or
+  editing a host.** Certs are keyed purely by domain
+  (`proxy::tls::select_cert_for_sni`), decoupled from hosts entirely --
+  a cert issued/uploaded beforehand, or left over from a host that was
+  deleted and is now being re-added, was already usable with ACME left
+  off, but there was no way to know that from the host form. Typing a
+  domain that already has a matching cert now shows its expiry and a
+  hint that "Issue/renew a certificate automatically" can safely stay
+  unchecked, instead of leaving the operator to guess or re-issue
+  needlessly.
 - **Split logging into `proxy.log`/`access.log`/`server.log`, plus a
   real per-request admin audit trail.** Everything used to go to one
   interleaved stdout/journald stream. `logging::init` now additionally

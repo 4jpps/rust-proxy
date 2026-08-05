@@ -85,6 +85,13 @@ account_key_path = "/var/lib/rust-proxy/acme-account.key"
 # bind_ip = "10.0.0.2"
 # bind_port = 443
 # upstream = "127.0.0.1:8000"
+# upstream_https/upstream_tls_verify/upstream_preserve_host all default
+# to false/true/true (plain HTTP upstream, matching the original
+# behavior) -- uncomment below if this upstream speaks HTTPS itself
+# (its own cert, self-signed or otherwise).
+# upstream_https = true
+# upstream_tls_verify = false  # accept a self-signed upstream cert; the connection is still encrypted, just not authenticated
+# upstream_preserve_host = true  # false rewrites the Host header sent to the upstream to `upstream`'s own host:port instead of the client's original one
 # websockets = true
 # force_https = true
 # acme_enabled = true
@@ -93,17 +100,11 @@ account_key_path = "/var/lib/rust-proxy/acme-account.key"
 # to "http01" or "dns01" to override; wildcard domains always use
 # dns-01 regardless of this setting.
 # acme_challenge_type = "auto"
-# access_allow_ips restricts which client IPs may reach this host
-# (application layer, independent of the firewall) -- empty/omitted
-# means unrestricted.
-# access_allow_ips = ["10.0.0.0/24"]
-# access_login gates this host behind a real login page (not HTTP Basic
-# Auth -- see the README). password_hash is an argon2 PHC string
-# (generate with `rust-proxy hash-password`), never a plaintext
-# password -- omit this table entirely for no login gate.
-# [hosts.access_login]
-# username = "viewer"
-# password_hash = "$argon2id$v=19$..."
+# acl_ids selects zero or more named, reusable ACLs (IP-allow and/or
+# login gates) by id -- create them from the admin UI's ACLs tab first,
+# then list their ids here. Empty/omitted means unrestricted, same as
+# leaving a host with no ACLs selected in the UI.
+# acl_ids = ["11111111-1111-1111-1111-111111111111"]
 
 # Example redirection host -- old.example.com gets its own ACME cert
 # and redirects every request straight to new.example.com, preserving

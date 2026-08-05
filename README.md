@@ -71,6 +71,17 @@ first boot. After that, sqlite (`admin.db_path`) is the source of
 truth and everything is managed from the admin UI, not by re-editing
 the file.
 
+`upstream` is plain HTTP by default. Set `upstream_https = true` if the
+internal service behind it speaks TLS itself; `upstream_tls_verify`
+(default `true`) checks its certificate against the bundled Mozilla
+root store, or set it `false` to accept a self-signed/untrusted
+upstream cert (still encrypted, just not authenticated -- only
+sensible for an upstream already reached over a network this proxy
+trusts). `upstream_preserve_host` (default `true`) forwards the
+client's original `Host` header unmodified; set it `false` if the
+backend needs to see its own `host:port` instead of the public-facing
+domain this proxy answers for.
+
 Each host picks its own ACME challenge type via `acme_challenge_type`:
 `auto` (the default) uses http-01 when the host has `force_https` on
 (port 80 is already open for the redirect, so no DNS provider
@@ -248,7 +259,7 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 |--------|-------------------------|-------------------------------------------------------------------------------------------|
 | GET    | `/api/dashboard`        | -- (host/port-rule/cert counts, configured `bind_ranges`)                                 |
 | GET    | `/api/hosts`            | --                                                                                         |
-| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","acl_ids","redirect","enabled"}` |
+| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","upstream_https","upstream_tls_verify","upstream_preserve_host","websockets","force_https","acme_enabled","acme_challenge_type","acl_ids","redirect","enabled"}` |
 | PUT    | `/api/hosts/:id`        | same shape as POST                                                                         |
 | DELETE | `/api/hosts/:id`        | --                                                                                         |
 | GET    | `/api/port-rules`       | --                                                                                         |

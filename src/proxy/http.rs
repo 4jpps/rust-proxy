@@ -20,6 +20,35 @@ use crate::state::AppState;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Both a plain `TcpStream` and a `tokio_rustls` TLS-wrapped one need to
+/// end up as the same `TokioIo<_>` type for `hyper::client::conn::http1`
+/// -- this trait lets `forward_http` box either behind one type instead
+/// of duplicating the whole handshake/send/upgrade sequence per branch.
+trait UpstreamIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> UpstreamIo for T {}
+
+/// Everything about how to reach and speak to one host's upstream,
+/// beyond the already-resolved `SocketAddr` -- grouped so `forward_http`
+/// doesn't need a five-argument signature; see each field's own comment
+/// for what it controls.
+pub struct UpstreamOptions<'a> {
+    pub websockets_enabled: bool,
+    /// Whether to speak TLS to the upstream at all -- `config::ProxyHost::upstream_https`.
+    pub https: bool,
+    /// Only consulted when `https` is set -- `config::ProxyHost::upstream_tls_verify`.
+    pub tls_verify: bool,
+    /// The original `host:port` string from `ProxyHost.upstream` (not
+    /// the resolved `SocketAddr`) -- the host part (port stripped) is
+    /// used as the TLS SNI/certificate-name when `https` is set, and
+    /// the whole string is used as the literal `Host` header sent to
+    /// the upstream when `preserve_host` is false.
+    pub upstream_host_port: &'a str,
+    /// `true` forwards the client's original `Host` header unmodified
+    /// (the existing, unchanged behavior). `false` rewrites it to
+    /// `upstream_host_port` instead -- `config::ProxyHost::upstream_preserve_host`.
+    pub preserve_host: bool,
+}
+
 pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
     let has_upgrade_header = req
         .headers()
@@ -36,19 +65,34 @@ pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
 }
 
 /// Forwards `req` to `upstream`, streaming the response body back
-/// unmodified. If `websockets_enabled` and the request is a WebSocket
-/// upgrade, splices the client and upstream connections together after
-/// the 101 response instead of treating it as a normal request/response.
+/// unmodified. If `opts.websockets_enabled` and the request is a
+/// WebSocket upgrade, splices the client and upstream connections
+/// together after the 101 response instead of treating it as a normal
+/// request/response. See `UpstreamOptions` for the HTTPS-upstream/
+/// `Host`-header-rewrite knobs.
 pub async fn forward_http(
     mut req: Request<Incoming>,
     upstream: SocketAddr,
-    websockets_enabled: bool,
+    opts: UpstreamOptions<'_>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, BoxError> {
-    let want_upgrade = websockets_enabled && is_websocket_upgrade(&req);
+    if !opts.preserve_host {
+        let value = hyper::header::HeaderValue::from_str(opts.upstream_host_port)?;
+        req.headers_mut().insert(hyper::header::HOST, value);
+    }
+
+    let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
     let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let stream = TcpStream::connect(upstream).await?;
-    let io = TokioIo::new(stream);
+    let tcp = TcpStream::connect(upstream).await?;
+    let io: TokioIo<Box<dyn UpstreamIo>> = if opts.https {
+        let host_only = opts.upstream_host_port.rsplit_once(':').map_or(opts.upstream_host_port, |(host, _)| host);
+        let server_name = rustls_pki_types::ServerName::try_from(host_only.to_string())?;
+        let config = if opts.tls_verify { super::upstream_tls::verified_client_config() } else { super::upstream_tls::insecure_client_config() };
+        let tls_stream = tokio_rustls::TlsConnector::from(config).connect(server_name, tcp).await?;
+        TokioIo::new(Box::new(tls_stream) as Box<dyn UpstreamIo>)
+    } else {
+        TokioIo::new(Box::new(tcp) as Box<dyn UpstreamIo>)
+    };
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(async move {
         if let Err(err) = conn.with_upgrades().await {
@@ -155,6 +199,7 @@ mod tests {
     use http_body_util::Empty;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
+    use std::sync::Arc;
     use tokio::net::{TcpListener, TcpStream};
 
     #[test]
@@ -342,7 +387,15 @@ mod tests {
             let (stream, _) = proxy_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             let service = service_fn(move |req: Request<Incoming>| async move {
-                forward_http(req, upstream_addr, false).await.map_err(|e| e.to_string())
+                let upstream_host_port = upstream_addr.to_string();
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: false,
+                    tls_verify: true,
+                    upstream_host_port: &upstream_host_port,
+                    preserve_host: true,
+                };
+                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
             });
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
         });
@@ -360,5 +413,132 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-upstream").unwrap(), "yes");
+    }
+
+    /// `preserve_host: false` must rewrite the `Host` header the
+    /// upstream actually receives to `upstream_host_port`, not just
+    /// leave the client's original value on the request untouched.
+    #[tokio::test]
+    async fn forward_http_rewrites_the_host_header_when_preserve_host_is_disabled() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(|req: Request<Incoming>| async move {
+                let seen_host = req.headers().get(hyper::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-seen-host", seen_host).body(body).unwrap())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: false,
+                    tls_verify: true,
+                    upstream_host_port: "backend.internal:9999",
+                    preserve_host: false,
+                };
+                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::builder().uri("/").header(hyper::header::HOST, "public.example.com").body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-seen-host").unwrap(), "backend.internal:9999", "the upstream must see its own host:port, not the client's original Host header");
+    }
+
+    fn self_signed_server_config(domain: &str) -> rustls::ServerConfig {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let entry = crate::proxy::tls::self_signed_entry(domain);
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(entry.cert_chain.clone(), entry.private_key.clone_key())
+            .unwrap()
+    }
+
+    /// Same three-hop shape as `forward_http_proxies_a_real_request_to_a_loopback_upstream`
+    /// (real client -> real "proxy" listener running `forward_http` in
+    /// its `service_fn` -> real upstream), except the upstream here
+    /// speaks real self-signed TLS -- proves `https: true` actually
+    /// completes a real TLS handshake and forwards the request, not
+    /// just that the code compiles or that a verifier type is wired in
+    /// somewhere. `verify: false` accepts it; `verify: true` (the next
+    /// test) must reject the same upstream.
+    async fn run_https_upstream_round_trip(tls_verify: bool) -> Result<Response<Incoming>, BoxError> {
+        let tls_config = Arc::new(self_signed_server_config("upstream.internal"));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = upstream_listener.accept().await else { return };
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+            let Ok(tls_stream) = acceptor.accept(stream).await else { return };
+            let io = TokioIo::new(tls_stream);
+            let service = service_fn(|_req: Request<Incoming>| async {
+                let body: BoxBody<Bytes, hyper::Error> =
+                    Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-upstream-tls", "yes").body(body).unwrap())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: true,
+                    tls_verify,
+                    upstream_host_port: "upstream.internal:0",
+                    preserve_host: true,
+                };
+                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::builder().uri("/").header(hyper::header::HOST, "example.com").body(Empty::<Bytes>::new()).unwrap();
+        sender.send_request(req).await.map_err(|e| Box::new(e) as BoxError)
+    }
+
+    #[tokio::test]
+    async fn forward_http_reaches_a_self_signed_https_upstream_when_verify_is_disabled() {
+        let resp = run_https_upstream_round_trip(false).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-upstream-tls").unwrap(), "yes");
+    }
+
+    /// When `forward_http` fails inside the "proxy" hop's `service_fn`,
+    /// hyper aborts that connection rather than synthesizing a response
+    /// (same reason `handle_https_request` in production converts this
+    /// into an explicit 502 itself instead of relying on hyper to do
+    /// it) -- so from the real client's side, a rejected upstream
+    /// certificate surfaces as the request itself failing, not as a
+    /// successful response carrying an error body.
+    #[tokio::test]
+    async fn forward_http_rejects_a_self_signed_https_upstream_when_verify_is_enabled() {
+        let result = run_https_upstream_round_trip(true).await;
+        assert!(result.is_err(), "a self-signed cert must be rejected when tls_verify is enabled, not silently accepted");
     }
 }

@@ -194,6 +194,31 @@ pub struct ProxyHost {
     /// (and may be left empty) when `redirect` is set.
     #[serde(default)]
     pub upstream: String,
+    /// Whether `upstream` speaks TLS -- an internal service can be
+    /// behind its own HTTPS (its own cert, self-signed or otherwise),
+    /// not just plain HTTP. `false` (the default) is the original,
+    /// unchanged plain-HTTP-upstream behavior.
+    #[serde(default)]
+    pub upstream_https: bool,
+    /// Only consulted when `upstream_https` is set. `true` (the
+    /// default) verifies the upstream's certificate chain against the
+    /// bundled Mozilla root store, same trust model any normal HTTPS
+    /// client uses. `false` accepts any certificate the upstream
+    /// presents, self-signed included -- the connection is still
+    /// encrypted, it just isn't authenticated, so this only makes sense
+    /// for an upstream already reached over a network this proxy
+    /// otherwise trusts (loopback, an internal subnet). See
+    /// `proxy::upstream_tls`.
+    #[serde(default = "default_true")]
+    pub upstream_tls_verify: bool,
+    /// `true` (the default) forwards the client's original `Host`
+    /// header to `upstream` unmodified -- the existing, unchanged
+    /// behavior. `false` rewrites it to `upstream`'s own `host:port`
+    /// instead, for a backend that expects to see its own hostname
+    /// (virtual-hosting on its own name, not the public-facing one this
+    /// proxy answers requests for).
+    #[serde(default = "default_true")]
+    pub upstream_preserve_host: bool,
     #[serde(default)]
     pub websockets: bool,
     #[serde(default = "default_true")]
@@ -735,6 +760,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "198.51.100.9".parse().unwrap(),
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,
@@ -757,6 +785,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "192.168.1.50".parse().unwrap(),
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,
@@ -778,6 +809,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "192.168.1.5".parse().unwrap(),
             bind_port: 443,
             upstream: "127.0.0.1:8000".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,
@@ -799,6 +833,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: "no-port-here".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,
@@ -820,6 +857,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: String::new(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,
@@ -845,6 +885,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: String::new(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,
@@ -929,6 +972,9 @@ dns_api_token = "token-placeholder"
                 bind_ip: "10.0.0.2".parse().unwrap(),
                 bind_port: 443,
                 upstream: "127.0.0.1:9000".into(),
+                upstream_https: false,
+                upstream_tls_verify: true,
+                upstream_preserve_host: true,
                 websockets: false,
                 force_https: true,
                 acme_enabled: true,
@@ -955,6 +1001,9 @@ dns_api_token = "token-placeholder"
                 bind_ip: "10.0.0.2".parse().unwrap(),
                 bind_port: 443,
                 upstream: "127.0.0.1:9000".into(),
+                upstream_https: false,
+                upstream_tls_verify: true,
+                upstream_preserve_host: true,
                 websockets: false,
                 force_https: true,
                 acme_enabled: true,
@@ -977,6 +1026,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,
@@ -1008,6 +1060,9 @@ dns_api_token = "token-placeholder"
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: false,
             force_https: true,
             acme_enabled: true,

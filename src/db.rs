@@ -41,6 +41,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             bind_ip TEXT NOT NULL,
             bind_port INTEGER NOT NULL,
             upstream TEXT NOT NULL,
+            upstream_https INTEGER NOT NULL DEFAULT 0,
+            upstream_tls_verify INTEGER NOT NULL DEFAULT 1,
+            upstream_preserve_host INTEGER NOT NULL DEFAULT 1,
             websockets INTEGER NOT NULL,
             force_https INTEGER NOT NULL,
             acme_enabled INTEGER NOT NULL,
@@ -81,6 +84,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // versions in the wild that leaving a few unused columns behind is
     // a safer bet than risking that migration failing outright.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_https INTEGER NOT NULL DEFAULT 0").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_tls_verify INTEGER NOT NULL DEFAULT 1").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_preserve_host INTEGER NOT NULL DEFAULT 1").execute(pool).await;
 
     // Metadata only -- kind is 'ip_allow' or 'login'; entries live in
     // the two tables below, keyed by acl_list_id. name is UNIQUE so an
@@ -735,7 +741,7 @@ async fn migrate_legacy_host_access(pool: &SqlitePool) -> Result<(), sqlx::Error
 
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, \
+        "SELECT id, domain, bind_ip, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
          acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled FROM hosts",
     )
     .fetch_all(pool)
@@ -768,6 +774,9 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 bind_ip: row.get::<String, _>("bind_ip").parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
                 bind_port: row.get::<i64, _>("bind_port") as u16,
                 upstream: row.get("upstream"),
+                upstream_https: row.get::<i64, _>("upstream_https") != 0,
+                upstream_tls_verify: row.get::<i64, _>("upstream_tls_verify") != 0,
+                upstream_preserve_host: row.get::<i64, _>("upstream_preserve_host") != 0,
                 websockets: row.get::<i64, _>("websockets") != 0,
                 force_https: row.get::<i64, _>("force_https") != 0,
                 acme_enabled: row.get::<i64, _>("acme_enabled") != 0,
@@ -803,15 +812,18 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             None => (None, true as i64, "permanent"),
         };
         sqlx::query(
-            "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, \
+            "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
              acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
         .bind(h.bind_ip.to_string())
         .bind(h.bind_port as i64)
         .bind(&h.upstream)
+        .bind(h.upstream_https as i64)
+        .bind(h.upstream_tls_verify as i64)
+        .bind(h.upstream_preserve_host as i64)
         .bind(h.websockets as i64)
         .bind(h.force_https as i64)
         .bind(h.acme_enabled as i64)
@@ -894,6 +906,9 @@ mod tests {
             bind_ip: "10.0.0.2".parse().unwrap(),
             bind_port: 443,
             upstream: "127.0.0.1:8000".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
             websockets: true,
             force_https: true,
             acme_enabled: true,

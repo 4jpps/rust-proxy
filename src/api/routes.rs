@@ -367,6 +367,12 @@ struct HostRequest {
     #[serde(default)]
     upstream: String,
     #[serde(default)]
+    upstream_https: bool,
+    #[serde(default = "default_true")]
+    upstream_tls_verify: bool,
+    #[serde(default = "default_true")]
+    upstream_preserve_host: bool,
+    #[serde(default)]
     websockets: bool,
     #[serde(default = "default_true")]
     force_https: bool,
@@ -551,6 +557,9 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         bind_ip: body.bind_ip,
         bind_port: body.bind_port,
         upstream: body.upstream,
+        upstream_https: body.upstream_https,
+        upstream_tls_verify: body.upstream_tls_verify,
+        upstream_preserve_host: body.upstream_preserve_host,
         websockets: body.websockets,
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,
@@ -583,6 +592,9 @@ async fn update_host(
         bind_ip: body.bind_ip,
         bind_port: body.bind_port,
         upstream: body.upstream,
+        upstream_https: body.upstream_https,
+        upstream_tls_verify: body.upstream_tls_verify,
+        upstream_preserve_host: body.upstream_preserve_host,
         websockets: body.websockets,
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,

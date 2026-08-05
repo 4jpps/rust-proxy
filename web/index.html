@@ -128,6 +128,12 @@
           <label class="chk"><input type="checkbox" name="force_https" checked> Redirect HTTP &rarr; HTTPS</label>
           <label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label>
         </div>
+        <div class="checks">
+          <label class="chk"><input type="checkbox" name="upstream_https" id="host-upstream-https"> Upstream speaks HTTPS</label>
+          <label class="chk" id="host-upstream-tls-verify-wrap"><input type="checkbox" name="upstream_tls_verify" checked> Verify upstream certificate (uncheck to accept a self-signed one)</label>
+          <label class="chk"><input type="checkbox" name="upstream_preserve_host" checked> Forward the original Host header to upstream (uncheck to send upstream's own host:port instead)</label>
+        </div>
+        <p class="hint" id="host-existing-cert-hint" style="display:none"></p>
       </fieldset>
 
       <fieldset>
@@ -530,12 +536,17 @@ function setHostFormMode(host) {
 
   if (!host) {
     form.reset();
+    toggleUpstreamTlsVerifyVisibility();
     return;
   }
   form.domain.value = host.domain;
   form.bind_ip.value = host.bind_ip;
   form.bind_port.value = host.bind_port;
   form.upstream.value = host.upstream || '';
+  form.upstream_https.checked = host.upstream_https;
+  form.upstream_tls_verify.checked = host.upstream_tls_verify;
+  form.upstream_preserve_host.checked = host.upstream_preserve_host;
+  toggleUpstreamTlsVerifyVisibility();
   form.websockets.checked = host.websockets;
   form.force_https.checked = host.force_https;
   form.enabled.checked = host.enabled;
@@ -551,6 +562,31 @@ function setHostFormMode(host) {
 
 document.getElementById('host-form-cancel').addEventListener('click', () => setHostFormMode(null));
 
+function toggleUpstreamTlsVerifyVisibility() {
+  const upstreamHttps = document.getElementById('host-upstream-https').checked;
+  document.getElementById('host-upstream-tls-verify-wrap').style.display = upstreamHttps ? '' : 'none';
+}
+document.getElementById('host-upstream-https').addEventListener('change', toggleUpstreamTlsVerifyVisibility);
+toggleUpstreamTlsVerifyVisibility();
+
+// Certs are keyed purely by domain (see proxy::tls::select_cert_for_sni),
+// decoupled from hosts entirely -- a cert created beforehand, or left
+// over from a host that was deleted and is now being re-added, is
+// already usable with ACME left off. certsByDomain is populated by
+// refreshCerts() below; this just surfaces that fact while the operator
+// is filling in the domain field, instead of leaving them to guess.
+let certsByDomain = {};
+document.querySelector('#host-form input[name=domain]').addEventListener('input', (e) => {
+  const hint = document.getElementById('host-existing-cert-hint');
+  const cert = certsByDomain[e.target.value.trim().toLowerCase()];
+  if (cert) {
+    hint.style.display = '';
+    hint.textContent = `A certificate for this domain already exists (expires in ${cert.days_remaining} days) -- you can leave "Issue/renew a certificate automatically" unchecked below to keep using it instead of issuing a new one.`;
+  } else {
+    hint.style.display = 'none';
+  }
+});
+
 async function refreshHosts() {
   const hosts = await (await api('/api/hosts')).json();
   const tbody = document.querySelector('#hosts-table tbody');
@@ -560,7 +596,7 @@ async function refreshHosts() {
     const access = (h.acl_ids || []).map((id) => (aclsById[id] ? esc(aclsById[id].name) : '(deleted)')).join(', ');
     const target = h.redirect
       ? `→ ${esc(h.redirect.target)} (${h.redirect.status === 'temporary' ? '302' : '301'})`
-      : esc(h.upstream);
+      : esc(h.upstream) + (h.upstream_https ? ` (https${h.upstream_tls_verify ? '' : ', unverified'})` : '');
     tr.innerHTML = `<td>${esc(h.domain)}</td><td>${esc(h.bind_ip)}:${h.bind_port}</td><td>${target}</td>
       <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
       <td>${esc(h.acme_challenge_type)}</td>
@@ -589,7 +625,11 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
   const dnsCredentialId = fd.get('dns_credential_id');
   const body = {
     domain: fd.get('domain'), bind_ip: fd.get('bind_ip'), bind_port: Number(fd.get('bind_port')),
-    upstream: fd.get('upstream'), websockets: fd.get('websockets') === 'on',
+    upstream: fd.get('upstream'),
+    upstream_https: fd.get('upstream_https') === 'on',
+    upstream_tls_verify: fd.get('upstream_tls_verify') === 'on',
+    upstream_preserve_host: fd.get('upstream_preserve_host') === 'on',
+    websockets: fd.get('websockets') === 'on',
     force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
     acme_challenge_type: fd.get('acme_challenge_type'),
     dns_credential_id: dnsCredentialId ? dnsCredentialId : null,
@@ -668,6 +708,7 @@ document.getElementById('acme-settings-form').addEventListener('submit', async (
 
 async function refreshCerts() {
   const certs = await (await api('/api/certs')).json();
+  certsByDomain = Object.fromEntries(certs.map((c) => [c.domain.toLowerCase(), c]));
   const tbody = document.querySelector('#certs-table tbody');
   tbody.innerHTML = '';
   for (const c of certs) {
