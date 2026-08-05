@@ -1,20 +1,20 @@
 [Unit]
-Description=rust-proxy nightly database backup
+Description=rust-proxy nightly database backup and compact
 After=rust-proxy.service
 
 [Service]
 Type=oneshot
 User=rust-proxy
 Group=rust-proxy
-# %t expands to the runtime directory root, not used here -- backups
-# live alongside the live DB's own state directory, in a dedicated
-# subdirectory so `rust-proxy backup`'s "destination must not already
-# exist" check never collides with anything else.
+# Backups live alongside the live DB's own state directory, in a
+# dedicated subdirectory so `rust-proxy backup-and-compact`'s
+# "destination must not already exist" check never collides with
+# anything else.
 ExecStart=/bin/sh -c '\
   set -e; \
   mkdir -p /var/lib/rust-proxy/backups; \
   dest=/var/lib/rust-proxy/backups/rust-proxy-$(date +%%Y%%m%%dT%%H%%M%%S).db; \
-  /usr/bin/rust-proxy --config /etc/rust-proxy/config.toml backup "$dest"; \
+  /usr/bin/rust-proxy --config /etc/rust-proxy/config.toml backup-and-compact "$dest"; \
   find /var/lib/rust-proxy/backups -name "rust-proxy-*.db" -mtime +14 -delete \
 '
 ReadWritePaths=/var/lib/rust-proxy

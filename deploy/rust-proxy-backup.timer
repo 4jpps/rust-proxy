@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly rust-proxy database backup
+Description=Nightly rust-proxy database backup and compact
 
 [Timer]
 OnCalendar=*-*-* 03:00:00

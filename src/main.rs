@@ -31,16 +31,23 @@ enum Command {
     HashPassword {
         password: String,
     },
-    /// Safely snapshots the live sqlite DB to `destination` -- a full,
-    /// consistent copy even while the daemon is running and actively
-    /// writing, via sqlite's own `VACUUM INTO` (not a raw file copy,
-    /// which could catch the DB mid-write, especially under WAL mode,
-    /// and produce a corrupt copy). `destination` must not already
-    /// exist -- `VACUUM INTO` refuses to overwrite. Driven by
-    /// `rust-proxy-backup.timer` (see deploy/) for the nightly
-    /// automated backup every install gets out of the box; also usable
-    /// by hand before a risky manual change.
-    Backup {
+    /// Safely snapshots the live sqlite DB to `destination`, then
+    /// compacts the live DB in place -- always both together, in that
+    /// order, never just one: a real backup should exist before the
+    /// live file gets rewritten by the compact step, not after.
+    /// `destination` gets a full, consistent copy even while the daemon
+    /// is running and actively writing, via sqlite's own `VACUUM INTO`
+    /// (not a raw file copy, which could catch the DB mid-write,
+    /// especially under WAL mode, and produce a corrupt copy) --
+    /// `destination` must not already exist, `VACUUM INTO` refuses to
+    /// overwrite. The compact step (a plain `VACUUM` against the live
+    /// DB) reclaims space freed by deleted rows and dropped columns,
+    /// which `ALTER TABLE ... DROP COLUMN` alone doesn't shrink the
+    /// file for. Driven by `rust-proxy-backup.timer` (see deploy/) for
+    /// the nightly automated run every install gets out of the box;
+    /// also usable by hand before a risky manual change.
+    #[command(name = "backup-and-compact")]
+    BackupAndCompact {
         destination: PathBuf,
     },
 }
@@ -57,13 +64,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::Config::load(&args.config)?;
 
-    if let Some(Command::Backup { destination }) = &args.command {
+    if let Some(Command::BackupAndCompact { destination }) = &args.command {
         if destination.exists() {
             anyhow::bail!("{} already exists -- refusing to overwrite (VACUUM INTO doesn't support it)", destination.display());
         }
         let pool = db::connect(&cfg.admin.db_path).await?;
         db::backup_to(&pool, destination).await?;
         println!("backed up {} to {}", cfg.admin.db_path.display(), destination.display());
+        db::vacuum(&pool).await?;
+        println!("compacted {}", cfg.admin.db_path.display());
         return Ok(());
     }
 

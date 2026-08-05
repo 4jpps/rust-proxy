@@ -51,6 +51,20 @@ pub async fn backup_to(pool: &SqlitePool, destination: &Path) -> Result<(), sqlx
     Ok(())
 }
 
+/// Compacts the live DB in place -- unlike `backup_to`'s `VACUUM INTO`
+/// (which produces an already-compact *copy*, leaving the live file
+/// untouched), a plain `VACUUM` rewrites the live database file itself,
+/// reclaiming space freed by deleted rows and dropped columns (e.g. the
+/// legacy columns `run_migrations` drops during an upgrade -- `ALTER
+/// TABLE ... DROP COLUMN` alone doesn't shrink the file). Always run
+/// `backup_to` first when compacting as part of a maintenance job --
+/// `VACUUM` rewrites the whole file in place, so a real backup should
+/// exist before that begins, not after.
+pub async fn vacuum(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("VACUUM").execute(pool).await?;
+    Ok(())
+}
+
 async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
@@ -1690,6 +1704,28 @@ mod tests {
         assert!(result.is_err(), "VACUUM INTO must refuse an already-existing destination, not silently overwrite it");
 
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[tokio::test]
+    async fn vacuum_compacts_the_live_db_and_leaves_its_data_intact() {
+        let src = std::env::temp_dir().join(format!("rust-proxy-vacuum-src-{}.db", Uuid::new_v4()));
+        let _ = std::fs::remove_file(&src);
+        let pool = connect(&src).await.unwrap();
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "vacuum test", AclKind::IpAllow, Utc::now()).await.unwrap();
+        // Delete-then-recreate a bunch of rows so there's real freed
+        // space for VACUUM to actually reclaim, not just a no-op on an
+        // already-minimal file.
+        for _ in 0..50 {
+            let id = Uuid::new_v4();
+            create_acl_list(&pool, id, &format!("throwaway {id}"), AclKind::IpAllow, Utc::now()).await.unwrap();
+            delete_acl_list(&pool, id).await.unwrap();
+        }
+
+        vacuum(&pool).await.unwrap();
+
+        assert!(acl_list_name_exists(&pool, "vacuum test").await.unwrap(), "VACUUM must never lose live data");
         let _ = std::fs::remove_file(&src);
     }
 }
