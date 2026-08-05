@@ -71,7 +71,6 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         CREATE TABLE IF NOT EXISTS hosts (
             id TEXT PRIMARY KEY,
             domain TEXT NOT NULL,
-            bind_ip TEXT NOT NULL,
             bind_port INTEGER NOT NULL,
             upstream TEXT NOT NULL,
             upstream_https INTEGER NOT NULL DEFAULT 0,
@@ -81,9 +80,6 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             force_https INTEGER NOT NULL,
             acme_enabled INTEGER NOT NULL,
             acme_challenge_type TEXT NOT NULL DEFAULT 'auto',
-            access_allow_ips TEXT NOT NULL DEFAULT '',
-            access_login_username TEXT,
-            access_login_password_hash TEXT,
             redirect_target TEXT,
             redirect_preserve_path INTEGER NOT NULL DEFAULT 1,
             redirect_status TEXT NOT NULL DEFAULT 'permanent',
@@ -101,38 +97,44 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // `ADD COLUMN IF NOT EXISTS`); the defaults above only apply to
     // genuinely new tables, so this also backfills existing rows.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acme_challenge_type TEXT NOT NULL DEFAULT 'auto'").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_allow_ips TEXT NOT NULL DEFAULT ''").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_login_username TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN access_login_password_hash TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_target TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_preserve_path INTEGER NOT NULL DEFAULT 1").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_status TEXT NOT NULL DEFAULT 'permanent'").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN dns_credential_id TEXT").execute(pool).await;
-    // Comma-joined ACL UUIDs -- same convention as the (now-legacy,
-    // still-present-but-unread-by-new-code) access_allow_ips column
-    // above. The access_allow_ips/access_login_* columns are left in
-    // place, not dropped: migrate_legacy_host_access below reads them
-    // once to preserve any pre-existing per-host access control as a
-    // real ACL, and DROP COLUMN support varies enough across sqlite
-    // versions in the wild that leaving a few unused columns behind is
-    // a safer bet than risking that migration failing outright.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_https INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_tls_verify INTEGER NOT NULL DEFAULT 1").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_preserve_host INTEGER NOT NULL DEFAULT 1").execute(pool).await;
-    // Dual-stack bind: the old single `bind_ip` column (always IPv4) is
-    // left in place, not dropped (same DROP-COLUMN-portability reasoning
-    // as acl_ids above), and its value is copied into bind_ip_v4 once so
-    // a pre-existing row's original single-family bind is preserved
-    // exactly instead of silently gaining an unwanted v6 bind or losing
-    // its v4 one.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
+    // Copy any pre-existing single-family `bind_ip` value (a real
+    // column only on a table created before this cleanup -- a fresh
+    // install's CREATE TABLE above no longer has it) into `bind_ip_v4`
+    // before it's dropped a few lines down, so a pre-existing row's
+    // original bind is preserved as its v4 half instead of lost. Errors
+    // harmlessly on a fresh table (no such column), same as everything
+    // else here.
     let _ = sqlx::query("UPDATE hosts SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
     // Both NULL means no rewrite (ProxyHost.path_rewrite is None); both
     // set together (the API layer never persists just one) means it is.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_pattern TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_replacement TEXT").execute(pool).await;
+    // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
+    // copied above) and `access_allow_ips`/`access_login_username`/
+    // `access_login_password_hash` (superseded by the acl_lists/
+    // acl_ip_entries/acl_credentials tables, migrated forward once by
+    // the now-removed `migrate_legacy_host_access` -- confirmed zero
+    // rows needed it in production before this was written) are real
+    // DROP COLUMNs, not just left inert -- sqlite 3.35+ (this project's
+    // bundled libsqlite3-sys is well above that) supports it, and a
+    // fresh install's CREATE TABLE above never had these columns in the
+    // first place, so DROP COLUMN harmlessly errors (ignored, same
+    // pattern as every ADD COLUMN above) rather than needing its own
+    // "does this column exist" branch.
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN bind_ip").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_allow_ips").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_login_username").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_login_password_hash").execute(pool).await;
 
     // Metadata only -- kind is 'ip_allow' or 'login'; entries live in
     // the two tables below, keyed by acl_list_id. name is UNIQUE so an
@@ -181,13 +183,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
     let _ = sqlx::query("ALTER TABLE acl_credentials ADD COLUMN description TEXT").execute(pool).await;
 
-    migrate_legacy_host_access(pool).await?;
-
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS port_rules (
             id TEXT PRIMARY KEY,
-            bind_ip TEXT NOT NULL,
             port_start INTEGER NOT NULL,
             port_end INTEGER NOT NULL,
             protocol TEXT NOT NULL,
@@ -204,6 +203,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
     let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
+    // See the identical `hosts.bind_ip` comment above -- same
+    // copy-then-drop, errors harmlessly on a fresh table.
     let _ = sqlx::query("UPDATE port_rules SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
     // Comma-joined ACL UUIDs -- same convention as hosts.acl_ids above.
     // Only AclKind::IpAllow lists are meaningful here (see PortRule::acl_ids'
@@ -211,6 +212,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // ignored at read time (nftables::sync_once), not rejected -- there's
     // no application layer on a raw port rule to reject it against.
     let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE port_rules DROP COLUMN bind_ip").execute(pool).await;
 
     // Only `token_hash` is ever persisted -- the plaintext token is shown
     // to the caller exactly once, at creation, and never stored anywhere.
@@ -947,58 +949,6 @@ pub async fn set_expose_admin_port(pool: &SqlitePool, value: bool) -> Result<(),
     Ok(())
 }
 
-/// One-time upgrade path: any host with pre-ACL-system inline
-/// `access_allow_ips`/`access_login_*` data (from before the reusable
-/// ACL system existed) gets that data preserved as a dedicated,
-/// auto-created per-host ACL (named `"<domain> (migrated)"`) instead of
-/// silently losing its access control on upgrade. Only touches hosts
-/// whose `acl_ids` is still empty (the column's own default), so this
-/// is safe to run on every startup -- a host only ever gets migrated
-/// once, even though the legacy columns are deliberately left populated
-/// afterward (see `run_migrations`'s comment on why they're not dropped).
-async fn migrate_legacy_host_access(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT id, domain, access_allow_ips, access_login_username, access_login_password_hash \
-         FROM hosts WHERE acl_ids = '' AND (access_allow_ips != '' OR access_login_username IS NOT NULL)",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    for row in rows {
-        let host_id: String = row.get("id");
-        let domain: String = row.get("domain");
-        let allow_ips: String = row.get("access_allow_ips");
-        let login_username: Option<String> = row.get("access_login_username");
-        let login_password_hash: Option<String> = row.get("access_login_password_hash");
-
-        let mut new_acl_ids = Vec::new();
-
-        if !allow_ips.is_empty() {
-            let acl_id = Uuid::new_v4();
-            create_acl_list(pool, acl_id, &format!("{domain} (migrated)"), AclKind::IpAllow, Utc::now()).await?;
-            let cidrs: Vec<String> = allow_ips.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-            add_acl_ip_entries(pool, acl_id, &cidrs).await?;
-            new_acl_ids.push(acl_id);
-        }
-
-        if let (Some(username), Some(password_hash)) = (login_username, login_password_hash) {
-            let acl_id = Uuid::new_v4();
-            create_acl_list(pool, acl_id, &format!("{domain} (migrated login)"), AclKind::Login, Utc::now()).await?;
-            add_acl_credentials(pool, acl_id, &[(username, password_hash)]).await?;
-            new_acl_ids.push(acl_id);
-        }
-
-        let acl_ids_csv = new_acl_ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
-        sqlx::query("UPDATE hosts SET acl_ids = ? WHERE id = ?")
-            .bind(acl_ids_csv)
-            .bind(host_id)
-            .execute(pool)
-            .await?;
-        tracing::info!(domain, "migrated legacy per-host access control into a new ACL");
-    }
-    Ok(())
-}
-
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
@@ -1082,18 +1032,12 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             None => (None, None),
         };
         sqlx::query(
-            "INSERT INTO hosts (id, domain, bind_ip, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
+            "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
              acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
-        // Legacy `bind_ip` column (NOT NULL) is kept populated with
-        // whichever family is set (v4 preferred) purely so the column's
-        // own constraint is satisfied -- nothing reads it anymore, see
-        // `load_hosts` above and the migration comment near its ALTER
-        // TABLE.
-        .bind(h.bind_ip_v4.map(|ip| ip.to_string()).or_else(|| h.bind_ip_v6.map(|ip| ip.to_string())).unwrap_or_else(|| "0.0.0.0".to_string()))
         .bind(h.bind_ip_v4.map(|ip| ip.to_string()))
         .bind(h.bind_ip_v6.map(|ip| ip.to_string()))
         .bind(h.bind_port as i64)
@@ -1161,10 +1105,9 @@ pub async fn save_port_rules(pool: &SqlitePool, rules: &[PortRule]) -> Result<()
         };
         let acl_ids = r.acl_ids.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>().join(",");
         sqlx::query(
-            "INSERT INTO port_rules (id, bind_ip, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, acl_ids, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO port_rules (id, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, acl_ids, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(r.id.to_string())
-        .bind(r.bind_ip_v4.map(|ip| ip.to_string()).or_else(|| r.bind_ip_v6.map(|ip| ip.to_string())).unwrap_or_else(|| "0.0.0.0".to_string()))
         .bind(r.bind_ip_v4.map(|ip| ip.to_string()))
         .bind(r.bind_ip_v6.map(|ip| ip.to_string()))
         .bind(r.port_start as i64)
@@ -1546,6 +1489,110 @@ mod tests {
         add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", Some("HQ subnet")).await.unwrap();
         let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
         assert_eq!(entries[0].description.as_deref(), Some("HQ subnet"));
+    }
+
+    /// Regression test for the dead-column cleanup: manually recreates
+    /// the pre-cleanup `hosts` schema (the single-family `bind_ip`
+    /// column, plus the pre-ACL-system `access_allow_ips`/
+    /// `access_login_username`/`access_login_password_hash` columns),
+    /// seeds a row with real legacy data the way a genuine production
+    /// upgrade would carry it forward, then proves: the DROP COLUMNs
+    /// actually ran (querying a dropped column errors), and the
+    /// existing row's `bind_ip` was correctly copied into `bind_ip_v4`
+    /// before that column was dropped out from under it -- exactly the
+    /// two ways this migration could have silently lost data.
+    #[tokio::test]
+    async fn run_migrations_drops_legacy_columns_from_a_pre_existing_hosts_table_without_losing_data() {
+        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE hosts (
+                id TEXT PRIMARY KEY,
+                domain TEXT NOT NULL,
+                bind_ip TEXT NOT NULL,
+                bind_port INTEGER NOT NULL,
+                upstream TEXT NOT NULL,
+                websockets INTEGER NOT NULL,
+                force_https INTEGER NOT NULL,
+                acme_enabled INTEGER NOT NULL,
+                acme_challenge_type TEXT NOT NULL DEFAULT 'auto',
+                access_allow_ips TEXT NOT NULL DEFAULT '',
+                access_login_username TEXT,
+                access_login_password_hash TEXT,
+                redirect_target TEXT,
+                redirect_preserve_path INTEGER NOT NULL DEFAULT 1,
+                redirect_status TEXT NOT NULL DEFAULT 'permanent',
+                dns_credential_id TEXT,
+                enabled INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let host_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, enabled) VALUES (?, ?, ?, ?, ?, 0, 1, 0, 1)")
+            .bind(host_id.to_string())
+            .bind("legacy.example.com")
+            .bind("10.0.0.9")
+            .bind(443i64)
+            .bind("127.0.0.1:8000")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        // The dropped columns must genuinely be gone, not just unused.
+        for column in ["bind_ip", "access_allow_ips", "access_login_username", "access_login_password_hash"] {
+            let result = sqlx::query(&format!("SELECT {column} FROM hosts")).fetch_optional(&pool).await;
+            assert!(result.is_err(), "column {column} should have been dropped but a query against it still succeeded");
+        }
+
+        let hosts = load_hosts(&pool).await.unwrap();
+        let host = hosts.iter().find(|h| h.id == host_id).expect("the pre-existing row must survive the migration");
+        assert_eq!(host.bind_ip_v4, Some("10.0.0.9".parse().unwrap()), "the old bind_ip value must have been copied into bind_ip_v4 before bind_ip was dropped");
+        assert_eq!(host.domain, "legacy.example.com");
+    }
+
+    /// Same regression coverage as the `hosts` test above, for
+    /// `port_rules.bind_ip`.
+    #[tokio::test]
+    async fn run_migrations_drops_legacy_bind_ip_from_a_pre_existing_port_rules_table_without_losing_data() {
+        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE port_rules (
+                id TEXT PRIMARY KEY,
+                bind_ip TEXT NOT NULL,
+                port_start INTEGER NOT NULL,
+                port_end INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                description TEXT NOT NULL,
+                passthrough_target TEXT,
+                enabled INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rule_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO port_rules (id, bind_ip, port_start, port_end, protocol, description, enabled) VALUES (?, ?, ?, ?, ?, ?, 1)")
+            .bind(rule_id.to_string())
+            .bind("10.0.0.9")
+            .bind(21115i64)
+            .bind(21115i64)
+            .bind("tcp")
+            .bind("rustdesk")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let result = sqlx::query("SELECT bind_ip FROM port_rules").fetch_optional(&pool).await;
+        assert!(result.is_err(), "bind_ip should have been dropped but a query against it still succeeded");
+
+        let rules = load_port_rules(&pool).await.unwrap();
+        let rule = rules.iter().find(|r| r.id == rule_id).expect("the pre-existing row must survive the migration");
+        assert_eq!(rule.bind_ip_v4, Some("10.0.0.9".parse().unwrap()), "the old bind_ip value must have been copied into bind_ip_v4 before bind_ip was dropped");
     }
 
     #[tokio::test]
