@@ -63,6 +63,14 @@ pub enum OrderStatus {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Authorization {
+    /// Per RFC 8555 §7.1.4, a wildcard identifier's `value` here is
+    /// already the bare apex (`example.com`, never `*.example.com`) --
+    /// a combined wildcard+apex order's two authorizations (see
+    /// `acme::domains_for_issuance`) report the identical
+    /// `identifier.value` and are otherwise indistinguishable, but
+    /// nothing here needs to tell them apart: each is fulfilled
+    /// identically (its own dns-01 challenge, its own TXT record at the
+    /// same `_acme-challenge.<apex>` name).
     pub identifier: Identifier,
     pub status: AuthorizationStatus,
     pub challenges: Vec<Challenge>,

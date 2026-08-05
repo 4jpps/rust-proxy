@@ -160,6 +160,16 @@ pub struct AcmeConfig {
     /// Renew when fewer than this many days remain before expiry.
     #[serde(default = "default_renew_before_days")]
     pub renew_before_days: i64,
+    /// Requested (not guaranteed) in every issued certificate's Subject
+    /// -- see `acme::cert::generate_csr`'s doc comment for why most
+    /// public CAs (Let's Encrypt included) silently discard this for
+    /// Domain Validated certs, and when it actually lands in the issued
+    /// cert (a private/enterprise ACME CA that does organization
+    /// vetting).
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub organizational_unit: Option<String>,
 }
 
 fn default_acme_directory() -> String {

@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+- **Fixed a real production routing bug: a request's own `Host` header
+  now always wins over the TLS connection's SNI when they disagree.**
+  `sni` is captured once per TLS connection at handshake time, but a
+  single connection can carry requests for more than one domain -- HTTP/2
+  connection coalescing (RFC 7540 §9.1.1) lets a browser reuse an
+  existing connection for a *different* origin whenever the connection's
+  certificate also covers it (exactly what a wildcard/SAN cert does),
+  and each request on that connection still carries its own real
+  `:authority`/`Host`. Routing by SNI first sent every request after the
+  first to whichever host the connection originally happened to be for.
+  Confirmed as a real production bug: visiting store.jpps.us right after
+  proxy.jpps.us (both under the same `*.jpps.us` wildcard cert, same
+  bind_ip:port) served proxy.jpps.us's admin login page instead of the
+  store. `sni` is still what `proxy::tls::CertResolver` uses to pick the
+  TLS certificate itself; this only changes which *host* a request
+  routes to. New regression test reproduces the exact scenario (two
+  hosts, one stale connection-level SNI, a `Host` header for the other)
+  and confirms the fix. See `proxy::handle_https_request`.
+- **A wildcard cert now also covers its own bare apex** (`*.example.com`
+  automatically requests `example.com` too, as a second SAN in the same
+  certificate) -- matching how certbot/acme.sh commonly issue combined
+  wildcard+apex certs, and how most operators expect a wildcard cert to
+  behave. A wildcard alone never covers its own apex (standard X.509
+  semantics), so this used to require a second, separately-managed
+  certificate. Applies to both per-host ACME issuance and the standalone
+  DNS-01 feature. Both authorizations validate via dns-01 against the
+  *same* TXT record name (`_acme-challenge.example.com` -- a wildcard
+  authorization's identifier is already the bare apex per RFC 8555) but
+  with different content per challenge token; real DNS "create record"
+  APIs add rather than overwrite, so both coexist and are independently
+  cleaned up by their own record ids, with whatever was already created
+  cleaned up even if a later record's creation fails partway through.
+  The issued cert is published under *both* domain keys -- publishing
+  only under the wildcard would leave the apex SAN practically
+  unreachable, since `proxy::tls::select_cert_for_sni`'s wildcard
+  fallback deliberately never matches the bare parent either. See
+  `acme::domains_for_issuance` and `acme::issue_via_dns01`.
+- **Organization/Organizational Unit requested in every issued CSR's
+  Subject**, via new `acme.organization`/`acme.organizational_unit`
+  config.toml fields. Only ever a *request*, not a guarantee -- Let's
+  Encrypt and virtually every public CA issue Domain Validated certs,
+  which by definition can't vouch for organizational identity, so these
+  fields are silently discarded by their CAs; they only actually land in
+  the issued certificate against a private/enterprise ACME CA that
+  performs real organization vetting. See `acme::cert::generate_csr`.
 - **HTTPS upstreams, including self-signed ones.** A host's `upstream`
   was always plain HTTP, even when the internal service behind it spoke
   TLS itself. Three new per-host settings: `upstream_https` (default

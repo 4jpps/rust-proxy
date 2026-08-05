@@ -90,7 +90,19 @@ and `dns01` force one or the other explicitly. A wildcard domain
 (`*.example.com`) always uses dns-01 regardless of this setting -- CAs
 never offer http-01 for a wildcard identifier. Choosing `http01`
 without `force_https` still opens a port-80 listener/firewall rule for
-that host, just to answer the challenge.
+that host, just to answer the challenge. A wildcard's own bare apex
+(`example.com`) is automatically requested as a second SAN in the same
+certificate -- a wildcard alone never covers its own apex (standard
+X.509 semantics), so this matches how certbot/acme.sh commonly issue
+combined wildcard+apex certs instead of requiring two separately
+managed certificates.
+
+`acme.organization`/`acme.organizational_unit` (config.toml only, both
+optional) are requested in every issued CSR's Subject -- only ever a
+*request*, not a guarantee, since Let's Encrypt and virtually every
+public CA issue Domain Validated certs that silently discard Subject
+fields beyond the SAN list; useful mainly against a private/enterprise
+ACME CA that performs real organization vetting.
 
 Each host can also gate access at the application layer, independent of
 `network.bind_ranges` and the nftables firewall -- the same idea as

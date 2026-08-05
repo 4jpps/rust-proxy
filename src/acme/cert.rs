@@ -31,8 +31,18 @@ pub struct GeneratedCsr {
 }
 
 /// One fresh key pair + CSR per issuance -- the leaf key is never reused
-/// across renewals.
-pub fn generate_csr(domains: &[String]) -> Result<GeneratedCsr, CertError> {
+/// across renewals. `organization`/`organizational_unit` (from
+/// `AcmeConfig`) are included in the CSR's Subject when set -- purely a
+/// *request*, not a guarantee: Let's Encrypt and virtually every public
+/// CA issue Domain Validated certs, which by definition can't vouch for
+/// organizational identity, so Subject fields beyond CN are silently
+/// discarded by their CAs (boulder, LE's issuer, does this
+/// unconditionally). This only actually lands in the issued certificate
+/// against a CA that performs real organization vetting (a private/
+/// enterprise ACME CA such as step-ca configured for OV) -- worth
+/// sending regardless, since it costs nothing against a CA that ignores
+/// it and is exactly what's needed against one that doesn't.
+pub fn generate_csr(domains: &[String], organization: Option<&str>, organizational_unit: Option<&str>) -> Result<GeneratedCsr, CertError> {
     let key_pair = KeyPair::generate()?;
     let mut params = CertificateParams::new(domains.to_vec())?;
     // `CertificateParams::new` (via its `Default` impl) hard-codes the
@@ -43,13 +53,21 @@ pub fn generate_csr(domains: &[String]) -> Result<GeneratedCsr, CertError> {
     // validation rejects it outright ("Cannot issue for \"rcgen self
     // signed cert\": Domain name contains an invalid character" --
     // rejectedIdentifier, confirmed against a real production
-    // failure). Clearing the DN entirely is standard ACME CSR practice
-    // anyway: the SAN extension (already set from `domains` above) is
-    // what CAs actually validate against; a Subject CN is optional and,
-    // per current CA/Browser Forum guidance, increasingly expected to
-    // be absent or to exactly match a SAN entry rather than carry a
-    // placeholder.
-    params.distinguished_name = rcgen::DistinguishedName::new();
+    // failure). Clearing the DN entirely first is standard ACME CSR
+    // practice anyway: the SAN extension (already set from `domains`
+    // above) is what CAs actually validate against; a Subject CN is
+    // optional and, per current CA/Browser Forum guidance, increasingly
+    // expected to be absent or to exactly match a SAN entry rather than
+    // carry a placeholder -- so this never sets one, only O/OU when
+    // configured.
+    let mut dn = rcgen::DistinguishedName::new();
+    if let Some(organization) = organization {
+        dn.push(rcgen::DnType::OrganizationName, organization);
+    }
+    if let Some(organizational_unit) = organizational_unit {
+        dn.push(rcgen::DnType::OrganizationalUnitName, organizational_unit);
+    }
+    params.distinguished_name = dn;
     let csr = params.serialize_request(&key_pair)?;
     Ok(GeneratedCsr {
         der: csr.der().as_ref().to_vec(),
@@ -100,7 +118,7 @@ mod tests {
 
     #[test]
     fn generates_a_der_csr_for_a_single_domain() {
-        let csr = generate_csr(&["example.com".to_string()]).unwrap();
+        let csr = generate_csr(&["example.com".to_string()], None, None).unwrap();
         assert!(!csr.der.is_empty());
         assert!(csr.key_pair_pem.contains("BEGIN PRIVATE KEY") || csr.key_pair_pem.contains("BEGIN EC PRIVATE KEY"));
     }
@@ -115,7 +133,7 @@ mod tests {
     /// loudly if a future rcgen upgrade reintroduces a default CN.
     #[test]
     fn csr_never_contains_rcgens_placeholder_common_name() {
-        let csr = generate_csr(&["example.com".to_string()]).unwrap();
+        let csr = generate_csr(&["example.com".to_string()], None, None).unwrap();
         let placeholder = b"rcgen self signed cert";
         assert!(
             !csr.der.windows(placeholder.len()).any(|w| w == placeholder),
@@ -124,14 +142,36 @@ mod tests {
     }
 
     #[test]
+    fn organization_and_organizational_unit_are_absent_from_the_csr_when_not_set() {
+        let csr = generate_csr(&["example.com".to_string()], None, None).unwrap();
+        // ASN.1 for these two -- if they're not requested at all,
+        // neither string should appear anywhere in the DER, regardless
+        // of encoding position.
+        assert!(!csr.der.windows(b"Acme Corp".len()).any(|w| w == b"Acme Corp"));
+    }
+
+    #[test]
+    fn organization_and_organizational_unit_are_embedded_in_the_csr_when_set() {
+        let csr = generate_csr(&["example.com".to_string()], Some("Acme Corp"), Some("Platform Engineering")).unwrap();
+        assert!(
+            csr.der.windows(b"Acme Corp".len()).any(|w| w == b"Acme Corp"),
+            "organization must actually be present in the CSR's Subject DN"
+        );
+        assert!(
+            csr.der.windows(b"Platform Engineering".len()).any(|w| w == b"Platform Engineering"),
+            "organizational_unit must actually be present in the CSR's Subject DN"
+        );
+    }
+
+    #[test]
     fn generates_a_csr_covering_multiple_sans() {
-        let csr = generate_csr(&["example.com".to_string(), "www.example.com".to_string()]).unwrap();
+        let csr = generate_csr(&["example.com".to_string(), "www.example.com".to_string()], None, None).unwrap();
         assert!(!csr.der.is_empty());
     }
 
     #[test]
     fn build_cert_entry_rejects_empty_chain() {
-        let csr = generate_csr(&["example.com".to_string()]).unwrap();
+        let csr = generate_csr(&["example.com".to_string()], None, None).unwrap();
         let err = build_cert_entry("", &csr.key_pair_pem).unwrap_err();
         assert!(matches!(err, CertError::EmptyChain));
     }

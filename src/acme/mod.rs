@@ -152,17 +152,56 @@ pub enum IssuanceError {
 /// up on the way out, success or failure.
 pub async fn issue_certificate(state: &AppState, client: &AcmeClient, http: &reqwest::Client, host: &ProxyHost) -> Result<(), IssuanceError> {
     let domain = &host.domain;
-    let (order_url, order, authz, authz_url) = create_order_and_authz(client, domain).await?;
+    let domains = domains_for_issuance(domain);
+    let (order_url, order, authzs) = create_order_and_authzs(client, &domains).await?;
+    let identity = csr_identity(state);
 
     let issued = match resolve_challenge_type(host) {
         ChallengeMethod::Dns01 => {
             let credential = resolve_dns_credential(state.db(), domain, host.dns_credential_id).await?;
             let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
-            issue_via_dns01(client, dns01.as_ref(), domain, &authz, &authz_url, &order_url, &order.finalize).await?
+            issue_via_dns01(client, dns01.as_ref(), &domains, &authzs, &order_url, &order.finalize, identity).await?
         }
-        ChallengeMethod::Http01 => issue_via_http01(state, client, domain, &authz, &authz_url, &order_url, &order.finalize).await?,
+        // Never wildcard here -- resolve_challenge_type always forces
+        // Dns01 for a wildcard domain, so domains_for_issuance never
+        // added a second SAN and authzs has exactly one entry.
+        ChallengeMethod::Http01 => {
+            let (authz_url, authz) = &authzs[0];
+            issue_via_http01(state, client, domain, authz, authz_url, &order_url, &order.finalize, identity).await?
+        }
     };
-    publish_cert(state, domain, &issued).await
+    publish_cert(state, &domains, &issued).await
+}
+
+/// Optional Subject O/OU to request in every CSR this issuance flow
+/// generates -- see `cert::generate_csr`'s doc comment for why this is
+/// only ever a request, never a guarantee, against most public CAs.
+#[derive(Debug, Clone, Copy, Default)]
+struct CsrIdentity<'a> {
+    organization: Option<&'a str>,
+    organizational_unit: Option<&'a str>,
+}
+
+fn csr_identity(state: &AppState) -> CsrIdentity<'_> {
+    CsrIdentity {
+        organization: state.acme().organization.as_deref(),
+        organizational_unit: state.acme().organizational_unit.as_deref(),
+    }
+}
+
+/// The domain(s) to actually request from the CA for one issuance -- a
+/// wildcard domain also requests its own bare apex as a second SAN in
+/// the same certificate (`*.example.com` + `example.com`), matching how
+/// certbot/acme.sh commonly issue combined wildcard+apex certificates:
+/// a wildcard alone never covers its own apex (standard X.509 wildcard
+/// semantics -- `*.example.com` doesn't match `example.com`), so most
+/// operators want both from one order rather than two separately
+/// managed certificates. A non-wildcard domain is unaffected.
+fn domains_for_issuance(domain: &str) -> Vec<String> {
+    match domain.strip_prefix("*.") {
+        Some(apex) => vec![domain.to_string(), apex.to_string()],
+        None => vec![domain.to_string()],
+    }
 }
 
 /// Same dns-01 issuance flow as `issue_certificate`, but for a domain
@@ -181,63 +220,107 @@ pub async fn issue_standalone_dns01_certificate(
     domain: &str,
     dns_credential_id: Option<uuid::Uuid>,
 ) -> Result<(), IssuanceError> {
-    let (order_url, order, authz, authz_url) = create_order_and_authz(client, domain).await?;
+    let domains = domains_for_issuance(domain);
+    let (order_url, order, authzs) = create_order_and_authzs(client, &domains).await?;
     let credential = resolve_dns_credential(state.db(), domain, dns_credential_id).await?;
     let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
-    let issued = issue_via_dns01(client, dns01.as_ref(), domain, &authz, &authz_url, &order_url, &order.finalize).await?;
-    publish_cert(state, domain, &issued).await
+    let issued = issue_via_dns01(client, dns01.as_ref(), &domains, &authzs, &order_url, &order.finalize, csr_identity(state)).await?;
+    publish_cert(state, &domains, &issued).await
 }
 
-async fn create_order_and_authz(client: &AcmeClient, domain: &str) -> Result<(String, types::Order, Authorization, String), IssuanceError> {
-    let (order_url, order) = client.new_order(&[domain.to_string()]).await?;
-    let authz_url = order
-        .authorizations
-        .first()
-        .ok_or_else(|| IssuanceError::NoAuthorization(domain.to_string()))?
-        .clone();
-    let authz = client.get_authorization(&authz_url).await?;
-    Ok((order_url, order, authz, authz_url))
+/// Fetches every authorization the order actually contains -- one per
+/// requested identifier (see `domains_for_issuance`: a wildcard+apex
+/// combined order has two), in the same order `domains` lists them
+/// (RFC 8555 doesn't guarantee this ordering itself, but nothing here
+/// currently depends on it -- each authorization carries its own
+/// `identifier`/`wildcard` fields, which is what `issue_via_dns01` keys
+/// off of).
+async fn create_order_and_authzs(client: &AcmeClient, domains: &[String]) -> Result<(String, types::Order, Vec<(String, Authorization)>), IssuanceError> {
+    let (order_url, order) = client.new_order(domains).await?;
+    if order.authorizations.is_empty() {
+        return Err(IssuanceError::NoAuthorization(domains.join(", ")));
+    }
+    let mut authzs = Vec::with_capacity(order.authorizations.len());
+    for url in &order.authorizations {
+        let authz = client.get_authorization(url).await?;
+        authzs.push((url.clone(), authz));
+    }
+    Ok((order_url, order, authzs))
 }
 
+/// Fulfills every authorization in `authzs` via dns-01 -- for a combined
+/// wildcard+apex order this means two TXT records at the *same* record
+/// name (`_acme-challenge.example.com`, since a wildcard authorization's
+/// `identifier.value` per RFC 8555 is already the bare apex) but with
+/// different content, since each authorization has its own challenge
+/// token. Real DNS providers' "create record" APIs add a new record
+/// rather than overwrite (confirmed against Cloudflare's own API
+/// shape), so both coexist and are cleaned up independently by their
+/// own record ids. If creating any record fails partway through,
+/// whatever was already created is still cleaned up before returning.
 async fn issue_via_dns01(
     client: &AcmeClient,
     dns01: &dyn DnsProvider,
-    domain: &str,
-    authz: &Authorization,
-    authz_url: &str,
+    domains: &[String],
+    authzs: &[(String, Authorization)],
     order_url: &str,
     finalize_url: &str,
+    identity: CsrIdentity<'_>,
 ) -> Result<IssuedCert, IssuanceError> {
-    let challenge = authz
-        .challenges
-        .iter()
-        .find(|c| c.typ == "dns-01")
-        .ok_or_else(|| IssuanceError::NoDns01Challenge(domain.to_string()))?;
-
-    let txt_value = dns01_txt_value(&challenge.token, client.account_key());
-    let record_name = acme_challenge_record_name(domain);
-    // Zone lookup wants the real domain, not the wildcard label -- no
-    // DNS zone is ever literally named "*.something".
-    let zone_lookup_domain = domain.strip_prefix("*.").unwrap_or(domain);
+    // Zone lookup wants a real domain, not the wildcard label -- no DNS
+    // zone is ever literally named "*.something". `domains[0]` always
+    // exists (`domains_for_issuance` never returns empty).
+    let zone_lookup_domain = domains[0].strip_prefix("*.").unwrap_or(&domains[0]);
     let zone = dns01.find_zone(zone_lookup_domain).await?;
-    let record_id = dns01.create_txt_record(&zone, &record_name, &txt_value).await?;
 
-    // Real DNS propagation before an authoritative resolver-facing CA
-    // check succeeds is minutes, not seconds; http-01 has no equivalent
-    // wait since the challenge is served straight from memory.
-    tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
+    let mut pending: Vec<(String, String)> = Vec::with_capacity(authzs.len());
+    let mut record_ids: Vec<String> = Vec::with_capacity(authzs.len());
+    let create_result: Result<(), IssuanceError> = async {
+        for (authz_url, authz) in authzs {
+            let challenge = authz
+                .challenges
+                .iter()
+                .find(|c| c.typ == "dns-01")
+                .ok_or_else(|| IssuanceError::NoDns01Challenge(authz.identifier.value.clone()))?;
+            let txt_value = dns01_txt_value(&challenge.token, client.account_key());
+            let record_name = acme_challenge_record_name(&authz.identifier.value);
+            let record_id = dns01.create_txt_record(&zone, &record_name, &txt_value).await?;
+            record_ids.push(record_id);
+            pending.push((authz_url.clone(), challenge.url.clone()));
+        }
+        Ok(())
+    }
+    .await;
 
-    // Everything from here on must still clean up the TXT record even on
-    // failure -- run the rest of the flow and clean up unconditionally
-    // afterward rather than threading `?` straight through.
-    let result = complete_order(client, &challenge.url, authz_url, order_url, finalize_url, domain).await;
+    // Everything from here on must still clean up every TXT record
+    // created so far, even on failure -- run the rest of the flow and
+    // clean up unconditionally afterward rather than threading `?`
+    // straight through.
+    let result = match create_result {
+        Ok(()) => {
+            // Real DNS propagation before an authoritative resolver-facing
+            // CA check succeeds is minutes, not seconds; http-01 has no
+            // equivalent wait since the challenge is served straight from
+            // memory.
+            tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
+            complete_order(client, &pending, order_url, finalize_url, domains, identity).await
+        }
+        Err(err) => Err(err),
+    };
 
-    if let Err(err) = dns01.delete_txt_record(&zone, &record_id).await {
-        tracing::warn!(domain, error = %err, "failed to clean up ACME challenge TXT record (left dangling with the DNS provider)");
+    for record_id in &record_ids {
+        if let Err(err) = dns01.delete_txt_record(&zone, record_id).await {
+            tracing::warn!(domains = %domains.join(", "), error = %err, "failed to clean up ACME challenge TXT record (left dangling with the DNS provider)");
+        }
     }
     result
 }
 
+// http-01 never applies to a wildcard (resolve_challenge_type forces
+// dns-01 for those), so this never needs the CsrIdentity/pending-list
+// generality issue_via_dns01 does -- one extra param over clippy's
+// default threshold, all of them meaningfully distinct.
+#[allow(clippy::too_many_arguments)]
 async fn issue_via_http01(
     state: &AppState,
     client: &AcmeClient,
@@ -246,6 +329,7 @@ async fn issue_via_http01(
     authz_url: &str,
     order_url: &str,
     finalize_url: &str,
+    identity: CsrIdentity<'_>,
 ) -> Result<IssuedCert, IssuanceError> {
     let challenge = authz
         .challenges
@@ -256,10 +340,12 @@ async fn issue_via_http01(
     let key_authorization = http01::key_authorization(&challenge.token, client.account_key());
     state.set_http01_challenge(challenge.token.clone(), key_authorization);
 
-    // Same unconditional-cleanup shape as dns-01's TXT record -- the
+    // Same unconditional-cleanup shape as dns-01's TXT record(s) -- the
     // in-memory token must not outlive this one validation attempt,
     // success or failure.
-    let result = complete_order(client, &challenge.url, authz_url, order_url, finalize_url, domain).await;
+    let pending = vec![(authz_url.to_string(), challenge.url.clone())];
+    let domains = vec![domain.to_string()];
+    let result = complete_order(client, &pending, order_url, finalize_url, &domains, identity).await;
     state.remove_http01_challenge(&challenge.token);
     result
 }
@@ -269,34 +355,34 @@ struct IssuedCert {
     key_pem: String,
 }
 
-/// Waits for the DNS-01 challenge to validate, then finalizes the order
-/// and downloads the full chain PEM.
+/// Waits for every `(authz_url, challenge_url)` pair in `pending` to
+/// validate (notifying each challenge first, then polling each
+/// authorization -- a combined wildcard+apex order has two of these,
+/// everything else has exactly one), then finalizes the order with a
+/// CSR covering every domain and downloads the full chain PEM.
 ///
 /// `finalize_url` (the order's own `finalize` field) and `order_url` (its
 /// `Location`, used for polling) are two distinct RFC 8555 endpoints --
 /// conflating them is a real interop risk even though some servers are
 /// lenient about it.
-async fn complete_order(
-    client: &AcmeClient,
-    challenge_url: &str,
-    authz_url: &str,
-    order_url: &str,
-    finalize_url: &str,
-    domain: &str,
-) -> Result<IssuedCert, IssuanceError> {
-    client.notify_challenge_ready(challenge_url).await?;
-
-    let authz = poll_until(
-        || client.get_authorization(authz_url),
-        |a| a.status != AuthorizationStatus::Pending,
-        "authorization",
-    )
-    .await?;
-    if authz.status != AuthorizationStatus::Valid {
-        return Err(IssuanceError::AuthorizationFailed(domain.to_string(), authz.status));
+async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order_url: &str, finalize_url: &str, domains: &[String], identity: CsrIdentity<'_>) -> Result<IssuedCert, IssuanceError> {
+    for (_, challenge_url) in pending {
+        client.notify_challenge_ready(challenge_url).await?;
     }
 
-    let csr = cert::generate_csr(&[domain.to_string()])?;
+    for (authz_url, _) in pending {
+        let authz = poll_until(
+            || client.get_authorization(authz_url),
+            |a| a.status != AuthorizationStatus::Pending,
+            "authorization",
+        )
+        .await?;
+        if authz.status != AuthorizationStatus::Valid {
+            return Err(IssuanceError::AuthorizationFailed(domains.join(", "), authz.status));
+        }
+    }
+
+    let csr = cert::generate_csr(domains, identity.organization, identity.organizational_unit)?;
     let order = client.finalize(finalize_url, &csr.der).await?;
     let order = poll_until(
         || client.poll_order(order_url),
@@ -318,11 +404,25 @@ async fn complete_order(
     })
 }
 
-async fn publish_cert(state: &AppState, domain: &str, issued: &IssuedCert) -> Result<(), IssuanceError> {
+/// Publishes the issued cert under every requested domain -- for a
+/// combined wildcard+apex order (`domains_for_issuance`) that's both
+/// `*.example.com` and `example.com`. This matters beyond bookkeeping:
+/// `proxy::tls::select_cert_for_sni` only ever falls back from an exact
+/// SNI match to a `*.parent` wildcard cert, *never* to the bare parent
+/// itself (standard X.509 wildcard semantics -- confirmed by
+/// `wildcard_host_does_not_match_the_bare_parent_domain`), so a cert
+/// published only under the wildcard key would leave the apex SAN
+/// entirely unreachable for TLS despite being right there in the
+/// certificate. Persisted to disk under each domain's own directory
+/// too, so `load_certs_from_disk` restores every entry after a restart
+/// the same way live issuance published them.
+async fn publish_cert(state: &AppState, domains: &[String], issued: &IssuedCert) -> Result<(), IssuanceError> {
     let entry = cert::build_cert_entry(&issued.chain_pem, &issued.key_pem)?;
-    persist_cert_files(&state.acme().cert_dir, domain, &issued.chain_pem, &issued.key_pem)?;
-    state.upsert_cert(domain.to_string(), entry);
-    tracing::info!(domain, "certificate issued and published");
+    for domain in domains {
+        persist_cert_files(&state.acme().cert_dir, domain, &issued.chain_pem, &issued.key_pem)?;
+        state.upsert_cert(domain.clone(), entry.clone());
+    }
+    tracing::info!(domains = %domains.join(", "), "certificate issued and published");
     Ok(())
 }
 
@@ -567,6 +667,16 @@ mod tests {
         assert!(!opens_port_80_for_acme(&h));
     }
 
+    #[test]
+    fn domains_for_issuance_adds_the_bare_apex_for_a_wildcard_domain() {
+        assert_eq!(domains_for_issuance("*.example.com"), vec!["*.example.com".to_string(), "example.com".to_string()]);
+    }
+
+    #[test]
+    fn domains_for_issuance_is_unchanged_for_a_non_wildcard_domain() {
+        assert_eq!(domains_for_issuance("app.example.com"), vec!["app.example.com".to_string()]);
+    }
+
     #[tokio::test]
     async fn resolve_dns_credential_uses_the_single_existing_credential_when_none_is_specified() {
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
@@ -643,6 +753,8 @@ mod tests {
                 cert_dir: tmp.join("certs"),
                 account_key_path: tmp.join("account.key"),
                 renew_before_days: 30,
+                organization: None,
+                organizational_unit: None,
             },
             hosts: vec![],
             port_rules: vec![],

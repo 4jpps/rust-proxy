@@ -76,6 +76,16 @@ account_key_path = "/var/lib/rust-proxy/acme-account.key"
 # https://acme-staging-v02.api.letsencrypt.org/directory while testing,
 # to avoid production rate limits.
 # renew_before_days = 30
+#
+# organization/organizational_unit are requested in every issued CSR's
+# Subject -- but only ever a *request*, not a guarantee: Let's Encrypt
+# and virtually every public CA issue Domain Validated certs, which by
+# definition can't vouch for organizational identity, so these are
+# silently discarded by their CAs. They only actually land in the
+# issued certificate against a private/enterprise ACME CA that performs
+# real organization vetting (e.g. step-ca configured for OV).
+# organization = "Your Company, Inc."
+# organizational_unit = "IT Department"
 
 # Example host -- proxies https://app.example.com on 10.0.0.2:443 to a
 # local service on 127.0.0.1:8000, with a websocket toggle and an ACME

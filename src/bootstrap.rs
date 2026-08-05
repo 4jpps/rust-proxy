@@ -110,6 +110,8 @@ mod tests {
                 cert_dir: PathBuf::from("/tmp/rust-proxy-bootstrap-test-certs"),
                 account_key_path: PathBuf::from("/tmp/rust-proxy-bootstrap-test-account.key"),
                 renew_before_days: 30,
+                organization: None,
+                organizational_unit: None,
             },
             hosts: vec![],
             port_rules: vec![],

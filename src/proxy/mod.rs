@@ -207,7 +207,25 @@ async fn handle_https_request(
         .get(hyper::header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let lookup_name = sni.or(host_header);
+    // The `Host`/`:authority` header must win over `sni` when both are
+    // present -- `sni` is captured once per TLS connection at handshake
+    // time, but a single connection can carry requests for more than
+    // one domain: HTTP/2 connection coalescing (RFC 7540 §9.1.1) lets a
+    // browser reuse an existing connection for a *different* origin
+    // whenever the connection's cert also covers it (exactly what a
+    // wildcard/SAN cert does), and each request on that connection
+    // still carries its own real `:authority`. Routing by `sni` first
+    // sent every request after the first to whichever host the
+    // connection originally happened to be for -- confirmed as a real
+    // production bug: visiting store.jpps.us after proxy.jpps.us (both
+    // under the *.jpps.us wildcard cert, same bind_ip:port) served
+    // proxy.jpps.us's admin login page instead. `sni` is still what
+    // `proxy::tls::CertResolver` uses to pick the TLS certificate
+    // itself (that part's connection-scoped by nature); this is purely
+    // about which *host* a given request routes to. `sni` remains the
+    // fallback for the rare case a request genuinely has no `Host`
+    // header at all (HTTP/1.0).
+    let lookup_name = host_header.or(sni);
 
     let hosts = state.hosts();
     let matched = lookup_name
@@ -521,6 +539,8 @@ mod tests {
                 cert_dir: PathBuf::from("/tmp/certs"),
                 account_key_path: PathBuf::from("/tmp/account.key"),
                 renew_before_days: 30,
+                organization: None,
+                organizational_unit: None,
             },
             hosts: vec![],
             port_rules: vec![],
@@ -652,6 +672,69 @@ mod tests {
 
     async fn response_text(resp: Response<Incoming>) -> String {
         String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+    }
+
+    /// Real production bug this guards against: HTTP/2 connection
+    /// coalescing (RFC 7540 §9.1.1, or any other keep-alive reuse) can
+    /// carry a request for a *different* domain than the one the TLS
+    /// connection's SNI named, whenever one cert (a wildcard/SAN cert)
+    /// covers both -- confirmed live: visiting store.jpps.us right
+    /// after proxy.jpps.us (both under the same *.jpps.us cert, same
+    /// bind_ip:port) served proxy.jpps.us's admin login page instead of
+    /// the store. Each request still carries its own real `Host`
+    /// header naming which domain it's actually for; routing must key
+    /// off that, not the connection-level SNI captured once at
+    /// handshake time.
+    #[tokio::test]
+    async fn the_host_header_wins_over_a_stale_connection_level_sni_when_they_disagree() {
+        let target_b = crate::config::RedirectTarget {
+            target: "https://b.example.com".into(),
+            preserve_path: false,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let host_a = redirect_host(
+            "first.example.com",
+            crate::config::RedirectTarget {
+                target: "https://a.example.com".into(),
+                preserve_path: false,
+                status: crate::config::RedirectStatus::Permanent,
+            },
+        );
+        let host_b = redirect_host("second.example.com", target_b);
+        let state = test_state_with_cert("first.example.com").await;
+        state.set_hosts(vec![host_a, host_b]);
+
+        let bind_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let bind_port = 443;
+        let stale_sni = Some("first.example.com".to_string());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let state = state.clone();
+                let sni = stale_sni.clone();
+                async move { handle_https_request(state, bind_ip, bind_port, "203.0.113.7".parse().unwrap(), sni, req).await }
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "second.example.com")
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(location, "https://b.example.com", "the request's real Host header must win over the connection's stale SNI");
     }
 
     #[tokio::test]
