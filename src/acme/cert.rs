@@ -34,7 +34,22 @@ pub struct GeneratedCsr {
 /// across renewals.
 pub fn generate_csr(domains: &[String]) -> Result<GeneratedCsr, CertError> {
     let key_pair = KeyPair::generate()?;
-    let params = CertificateParams::new(domains.to_vec())?;
+    let mut params = CertificateParams::new(domains.to_vec())?;
+    // `CertificateParams::new` (via its `Default` impl) hard-codes the
+    // Subject Common Name to the literal string "rcgen self signed
+    // cert" -- harmless for the self-signed test certs rcgen is mostly
+    // used for, but fatal here: that string ends up as the CSR's
+    // Subject when serialized, and Let's Encrypt's finalize-order
+    // validation rejects it outright ("Cannot issue for \"rcgen self
+    // signed cert\": Domain name contains an invalid character" --
+    // rejectedIdentifier, confirmed against a real production
+    // failure). Clearing the DN entirely is standard ACME CSR practice
+    // anyway: the SAN extension (already set from `domains` above) is
+    // what CAs actually validate against; a Subject CN is optional and,
+    // per current CA/Browser Forum guidance, increasingly expected to
+    // be absent or to exactly match a SAN entry rather than carry a
+    // placeholder.
+    params.distinguished_name = rcgen::DistinguishedName::new();
     let csr = params.serialize_request(&key_pair)?;
     Ok(GeneratedCsr {
         der: csr.der().as_ref().to_vec(),
@@ -88,6 +103,24 @@ mod tests {
         let csr = generate_csr(&["example.com".to_string()]).unwrap();
         assert!(!csr.der.is_empty());
         assert!(csr.key_pair_pem.contains("BEGIN PRIVATE KEY") || csr.key_pair_pem.contains("BEGIN EC PRIVATE KEY"));
+    }
+
+    /// Regression test for a real production failure: `rcgen`'s default
+    /// Subject Common Name ("rcgen self signed cert") was leaking into
+    /// the CSR sent to Let's Encrypt, which rejected the whole order
+    /// with `rejectedIdentifier` ("Cannot issue for \"rcgen self signed
+    /// cert\": Domain name contains an invalid character"). Checks the
+    /// raw DER for the placeholder string directly -- simpler and just
+    /// as effective as parsing the ASN.1 Subject field, and fails
+    /// loudly if a future rcgen upgrade reintroduces a default CN.
+    #[test]
+    fn csr_never_contains_rcgens_placeholder_common_name() {
+        let csr = generate_csr(&["example.com".to_string()]).unwrap();
+        let placeholder = b"rcgen self signed cert";
+        assert!(
+            !csr.der.windows(placeholder.len()).any(|w| w == placeholder),
+            "CSR DER must not contain rcgen's default Subject CN -- it gets rejected by Let's Encrypt as an invalid identifier"
+        );
     }
 
     #[test]
