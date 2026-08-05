@@ -50,6 +50,13 @@ configure)
         # fresh install *and* reloads a running one onto the new
         # binary on an upgrade.
         systemctl restart rust-proxy || true
+        # The backup *timer* is enabled+started (it just waits for its
+        # next 03:00 firing); the backup *service* itself is a oneshot,
+        # never enabled directly -- systemd runs it only when the timer
+        # fires. `enable --now` here is correct (unlike rust-proxy.service
+        # above) since there's no separate "restart onto new binary"
+        # concern for a unit that isn't currently running.
+        systemctl enable --now rust-proxy-backup.timer || true
     fi
     ;;
 esac

@@ -342,8 +342,16 @@ pub struct ProxyHost {
     /// there's no upstream request to rewrite the path of). A path that
     /// doesn't match `pattern` at all is forwarded unchanged, not
     /// rejected -- e.g. useful for mounting a whole external site's wiki
-    /// under a clean URL: pattern `^/([^/]+/[^/]+)(?:/(.*))?$`,
-    /// replacement `/$1/-/wikis/$2`.
+    /// under a clean URL: pattern `^/([^/]+/[^/]+)/?$`, replacement
+    /// `/$1/-/wikis/Home`. Note the pattern there matches ONLY a bare,
+    /// exactly-two-segment path -- `regex` (RE2-based, no lookahead
+    /// support) can't express "and doesn't already start with the
+    /// target's own `-/` namespace", so a looser pattern that also
+    /// tried to preserve a deeper path would end up matching (and
+    /// mangling) the target's own already-rewritten URLs the moment a
+    /// visitor clicks a link on the resulting page -- confirmed as a
+    /// real bug in production (see proxy::mod's own test module for the
+    /// regression test).
     #[serde(default)]
     pub path_rewrite: Option<PathRewrite>,
     #[serde(default = "default_true")]

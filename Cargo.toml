@@ -87,6 +87,8 @@ self-hostable alternative to Nginx Proxy Manager. See README.md."""
 assets = [
     ["target/release/rust-proxy", "usr/bin/", "755"],
     ["deploy/rust-proxy.service", "lib/systemd/system/", "644"],
+    ["deploy/rust-proxy-backup.service", "lib/systemd/system/", "644"],
+    ["deploy/rust-proxy-backup.timer", "lib/systemd/system/", "644"],
     ["deploy/config.toml.example", "usr/share/doc/rust-proxy/", "644"],
     ["README.md", "usr/share/doc/rust-proxy/", "644"],
     ["LICENSE", "usr/share/doc/rust-proxy/", "644"],

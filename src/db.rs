@@ -33,6 +33,24 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
+/// Safely snapshots the whole live DB to `destination` via sqlite's own
+/// `VACUUM INTO` -- a full, consistent copy even while the daemon is
+/// running and actively writing, unlike a raw file copy (which could
+/// catch the DB mid-write, especially under WAL mode, and produce a
+/// corrupt copy). `destination` must not already exist; `VACUUM INTO`
+/// refuses to overwrite. Used by `rust-proxy backup` (see main.rs),
+/// itself driven nightly by `rust-proxy-backup.timer` (see deploy/).
+pub async fn backup_to(pool: &SqlitePool, destination: &Path) -> Result<(), sqlx::Error> {
+    // `?`-bound VACUUM INTO silently no-ops on this sqlx/libsqlite3-sys
+    // combination (confirmed: returns Ok(()) but never writes the file)
+    // -- the destination path is escaped by hand instead (doubling any
+    // embedded single quotes, the same escaping SQL string literals
+    // always use) and interpolated directly.
+    let escaped = destination.to_string_lossy().replace('\'', "''");
+    sqlx::query(&format!("VACUUM INTO '{escaped}'")).execute(pool).await?;
+    Ok(())
+}
+
 async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
@@ -1637,5 +1655,41 @@ mod tests {
 
         set_expose_admin_port(&pool, true).await.unwrap();
         assert_eq!(load_expose_admin_port(&pool).await.unwrap(), Some(true), "a second call must update the existing row, not fail on the unique id");
+    }
+
+    #[tokio::test]
+    async fn backup_to_produces_a_real_readable_copy_with_the_same_data() {
+        let src = std::env::temp_dir().join(format!("rust-proxy-backup-src-{}.db", Uuid::new_v4()));
+        let _ = std::fs::remove_file(&src);
+        let pool = connect(&src).await.unwrap();
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "backup test", AclKind::IpAllow, Utc::now()).await.unwrap();
+
+        let dest = std::env::temp_dir().join(format!("rust-proxy-backup-test-{}.db", Uuid::new_v4()));
+        let _ = std::fs::remove_file(&dest);
+
+        backup_to(&pool, &dest).await.unwrap();
+        assert!(dest.is_file(), "backup_to must have written a real file");
+
+        let backup_pool = connect(&dest).await.unwrap();
+        assert!(acl_list_name_exists(&backup_pool, "backup test").await.unwrap(), "the backup must contain the same data as the live DB at the moment it was taken");
+
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[tokio::test]
+    async fn backup_to_refuses_to_overwrite_an_existing_destination() {
+        let src = std::env::temp_dir().join(format!("rust-proxy-backup-src-{}.db", Uuid::new_v4()));
+        let _ = std::fs::remove_file(&src);
+        let pool = connect(&src).await.unwrap();
+        let dest = std::env::temp_dir().join(format!("rust-proxy-backup-test-{}.db", Uuid::new_v4()));
+        std::fs::write(&dest, b"not a real backup").unwrap();
+
+        let result = backup_to(&pool, &dest).await;
+        assert!(result.is_err(), "VACUUM INTO must refuse an already-existing destination, not silently overwrite it");
+
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&src);
     }
 }

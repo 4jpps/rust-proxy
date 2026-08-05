@@ -31,19 +31,41 @@ enum Command {
     HashPassword {
         password: String,
     },
+    /// Safely snapshots the live sqlite DB to `destination` -- a full,
+    /// consistent copy even while the daemon is running and actively
+    /// writing, via sqlite's own `VACUUM INTO` (not a raw file copy,
+    /// which could catch the DB mid-write, especially under WAL mode,
+    /// and produce a corrupt copy). `destination` must not already
+    /// exist -- `VACUUM INTO` refuses to overwrite. Driven by
+    /// `rust-proxy-backup.timer` (see deploy/) for the nightly
+    /// automated backup every install gets out of the box; also usable
+    /// by hand before a risky manual change.
+    Backup {
+        destination: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if let Some(Command::HashPassword { password }) = args.command {
-        let hash = api::auth::hash_password(&password).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(Command::HashPassword { password }) = &args.command {
+        let hash = api::auth::hash_password(password).map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("{hash}");
         return Ok(());
     }
 
     let cfg = config::Config::load(&args.config)?;
+
+    if let Some(Command::Backup { destination }) = &args.command {
+        if destination.exists() {
+            anyhow::bail!("{} already exists -- refusing to overwrite (VACUUM INTO doesn't support it)", destination.display());
+        }
+        let pool = db::connect(&cfg.admin.db_path).await?;
+        db::backup_to(&pool, destination).await?;
+        println!("backed up {} to {}", cfg.admin.db_path.display(), destination.display());
+        return Ok(());
+    }
 
     // Split into proxy.log/access.log/server.log under the same
     // directory as the sqlite DB (already read-write for this daemon,

@@ -567,20 +567,40 @@ mod tests {
         crate::config::PathRewrite { pattern: pattern.into(), replacement: replacement.into() }
     }
 
-    #[test]
-    fn apply_path_rewrite_inserts_gitlab_wikis_segment_for_a_bare_project_path() {
-        let rw = path_rewrite(r"^/([^/]+/[^/]+)(?:/(.*))?$", "/$1/-/wikis/$2");
-        let mut req = Request::builder().uri("/jpps/rust-proxy").body(()).unwrap();
-        apply_path_rewrite(&mut req, &rw);
-        assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/");
+    /// This is the exact pattern/replacement used for wiki.jpps.us in
+    /// production -- it deliberately matches ONLY a bare, exactly-two-segment
+    /// path (a GitLab `<namespace>/<project>` path), landing directly on
+    /// the wiki's real "Home" page slug in one hop. An earlier version
+    /// of this pattern also matched (and preserved) any deeper path,
+    /// which sounds more capable but is a real bug: `regex` (RE2-based,
+    /// no lookahead support) can't express "doesn't already start with
+    /// GitLab's own `-/` namespace", so it also matched -- and mangled --
+    /// GitLab's own already-correct `/-/wikis/<page>` URLs into
+    /// `/-/wikis/-/wikis/<page>` on the very next click, a real 404 hit
+    /// in production. Restricting the pattern to exactly two segments
+    /// makes that collision impossible: anything with a `/-/` in it has
+    /// more than two segments and simply doesn't match at all.
+    fn gitlab_wiki_rewrite() -> crate::config::PathRewrite {
+        path_rewrite(r"^/([^/]+/[^/]+)/?$", "/$1/-/wikis/Home")
     }
 
     #[test]
-    fn apply_path_rewrite_preserves_a_deeper_path_after_the_project() {
-        let rw = path_rewrite(r"^/([^/]+/[^/]+)(?:/(.*))?$", "/$1/-/wikis/$2");
-        let mut req = Request::builder().uri("/jpps/rust-proxy/getting-started").body(()).unwrap();
+    fn apply_path_rewrite_sends_a_bare_project_path_straight_to_the_wiki_home_page() {
+        let rw = gitlab_wiki_rewrite();
+        let mut req = Request::builder().uri("/jpps/rust-proxy").body(()).unwrap();
         apply_path_rewrite(&mut req, &rw);
-        assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/getting-started");
+        assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/Home");
+    }
+
+    #[test]
+    fn apply_path_rewrite_does_not_touch_an_already_correct_gitlab_wiki_url() {
+        // Regression test for the real production bug described above --
+        // clicking a real wiki page link (already under /-/wikis/) must
+        // never be rewritten a second time.
+        let rw = gitlab_wiki_rewrite();
+        let mut req = Request::builder().uri("/jpps/rust-proxy/-/wikis/Getting-Started").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/Getting-Started");
     }
 
     #[test]

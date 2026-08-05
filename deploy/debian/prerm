@@ -5,6 +5,8 @@ case "$1" in
 remove|deconfigure)
     if command -v systemctl >/dev/null 2>&1; then
         systemctl stop rust-proxy >/dev/null 2>&1 || true
+        systemctl stop rust-proxy-backup.timer >/dev/null 2>&1 || true
+        systemctl disable rust-proxy-backup.timer >/dev/null 2>&1 || true
     fi
     # The daemon manages a default-DROP inbound nftables table
     # (`inet rust_proxy`, see src/nftables/generator.rs) for as long as

@@ -2280,7 +2280,7 @@ mod tests {
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
                         r#"{"domain":"wiki.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,
-                        "path_rewrite":{"pattern":"^/([^/]+/[^/]+)(?:/(.*))?$","replacement":"/$1/-/wikis/$2"}}"#,
+                        "path_rewrite":{"pattern":"^/([^/]+/[^/]+)/?$","replacement":"/$1/-/wikis/Home"}}"#,
                     ))
                     .unwrap(),
             )
@@ -2288,8 +2288,8 @@ mod tests {
             .unwrap();
         assert_eq!(create_resp.status(), StatusCode::OK);
         let created = body_json(create_resp).await;
-        assert_eq!(created["path_rewrite"]["pattern"], "^/([^/]+/[^/]+)(?:/(.*))?$");
-        assert_eq!(created["path_rewrite"]["replacement"], "/$1/-/wikis/$2");
+        assert_eq!(created["path_rewrite"]["pattern"], "^/([^/]+/[^/]+)/?$");
+        assert_eq!(created["path_rewrite"]["replacement"], "/$1/-/wikis/Home");
 
         let list_resp = router
             .oneshot(
@@ -2302,7 +2302,7 @@ mod tests {
             .await
             .unwrap();
         let json = body_json(list_resp).await;
-        assert_eq!(json[0]["path_rewrite"]["replacement"], "/$1/-/wikis/$2");
+        assert_eq!(json[0]["path_rewrite"]["replacement"], "/$1/-/wikis/Home");
     }
 
     #[tokio::test]

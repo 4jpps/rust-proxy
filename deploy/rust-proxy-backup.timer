@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly rust-proxy database backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Runs the missed backup on the next boot if the host was off at
+# 03:00 -- a backup schedule that silently skips whenever the machine
+# happens to be down defeats the point of having one.
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
