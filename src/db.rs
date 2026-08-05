@@ -211,6 +211,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    let _ = sqlx::query("ALTER TABLE standalone_certs ADD COLUMN organization TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE standalone_certs ADD COLUMN organizational_unit TEXT").execute(pool).await;
 
     // Single-row table (id is always 1) holding the DB-backed ACME
     // contact email -- only ever consulted by
@@ -1200,6 +1202,35 @@ mod tests {
         let row = load_admin_identity(&pool).await.unwrap().unwrap();
         assert_eq!(row.username, "admin", "the second call must not have overwritten the first");
         assert_eq!(row.password_hash, "hash-1");
+    }
+
+    /// Regression test for a real deployment bug: `CREATE TABLE IF NOT
+    /// EXISTS` with the new `organization`/`organizational_unit`
+    /// columns already in its definition is a no-op against a
+    /// pre-existing `standalone_certs` table from before those columns
+    /// existed -- only the paired `ALTER TABLE ... ADD COLUMN` actually
+    /// upgrades it. `memory_pool()`/`connect()` always create a brand
+    /// new table (so `CREATE TABLE IF NOT EXISTS` alone happens to
+    /// "work" there, masking a missing `ALTER TABLE` in every other
+    /// test), so this manually recreates the *pre-upgrade* schema first
+    /// to actually exercise the upgrade path a real production DB goes
+    /// through.
+    #[tokio::test]
+    async fn run_migrations_adds_organization_columns_to_a_pre_existing_standalone_certs_table() {
+        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE standalone_certs (id TEXT PRIMARY KEY, domain TEXT NOT NULL UNIQUE, dns_credential_id TEXT, created_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        // Would fail with "no such column" before the fix -- confirmed
+        // against the exact same error a real upgraded production
+        // instance hit.
+        create_standalone_cert(&pool, Uuid::new_v4(), "*.example.com", None, Utc::now(), Some("Acme Corp"), None).await.unwrap();
+        let certs = list_standalone_certs(&pool).await.unwrap();
+        assert_eq!(certs[0].organization.as_deref(), Some("Acme Corp"));
     }
 
     #[tokio::test]
