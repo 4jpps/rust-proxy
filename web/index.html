@@ -70,18 +70,20 @@
       <input type="password" name="password_confirm" placeholder="confirm password" required>
     </div>
     <label class="chk"><input type="checkbox" id="setup-add-dns" name="add_dns"> Add a DNS-01 credential now</label>
-    <div class="inline" id="setup-dns-fields" style="display:none">
-      <input type="text" name="dns_name" placeholder="credential name (e.g. &quot;default&quot;)">
-      <select name="dns_provider">
-        <option value="cloudflare">Cloudflare</option>
-        <option value="digitalocean">DigitalOcean</option>
-        <option value="hetzner">Hetzner</option>
-        <option value="duckdns">DuckDNS</option>
-        <option value="godaddy">GoDaddy</option>
-        <option value="namecheap">Namecheap (token: api_user:api_key:client_ip)</option>
-        <option value="route53">Route53 (token: access_key_id:secret_access_key)</option>
-      </select>
-      <input type="text" name="dns_token" placeholder="API token / credential string">
+    <div id="setup-dns-fields" style="display:none;flex-direction:column;align-items:flex-start;gap:0.6rem;width:100%">
+      <div class="inline">
+        <input type="text" name="dns_name" placeholder="credential name (e.g. &quot;default&quot;)">
+        <select name="dns_provider" class="dns-provider-select" data-fields-for="setup">
+          <option value="cloudflare">Cloudflare</option>
+          <option value="digitalocean">DigitalOcean</option>
+          <option value="hetzner">Hetzner</option>
+          <option value="duckdns">DuckDNS</option>
+          <option value="godaddy">GoDaddy</option>
+          <option value="namecheap">Namecheap</option>
+          <option value="route53">Route53 (AWS)</option>
+        </select>
+      </div>
+      <div class="field-grid dns-cred-fields" id="setup-dns-cred-fields" data-prefix="setup" style="width:100%"></div>
     </div>
     <button type="submit">Create admin account</button>
     <span class="error" id="setup-error"></span>
@@ -235,18 +237,18 @@
       <div class="field-grid">
         <label><span>Name</span><input type="text" name="name" placeholder="prod-cloudflare" required></label>
         <label><span>Provider</span>
-          <select name="provider">
+          <select name="provider" class="dns-provider-select" data-fields-for="cred">
             <option value="cloudflare">Cloudflare</option>
             <option value="digitalocean">DigitalOcean</option>
             <option value="hetzner">Hetzner</option>
             <option value="duckdns">DuckDNS</option>
             <option value="godaddy">GoDaddy</option>
-            <option value="namecheap">Namecheap (token: api_user:api_key:client_ip)</option>
-            <option value="route53">Route53 (token: access_key_id:secret_access_key)</option>
+            <option value="namecheap">Namecheap</option>
+            <option value="route53">Route53 (AWS)</option>
           </select>
         </label>
-        <label class="wide"><span>API token / credential string</span><input type="text" name="token" required></label>
       </div>
+      <div class="field-grid dns-cred-fields" id="cred-dns-cred-fields" data-prefix="cred"></div>
       <div class="form-actions">
         <button type="submit">Add credential</button>
         <span class="error" id="dns-credential-error"></span>
@@ -330,6 +332,54 @@ document.getElementById('logout-btn').addEventListener('click', async () => {
   showLogin();
 });
 
+// Per-provider credential field definitions -- Cloudflare/DigitalOcean/
+// Hetzner/DuckDNS/GoDaddy each take one opaque API token; Namecheap and
+// Route53 pack multiple credential parts into that same single `token`
+// string the backend expects (see acme::dns01::{namecheap,route53}'s
+// own `token.splitn(...)` parsing), so dedicated inputs render for
+// those instead and get joined client-side -- no more hand-constructing
+// a colon-delimited string correctly (or getting the field order wrong).
+const DNS_PROVIDER_FIELDS = {
+  cloudflare: [{ key: 'token', label: 'API token', placeholder: 'Zone:DNS:Edit scoped token', type: 'text' }],
+  digitalocean: [{ key: 'token', label: 'Personal access token', placeholder: 'write-scoped token', type: 'text' }],
+  hetzner: [{ key: 'token', label: 'DNS API token', placeholder: 'from the Hetzner DNS Console', type: 'text' }],
+  duckdns: [{ key: 'token', label: 'DuckDNS token', placeholder: 'from your DuckDNS account page', type: 'text' }],
+  godaddy: [{ key: 'token', label: 'API key (Personal Access Token)', placeholder: 'a Bearer token, not the older sso-key scheme', type: 'text' }],
+  namecheap: [
+    { key: 'api_user', label: 'API user', placeholder: 'your Namecheap username', type: 'text' },
+    { key: 'api_key', label: 'API key', placeholder: "from Namecheap's API access settings", type: 'text' },
+    { key: 'client_ip', label: 'Whitelisted client IP', placeholder: 'the IP Namecheap has allowlisted for API access', type: 'text' },
+  ],
+  route53: [
+    { key: 'access_key_id', label: 'Access key ID', placeholder: 'AKIA...', type: 'text' },
+    { key: 'secret_access_key', label: 'Secret access key', placeholder: '', type: 'password' },
+  ],
+};
+
+function renderDnsCredentialFields(container, provider) {
+  const fields = DNS_PROVIDER_FIELDS[provider] || DNS_PROVIDER_FIELDS.cloudflare;
+  container.innerHTML = fields
+    .map((f) => `<label${fields.length === 1 ? ' class="wide"' : ''}><span>${esc(f.label)}</span><input type="${f.type}" data-dns-field="${f.key}" placeholder="${esc(f.placeholder)}"></label>`)
+    .join('');
+}
+
+// Packs whatever this provider's rendered fields hold into the single
+// colon-delimited `token` string the backend expects -- must match
+// acme::dns01::{namecheap,route53}::new's exact split-count/field order.
+function packDnsCredentialToken(container, provider) {
+  const get = (key) => (container.querySelector(`[data-dns-field="${key}"]`) || {}).value || '';
+  if (provider === 'namecheap') return `${get('api_user')}:${get('api_key')}:${get('client_ip')}`;
+  if (provider === 'route53') return `${get('access_key_id')}:${get('secret_access_key')}`;
+  return get('token');
+}
+
+for (const select of document.querySelectorAll('.dns-provider-select')) {
+  const prefix = select.dataset.fieldsFor;
+  const container = document.getElementById(`${prefix}-dns-cred-fields`);
+  renderDnsCredentialFields(container, select.value);
+  select.addEventListener('change', () => renderDnsCredentialFields(container, select.value));
+}
+
 document.getElementById('setup-add-dns').addEventListener('change', (e) => {
   document.getElementById('setup-dns-fields').style.display = e.target.checked ? 'flex' : 'none';
 });
@@ -343,8 +393,12 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
     return;
   }
   const body = { username: fd.get('username'), password };
-  if (fd.get('add_dns') === 'on' && fd.get('dns_name') && fd.get('dns_token')) {
-    body.dns_credential = { name: fd.get('dns_name'), provider: fd.get('dns_provider'), token: fd.get('dns_token') };
+  if (fd.get('add_dns') === 'on' && fd.get('dns_name')) {
+    const provider = fd.get('dns_provider');
+    const token = packDnsCredentialToken(document.getElementById('setup-dns-cred-fields'), provider);
+    if (token.replace(/:/g, '')) {
+      body.dns_credential = { name: fd.get('dns_name'), provider, token };
+    }
   }
   const resp = await fetch('/api/setup', {
     method: 'POST',
@@ -612,10 +666,18 @@ async function refreshDnsCredentials() {
 document.getElementById('dns-credential-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
-  const body = { name: fd.get('name'), provider: fd.get('provider'), token: fd.get('token') };
+  const provider = fd.get('provider');
+  const token = packDnsCredentialToken(document.getElementById('cred-dns-cred-fields'), provider);
+  const body = { name: fd.get('name'), provider, token };
   const resp = await api('/api/dns-credentials', { method: 'POST', body: JSON.stringify(body) });
-  if (resp.ok) { e.target.reset(); document.getElementById('dns-credential-error').textContent = ''; refreshDnsCredentials(); }
-  else { document.getElementById('dns-credential-error').textContent = (await resp.json()).error || 'failed'; }
+  if (resp.ok) {
+    e.target.reset();
+    renderDnsCredentialFields(document.getElementById('cred-dns-cred-fields'), document.querySelector('#dns-credential-form select[name=provider]').value);
+    document.getElementById('dns-credential-error').textContent = '';
+    refreshDnsCredentials();
+  } else {
+    document.getElementById('dns-credential-error').textContent = (await resp.json()).error || 'failed';
+  }
 });
 
 // Probe session state on load -- but check whether this instance has

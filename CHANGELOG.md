@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **Per-provider DNS credential fields, not a hand-packed token
+  string.** The DNS Credentials form (and the setup wizard's optional
+  DNS step) used to have one generic "token" text box, with Namecheap
+  (`api_user:api_key:client_ip`) and Route53
+  (`access_key_id:secret_access_key`) requiring the operator to
+  manually construct a correctly-ordered, colon-delimited string --
+  explained only in the provider dropdown's option text. Both forms now
+  render dedicated, labeled inputs per provider (2 for Route53, 3 for
+  Namecheap, a single clearly-labeled token field for the other five)
+  and pack them into the exact string `acme::dns01::{namecheap,route53}`
+  expect entirely client-side -- no more error-prone manual construction.
 - **Admin defaults to `0.0.0.0:8084`** (was a required field with no
   default; 8084 to cut down on port collisions with the many
   self-hosted tools defaulting to 8080), reachable from the network out
