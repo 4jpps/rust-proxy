@@ -9,8 +9,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+
+#[cfg(test)]
+use tokio::net::TcpListener;
 
 /// Accepts on `bind_addr`, dials `upstream` for every new connection, and
 /// copies bytes bidirectionally until either side closes. Runs until the

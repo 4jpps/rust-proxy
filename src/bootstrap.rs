@@ -66,8 +66,8 @@ pub async fn load_persisted_admin_identity(db_pool: &SqlitePool) -> Result<Optio
     }))
 }
 
-/// Full startup sequence: connect the DB, load/seed hosts + port_rules
-/// + the default DNS credential, resolve the persisted admin identity
+/// Full startup sequence: connect the DB, load/seed hosts, port_rules,
+/// and the default DNS credential, resolve the persisted admin identity
 /// and ACME contact email, build `AppState`, and load certs from disk.
 /// Everything `main()` needs before it can spawn the long-running
 /// service tasks.

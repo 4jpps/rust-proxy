@@ -19,7 +19,10 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::config::{AcmeChallengeType, DnsProviderKind, ProxyHost};
+use crate::config::{AcmeChallengeType, ProxyHost};
+
+#[cfg(test)]
+use crate::config::DnsProviderKind;
 use crate::state::AppState;
 use client::{AcmeClient, AcmeError};
 use dns01::{acme_challenge_record_name, dns01_txt_value, Dns01Error, DnsProvider};

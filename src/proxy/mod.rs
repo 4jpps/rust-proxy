@@ -28,6 +28,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+#[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -579,10 +580,7 @@ mod tests {
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
         let state = AppState::new(cfg, pool, vec![], vec![], None, None);
-        state.upsert_cert(domain.to_string(), {
-            let entry = tls::self_signed_entry(domain);
-            entry
-        });
+        state.upsert_cert(domain.to_string(), tls::self_signed_entry(domain));
         state
     }
 

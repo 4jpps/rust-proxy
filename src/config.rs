@@ -347,22 +347,17 @@ pub struct RedirectTarget {
     pub status: RedirectStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RedirectStatus {
     /// 301 -- browsers and search engines cache this redirect
     /// indefinitely, same as `proxy::http::https_redirect_response`'s
     /// own `force_https` redirect.
+    #[default]
     Permanent,
     /// 302 -- for a redirect that might change later (a temporary
     /// migration, an A/B test) and shouldn't be cached hard.
     Temporary,
-}
-
-impl Default for RedirectStatus {
-    fn default() -> Self {
-        Self::Permanent
-    }
 }
 
 /// A single login credential gating one host behind `proxy::login`'s
@@ -414,22 +409,17 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AcmeChallengeType {
     /// http-01 for a plain domain with `force_https` (no DNS provider
     /// credentials needed -- the common case), dns-01 for a wildcard
     /// domain or a plain domain without `force_https` (http-01 needs
     /// port 80 reachable, which nothing opens without it).
+    #[default]
     Auto,
     Http01,
     Dns01,
-}
-
-impl Default for AcmeChallengeType {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// `*.` leading label, same shape `validate_domain` already accepts --
