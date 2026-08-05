@@ -373,6 +373,7 @@ mod tests {
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         }]);
 
@@ -449,6 +450,7 @@ mod tests {
                     dns_credential_id: None,
                     redirect: None,
                     path_rewrite: None,
+                    static_root: None,
                     enabled: true,
                 }]);
             }));

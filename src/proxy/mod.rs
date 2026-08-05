@@ -308,6 +308,10 @@ async fn handle_https_request(
         return Ok(http::redirect_target_response(&req, redirect));
     }
 
+    if let Some(static_root) = &host.static_root {
+        return Ok(http::serve_static_response(&req, static_root).await);
+    }
+
     let mut req = req;
     if let Some(path_rewrite) = &host.path_rewrite {
         apply_path_rewrite(&mut req, path_rewrite);
@@ -811,6 +815,7 @@ mod tests {
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         }
     }
@@ -1202,6 +1207,7 @@ mod tests {
             dns_credential_id: None,
             redirect: Some(redirect),
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         }
     }

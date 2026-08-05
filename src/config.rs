@@ -367,6 +367,19 @@ pub struct ProxyHost {
     ///   here unless a new real value is added to the alternation.
     #[serde(default)]
     pub path_rewrite: Option<PathRewrite>,
+    /// When set, this host serves files directly from this local
+    /// directory instead of proxying to `upstream` -- same "alternative
+    /// to upstream" shape as `redirect` above (checked first, in that
+    /// order: `redirect`, then `static_root`, then normal upstream
+    /// proxying), and like `redirect`, domain matching/TLS/ACME/access
+    /// control are all identical either way. `path_rewrite` is ignored
+    /// on a static host -- there's no upstream request to rewrite the
+    /// path of, only a local file to resolve. See
+    /// `proxy::http::serve_static_response` for exactly how a request
+    /// path resolves to a file (path-traversal guard, `index.html`
+    /// fallback, content-type by extension).
+    #[serde(default)]
+    pub static_root: Option<PathBuf>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -927,6 +940,7 @@ dns_api_token = "token-placeholder"
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -954,6 +968,7 @@ dns_api_token = "token-placeholder"
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok(), "bind_ip in the second range should be accepted");
@@ -980,6 +995,7 @@ dns_api_token = "token-placeholder"
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1006,6 +1022,7 @@ dns_api_token = "token-placeholder"
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1036,6 +1053,7 @@ dns_api_token = "token-placeholder"
                 status: RedirectStatus::Permanent,
             }),
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -1066,6 +1084,7 @@ dns_api_token = "token-placeholder"
                 status: RedirectStatus::Permanent,
             }),
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1159,6 +1178,7 @@ dns_api_token = "token-placeholder"
                 dns_credential_id: None,
                 redirect: None,
                 path_rewrite: None,
+                static_root: None,
                 enabled: true,
             });
         }
@@ -1190,6 +1210,7 @@ dns_api_token = "token-placeholder"
                 dns_credential_id: None,
                 redirect: None,
                 path_rewrite: None,
+                static_root: None,
                 enabled: true,
             });
         }
@@ -1217,6 +1238,7 @@ dns_api_token = "token-placeholder"
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -1255,6 +1277,7 @@ dns_api_token = "token-placeholder"
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());

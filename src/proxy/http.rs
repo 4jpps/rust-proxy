@@ -5,6 +5,7 @@
 //! under concurrent hot-reloads.
 
 use std::net::SocketAddr;
+use std::path::Path;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -215,6 +216,107 @@ pub fn http01_challenge_response<B>(state: &AppState, req: &Request<B>) -> Optio
             )
             .expect("static challenge response is always valid"),
     )
+}
+
+/// Minimal percent-decoder for request paths -- just enough to stop
+/// `%2e%2e%2f`-style encoded traversal from slipping past the plain
+/// string checks below before the real guard (canonicalize + prefix
+/// check) runs. Invalid/incomplete escapes are left as-is rather than
+/// rejected outright; the canonicalize check downstream is the actual
+/// security boundary, this only normalizes the common encoded case.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn content_type_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn static_not_found_response() -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = "<!doctype html><html><head><title>Not found</title></head>\
+        <body><h1>404 Not Found</h1></body></html>";
+    Response::builder()
+        .status(hyper::StatusCode::NOT_FOUND)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(http_body_util::Full::new(Bytes::from(body)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static 404 response is always valid")
+}
+
+/// Serves a `static_root` host's response by resolving the request path
+/// against `root` on disk. A directory or extensionless path falls back
+/// to `index.html` inside it; anything that resolves outside `root`
+/// (traversal via `../` or its percent-encoded form) or that doesn't
+/// exist as a file is a plain 404 -- never a directory listing.
+pub async fn serve_static_response<B>(req: &Request<B>, root: &Path) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(_) => return static_not_found_response(),
+    };
+
+    let decoded_path = percent_decode(req.uri().path());
+    let relative = decoded_path.trim_start_matches('/');
+    let mut candidate = root.clone();
+    for segment in relative.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        candidate.push(segment);
+    }
+
+    let resolved = match tokio::fs::canonicalize(&candidate).await {
+        Ok(resolved) => resolved,
+        Err(_) => return static_not_found_response(),
+    };
+    if !resolved.starts_with(&root) {
+        return static_not_found_response();
+    }
+
+    let file_path = if resolved.is_dir() { resolved.join("index.html") } else { resolved };
+    let file_path = match tokio::fs::canonicalize(&file_path).await {
+        Ok(p) if p.starts_with(&root) && p.is_file() => p,
+        _ => return static_not_found_response(),
+    };
+
+    match tokio::fs::read(&file_path).await {
+        Ok(contents) => Response::builder()
+            .status(hyper::StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, content_type_for(&file_path))
+            .body(http_body_util::Full::new(Bytes::from(contents)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+            .expect("static file response is always valid"),
+        Err(_) => static_not_found_response(),
+    }
 }
 
 #[cfg(test)]
@@ -637,5 +739,96 @@ mod tests {
     async fn forward_http_rejects_a_self_signed_https_upstream_when_verify_is_enabled() {
         let result = run_https_upstream_round_trip(true).await;
         assert!(result.is_err(), "a self-signed cert must be rejected when tls_verify is enabled, not silently accepted");
+    }
+
+    /// Mirrors this codebase's existing convention for filesystem-backed
+    /// tests (see `db.rs`'s `backup_to`/`vacuum` tests) -- a uniquely
+    /// named directory under `std::env::temp_dir()`, left on disk after
+    /// the test (the OS temp dir is periodically cleaned; nothing here
+    /// depends on cleanup happening promptly).
+    struct StaticRootFixture {
+        root: std::path::PathBuf,
+        parent: std::path::PathBuf,
+    }
+
+    fn static_root_fixture() -> StaticRootFixture {
+        let base = std::env::temp_dir().join(format!("rust-proxy-static-root-test-{}", uuid::Uuid::new_v4()));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), "<h1>home</h1>").unwrap();
+        std::fs::write(root.join("style.css"), "body{}").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("index.html"), "<h1>sub</h1>").unwrap();
+        std::fs::write(base.join("secret.txt"), "top secret").unwrap();
+        StaticRootFixture { root, parent: base }
+    }
+
+    impl Drop for StaticRootFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    impl StaticRootFixture {
+        fn path(&self) -> &std::path::Path {
+            &self.root
+        }
+    }
+
+    async fn body_string(resp: Response<BoxBody<Bytes, hyper::Error>>) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_serves_a_real_file_with_the_right_content_type() {
+        let root = static_root_fixture();
+        let req = Request::builder().uri("/style.css").body(()).unwrap();
+        let resp = serve_static_response(&req, root.path()).await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "text/css; charset=utf-8");
+        assert_eq!(body_string(resp).await, "body{}");
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_falls_back_to_index_html_for_the_root_path() {
+        let root = static_root_fixture();
+        let req = Request::builder().uri("/").body(()).unwrap();
+        let resp = serve_static_response(&req, root.path()).await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert_eq!(body_string(resp).await, "<h1>home</h1>");
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_falls_back_to_index_html_for_a_subdirectory() {
+        let root = static_root_fixture();
+        let req = Request::builder().uri("/sub").body(()).unwrap();
+        let resp = serve_static_response(&req, root.path()).await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert_eq!(body_string(resp).await, "<h1>sub</h1>");
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_404s_a_missing_file() {
+        let root = static_root_fixture();
+        let req = Request::builder().uri("/nope.html").body(()).unwrap();
+        let resp = serve_static_response(&req, root.path()).await;
+        assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_refuses_a_plain_traversal_path() {
+        let root = static_root_fixture();
+        let req = Request::builder().uri("/../secret.txt").body(()).unwrap();
+        let resp = serve_static_response(&req, root.path()).await;
+        assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_refuses_a_percent_encoded_traversal_path() {
+        let root = static_root_fixture();
+        let req = Request::builder().uri("/%2e%2e/%2e%2e/etc/passwd").body(()).unwrap();
+        let resp = serve_static_response(&req, root.path()).await;
+        assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
     }
 }

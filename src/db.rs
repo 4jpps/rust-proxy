@@ -119,6 +119,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // set together (the API layer never persists just one) means it is.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_pattern TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_replacement TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN static_root TEXT").execute(pool).await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
     // copied above) and `access_allow_ips`/`access_login_username`/
     // `access_login_password_hash` (superseded by the acl_lists/
@@ -952,7 +953,7 @@ pub async fn set_expose_admin_port(pool: &SqlitePool, value: bool) -> Result<(),
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -1000,6 +1001,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 dns_credential_id,
                 redirect,
                 path_rewrite,
+                static_root: row.get::<Option<String>, _>("static_root").map(std::path::PathBuf::from),
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1033,8 +1035,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -1056,6 +1058,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.dns_credential_id.map(|id| id.to_string()))
         .bind(path_rewrite_pattern)
         .bind(path_rewrite_replacement)
+        .bind(h.static_root.as_ref().map(|p| p.to_string_lossy().to_string()))
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -1152,6 +1155,7 @@ mod tests {
             dns_credential_id: None,
             redirect: None,
             path_rewrite: None,
+            static_root: None,
             enabled: true,
         }
     }

@@ -465,6 +465,12 @@ struct HostRequest {
     /// the first time a request hits this host.
     #[serde(default)]
     path_rewrite: Option<crate::config::PathRewrite>,
+    /// See `config::ProxyHost::static_root`'s doc comment. Validated in
+    /// `validate_host_request` to actually exist and be a directory --
+    /// same "reject at save time, not discovered on the first request"
+    /// reasoning as `path_rewrite`'s pattern.
+    #[serde(default)]
+    static_root: Option<std::path::PathBuf>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -478,9 +484,14 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     if req.bind_port == 0 {
         return Err(ApiError::BadRequest("bind_port must not be 0".into()));
     }
-    match &req.redirect {
-        Some(redirect) => crate::config::validate_redirect_target(&redirect.target).map_err(|e| ApiError::BadRequest(e.to_string()))?,
-        None => {
+    match (&req.redirect, &req.static_root) {
+        (Some(redirect), _) => crate::config::validate_redirect_target(&redirect.target).map_err(|e| ApiError::BadRequest(e.to_string()))?,
+        (None, Some(static_root)) => {
+            if !static_root.is_dir() {
+                return Err(ApiError::BadRequest(format!("static_root {} does not exist or is not a directory", static_root.display())));
+            }
+        }
+        (None, None) => {
             if !req.upstream.contains(':') {
                 return Err(ApiError::BadRequest("upstream must be host:port".into()));
             }
@@ -785,6 +796,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
         path_rewrite: body.path_rewrite,
+        static_root: body.static_root,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -822,6 +834,7 @@ async fn update_host(
         dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
         path_rewrite: body.path_rewrite,
+        static_root: body.static_root,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;
