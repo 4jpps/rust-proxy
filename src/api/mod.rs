@@ -15,8 +15,8 @@ use crate::state::AppState;
 async fn serve_one(ip: IpAddr, port: u16, state: AppState) -> anyhow::Result<()> {
     let addr = SocketAddr::from((ip, port));
     let router = routes::build_router(state);
+    let listener = crate::netbind::bind_tcp_listener(addr)?;
     tracing::info!(%addr, "admin API listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
 }

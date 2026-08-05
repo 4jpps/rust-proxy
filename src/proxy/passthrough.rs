@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 /// copies bytes bidirectionally until either side closes. Runs until the
 /// listener itself errors (socket closed, etc).
 pub async fn run_tcp_passthrough(bind_addr: SocketAddr, upstream: SocketAddr) -> std::io::Result<()> {
-    let listener = TcpListener::bind(bind_addr).await?;
+    let listener = crate::netbind::bind_tcp_listener(bind_addr)?;
     tracing::info!(%bind_addr, %upstream, "tcp passthrough listening");
     loop {
         let (mut inbound, peer) = listener.accept().await?;
@@ -44,7 +44,7 @@ const UDP_BUF_SIZE: usize = 64 * 1024;
 /// client, and every subsequent datagram from that client just gets
 /// forwarded through the existing session. Idle sessions are reaped.
 pub async fn run_udp_passthrough(bind_addr: SocketAddr, upstream: SocketAddr) -> std::io::Result<()> {
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    let socket = Arc::new(crate::netbind::bind_udp_socket(bind_addr)?);
     tracing::info!(%bind_addr, %upstream, "udp passthrough listening");
 
     let sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Arc::new(Mutex::new(HashMap::new()));

@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod localip;
 mod logging;
+mod netbind;
 mod nftables;
 mod proxy;
 mod state;

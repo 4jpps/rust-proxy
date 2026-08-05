@@ -116,7 +116,7 @@ fn passthrough_keys(port_rules: &[crate::config::PortRule]) -> Vec<(IpAddr, u16,
 fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
         let addr = SocketAddr::from((bind_ip, bind_port));
-        let listener = match TcpListener::bind(addr).await {
+        let listener = match crate::netbind::bind_tcp_listener(addr) {
             Ok(l) => l,
             Err(err) => {
                 tracing::error!(%addr, error = %err, "failed to bind HTTPS listener");
@@ -398,7 +398,7 @@ fn login_success_response(token: &str) -> Response<BoxBody<Bytes, hyper::Error>>
 fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
         let addr = SocketAddr::from((bind_ip, bind_port));
-        let listener = match TcpListener::bind(addr).await {
+        let listener = match crate::netbind::bind_tcp_listener(addr) {
             Ok(l) => l,
             Err(err) => {
                 tracing::error!(%addr, error = %err, "failed to bind redirect listener");
