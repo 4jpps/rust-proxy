@@ -83,24 +83,33 @@ that host, just to answer the challenge.
 
 Each host can also gate access at the application layer, independent of
 `network.bind_ranges` and the nftables firewall -- the same idea as
-Nginx Proxy Manager's own access lists:
+Nginx Proxy Manager's own access lists, but as reusable, named ACLs
+(`GET`/`POST`/`DELETE /api/acls`) rather than fields typed inline per
+host:
 
-- `access_allow_ips`: a list of CIDRs (`"10.0.0.0/24"`) allowed to reach
-  this host. Empty (the default) means unrestricted; any other source
-  IP gets a 403 before the request ever reaches the upstream.
-- `access_login`: an optional `{"username", "password"}` gate, checked
-  after the IP allow list. A visitor without a valid session gets a real
-  HTML login page (`proxy::login`) in place of the upstream, not an HTTP
-  Basic Auth prompt -- Basic Auth's browser-native dialog is poorly
-  recognized by most password managers, since there's no real form/
-  password field for them to offer to save. Submitting the form sets a
-  signed, `HttpOnly`/`Secure` session cookie scoped to that one host (a
-  session for one domain is never accepted on another, even if somehow
-  presented there). The password is hashed (argon2) server-side and
-  never stored or returned in plaintext -- like every other credential
-  this daemon issues, it's client-authoritative on each `POST`/`PUT`:
-  leaving it out on an edit clears it, the same as any other host field,
-  there's no separate "leave unchanged" option.
+- **IP allow** ACLs hold one or more CIDRs (`"10.0.0.0/24"`) or bare
+  IPv4 addresses (treated as `/32`). A source IP outside every selected
+  list gets a 403 before the request ever reaches the upstream.
+- **Login** ACLs hold one or more `{"username", "password"}` pairs,
+  checked after the IP allow lists. A visitor without a valid session
+  gets a real HTML login page (`proxy::login`) in place of the
+  upstream, not an HTTP Basic Auth prompt -- Basic Auth's browser-native
+  dialog is poorly recognized by most password managers, since there's
+  no real form/password field for them to offer to save. Submitting the
+  form sets a signed, `HttpOnly`/`Secure` session cookie scoped to that
+  one host (a session for one domain is never accepted on another, even
+  if somehow presented there). Passwords are hashed (argon2)
+  server-side at ACL-creation time and never stored or returned in
+  plaintext.
+
+A host selects `acl_ids`: none, one, or several ACLs. Multiple selected
+lists of the same kind combine by union -- any selected IP-allow list's
+range is enough, any selected Login list's credentials work -- while
+the IP-gate and login-gate stay two independent sequential checks, same
+as a single inline list/login gate did before. Managing the list itself
+(adding an IP, rotating a password) happens once in the ACL, not once
+per host that references it. Deleting an ACL still selected by a host
+is rejected -- clear it from every host first.
 
 A host can also be a pure redirect instead of a reverse proxy -- set
 `redirect` (`{"target", "preserve_path", "status"}`) and `upstream`
@@ -110,9 +119,8 @@ path/query onto `target` (redirecting `old.example.com/post` straight
 to `new.example.com/post`); `status` is `"permanent"` (301, the
 default) or `"temporary"` (302). Same as Nginx Proxy Manager's
 Redirection Hosts, a redirect host still gets its own ACME cert and its
-own `access_allow_ips`/`access_login` -- domain matching, TLS, and
-access control are identical to a proxy host, only the final response
-differs.
+own ACL selection -- domain matching, TLS, and access control are
+identical to a proxy host, only the final response differs.
 
 ### Firewall
 
@@ -207,7 +215,7 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 |--------|-------------------------|-------------------------------------------------------------------------------------------|
 | GET    | `/api/dashboard`        | -- (host/port-rule/cert counts, configured `bind_ranges`)                                 |
 | GET    | `/api/hosts`            | --                                                                                         |
-| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","access_allow_ips","access_login","redirect","enabled"}` |
+| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","websockets","force_https","acme_enabled","acme_challenge_type","acl_ids","redirect","enabled"}` |
 | PUT    | `/api/hosts/:id`        | same shape as POST                                                                         |
 | DELETE | `/api/hosts/:id`        | --                                                                                         |
 | GET    | `/api/port-rules`       | --                                                                                         |
@@ -217,6 +225,9 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 | GET    | `/api/certs`            | -- (`{domain, not_after, days_remaining}` per issued/uploaded cert)                       |
 | POST   | `/api/certs`            | `{"domain","fullchain_pem","private_key_pem"}` -- upload a custom cert (see Configuration) |
 | DELETE | `/api/certs/:domain`    | --                                                                                         |
+| GET    | `/api/acls`             | -- (`{id, name, kind, created_at}` per ACL, never entries/credentials)                    |
+| POST   | `/api/acls`             | `{"name","kind"}` plus `"ip_entries"` (IP allow) or `"credentials"` (Login, `[{"username","password"}]`) |
+| DELETE | `/api/acls/:id`         | -- refused (409) while any host still selects it                                          |
 
 ```sh
 curl -X POST https://proxy.example.com/api/hosts \
@@ -262,9 +273,9 @@ for the token-authenticated API.
 - `proxy` -- the data plane: `router` (pure host-matching), `tls`
   (SNI cert dispatch reading live state), `http` (forwarding + WebSocket
   upgrade passthrough + a `redirect` host's response), `access` (pure
-  IP-allow-list checks), `login` (the `access_login` session-cookie
-  gate: credential check, HMAC session signing/verification, and the
-  login page itself) -- access/login run before a matched request is
+  IP-allow-list checks), `login` (the Login-ACL session-cookie gate:
+  credential check, HMAC session signing/verification, and the login
+  page itself) -- access/login run before a matched request is
   forwarded (or, for a `redirect` host, before the redirect response is
   built instead), `passthrough` (raw TCP/UDP
   for non-HTTP port rules). ALPN offers `h2` then `http/1.1`; the HTTPS

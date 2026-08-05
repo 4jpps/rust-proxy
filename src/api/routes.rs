@@ -36,6 +36,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/tokens/:id", axum::routing::delete(delete_api_token))
         .route("/api/dns-credentials", get(list_dns_credentials).post(create_dns_credential))
         .route("/api/dns-credentials/:id", axum::routing::delete(delete_dns_credential))
+        .route("/api/acls", get(list_acls).post(create_acl_list))
+        .route("/api/acls/:id", axum::routing::delete(delete_acl_list))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
@@ -269,16 +271,12 @@ struct HostRequest {
     acme_enabled: bool,
     #[serde(default)]
     acme_challenge_type: crate::config::AcmeChallengeType,
-    /// CIDR strings (e.g. `"10.0.0.0/24"`) -- empty means unrestricted.
-    /// Parsed and validated in `parse_access_allow_ips`.
+    /// Named ACLs this host selects -- see `config::AclList`. Empty
+    /// means unrestricted (no IP allow list, no login gate), same as
+    /// the pre-ACL-system default. Validated in `validate_acl_ids`
+    /// (every id must actually exist).
     #[serde(default)]
-    access_allow_ips: Vec<String>,
-    /// `None` means no login gate (see `proxy::login`). `password` is
-    /// plaintext, hashed server-side (`build_host_login`) before it ever
-    /// reaches sqlite -- same as the admin account's own password, never
-    /// stored raw.
-    #[serde(default)]
-    access_login: Option<HostLoginRequest>,
+    acl_ids: Vec<Uuid>,
     #[serde(default)]
     dns_credential_id: Option<Uuid>,
     /// When set, this host redirects instead of proxying -- see
@@ -290,11 +288,6 @@ struct HostRequest {
     enabled: bool,
 }
 
-#[derive(Deserialize)]
-struct HostLoginRequest {
-    username: String,
-    password: String,
-}
 fn default_true() -> bool {
     true
 }
@@ -317,62 +310,138 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     Ok(())
 }
 
-fn parse_access_allow_ips(raw: &[String]) -> Result<Vec<ipnet::Ipv4Net>, ApiError> {
-    raw.iter()
-        .map(|s| s.parse().map_err(|_| ApiError::BadRequest(format!("invalid access_allow_ips entry \"{s}\""))))
-        .collect()
+/// Every id in `acl_ids` must actually exist -- a typo'd or
+/// since-deleted ACL id must never be accepted at host-creation time
+/// only to silently fail to restrict anything at request time. Same
+/// "reject at config time, not discovered hours later" reasoning as
+/// `validate_dns_credential_choice`.
+async fn validate_acl_ids(state: &AppState, acl_ids: &[Uuid]) -> Result<(), ApiError> {
+    if acl_ids.is_empty() {
+        return Ok(());
+    }
+    let existing: std::collections::HashSet<Uuid> = crate::db::list_acl_lists(state.db()).await?.into_iter().map(|a| a.id).collect();
+    for id in acl_ids {
+        if !existing.contains(id) {
+            return Err(ApiError::BadRequest(format!("ACL {id} does not exist")));
+        }
+    }
+    Ok(())
 }
 
-/// Hashes the plaintext password (argon2, same as the admin account's
-/// own) into a storable `HostAuth` -- `None` in means no login gate for
-/// this host, same as leaving `access_login` out of the request
-/// entirely.
-fn build_host_login(req: &Option<HostLoginRequest>) -> Result<Option<crate::config::HostAuth>, ApiError> {
-    let Some(req) = req else { return Ok(None) };
-    if req.username.trim().is_empty() || req.password.is_empty() {
-        return Err(ApiError::BadRequest("access_login requires a non-empty username and password".into()));
+/// Accepts either a real CIDR (`10.0.0.0/24`) or a bare IPv4 address
+/// (`203.0.113.5`, treated as `/32`) -- the admin UI's own placeholder
+/// text advertises both forms side by side ("10.0.0.0/24, 203.0.113.5"),
+/// so a bare address must actually work rather than 400ing on exactly
+/// what the UI suggested typing.
+fn normalize_cidr(s: &str) -> Result<String, ApiError> {
+    if let Ok(net) = s.parse::<ipnet::Ipv4Net>() {
+        return Ok(net.to_string());
     }
-    let password_hash = auth::hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Some(crate::config::HostAuth {
-        username: req.username.clone(),
-        password_hash,
-    }))
+    if let Ok(addr) = s.parse::<std::net::Ipv4Addr>() {
+        return Ok(format!("{addr}/32"));
+    }
+    Err(ApiError::BadRequest(format!("invalid CIDR or IP address: {s}")))
 }
 
-/// Same as `build_host_login`, but for `PUT /api/hosts/:id`: an
-/// explicitly-blank password means "keep whatever this host's login
-/// gate already had" rather than a validation error. `GET`/`PUT
-/// /api/hosts` never return a login gate's password hash (see
-/// `HostAuth::password_hash`'s `#[serde(skip_serializing)]`), so the
-/// admin UI's edit form can only ever prefill the username, never the
-/// password -- requiring a full re-type on every edit that touches any
-/// *other* field of a login-gated host would be a real usability trap,
-/// not just an inconvenience.
-fn build_host_login_for_update(req: &Option<HostLoginRequest>, existing: &Option<crate::config::HostAuth>) -> Result<Option<crate::config::HostAuth>, ApiError> {
-    let Some(req) = req else { return Ok(None) };
-    if req.username.trim().is_empty() {
-        return Err(ApiError::BadRequest("access_login requires a non-empty username".into()));
+#[derive(Serialize)]
+struct AclListSummary {
+    id: Uuid,
+    name: String,
+    kind: crate::config::AclKind,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+struct AclCredentialRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct CreateAclListRequest {
+    name: String,
+    kind: crate::config::AclKind,
+    #[serde(default)]
+    ip_entries: Vec<String>,
+    #[serde(default)]
+    credentials: Vec<AclCredentialRequest>,
+}
+
+async fn list_acls(State(state): State<AppState>) -> Result<Json<Vec<AclListSummary>>, ApiError> {
+    let lists = crate::db::list_acl_lists(state.db()).await?;
+    Ok(Json(
+        lists
+            .into_iter()
+            .map(|a| AclListSummary { id: a.id, name: a.name, kind: a.kind, created_at: a.created_at })
+            .collect(),
+    ))
+}
+
+/// An `IpAllow` list needs at least one valid CIDR entry, a `Login` list
+/// needs at least one non-empty username/password pair -- an ACL nobody
+/// can ever match is never useful to create, and passwords are hashed
+/// here (same as every other credential this project stores) so a
+/// plaintext password never reaches sqlite.
+async fn create_acl_list(State(state): State<AppState>, Json(body): Json<CreateAclListRequest>) -> Result<Json<AclListSummary>, ApiError> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".into()));
     }
-    if req.password.is_empty() {
-        return match existing {
-            Some(existing) => Ok(Some(crate::config::HostAuth {
-                username: req.username.clone(),
-                password_hash: existing.password_hash.clone(),
-            })),
-            None => Err(ApiError::BadRequest("access_login requires a non-empty password (this host has no existing login gate to keep unchanged)".into())),
-        };
+    if crate::db::acl_list_name_exists(state.db(), name).await? {
+        return Err(ApiError::BadRequest(format!("an ACL named \"{name}\" already exists")));
     }
-    let password_hash = auth::hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Some(crate::config::HostAuth {
-        username: req.username.clone(),
-        password_hash,
-    }))
+
+    let id = Uuid::new_v4();
+    let created_at = chrono::Utc::now();
+
+    match body.kind {
+        crate::config::AclKind::IpAllow => {
+            if body.ip_entries.is_empty() {
+                return Err(ApiError::BadRequest("ip_entries must not be empty for an IP allow list".into()));
+            }
+            let normalized: Vec<String> = body.ip_entries.iter().map(|s| normalize_cidr(s)).collect::<Result<_, _>>()?;
+            crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
+            crate::db::add_acl_ip_entries(state.db(), id, &normalized).await?;
+        }
+        crate::config::AclKind::Login => {
+            if body.credentials.is_empty() {
+                return Err(ApiError::BadRequest("credentials must not be empty for a login list".into()));
+            }
+            let mut hashed = Vec::with_capacity(body.credentials.len());
+            for cred in &body.credentials {
+                if cred.username.trim().is_empty() || cred.password.is_empty() {
+                    return Err(ApiError::BadRequest("username and password must not be empty".into()));
+                }
+                let password_hash = auth::hash_password(&cred.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+                hashed.push((cred.username.clone(), password_hash));
+            }
+            crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
+            crate::db::add_acl_credentials(state.db(), id, &hashed).await?;
+        }
+    }
+
+    Ok(Json(AclListSummary { id, name: name.to_string(), kind: body.kind, created_at }))
+}
+
+/// Refuses to delete an ACL still selected by any live host's `acl_ids`
+/// -- deletion has no FK/cascade onto hosts, so an orphaned reference
+/// would otherwise silently stop restricting that host's traffic instead
+/// of failing loudly. Same reasoning as `delete_dns_credential`.
+async fn delete_acl_list(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+    let still_in_use = state.hosts().iter().any(|h| h.acl_ids.contains(&id));
+    if still_in_use {
+        return Err(ApiError::Conflict("one or more hosts still select this ACL -- remove it from them first".into()));
+    }
+    let found = crate::db::delete_acl_list(state.db(), id).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest>) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
-    let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
-    let access_login = build_host_login(&body.access_login)?;
+    validate_acl_ids(&state, &body.acl_ids).await?;
     let host = ProxyHost {
         id: Uuid::new_v4(),
         domain: body.domain,
@@ -383,8 +452,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,
         acme_challenge_type: body.acme_challenge_type,
-        access_allow_ips,
-        access_login,
+        acl_ids: body.acl_ids,
         dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
         enabled: body.enabled,
@@ -405,9 +473,7 @@ async fn update_host(
     Json(body): Json<HostRequest>,
 ) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
-    let access_allow_ips = parse_access_allow_ips(&body.access_allow_ips)?;
-    let existing_access_login = state.hosts().iter().find(|h| h.id == id).and_then(|h| h.access_login.clone());
-    let access_login = build_host_login_for_update(&body.access_login, &existing_access_login)?;
+    validate_acl_ids(&state, &body.acl_ids).await?;
     let updated = ProxyHost {
         id,
         domain: body.domain,
@@ -418,8 +484,7 @@ async fn update_host(
         force_https: body.force_https,
         acme_enabled: body.acme_enabled,
         acme_challenge_type: body.acme_challenge_type,
-        access_allow_ips,
-        access_login,
+        acl_ids: body.acl_ids,
         dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
         enabled: body.enabled,
@@ -1227,52 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_host_with_access_control_persists_ip_allow_list_and_never_returns_the_password_hash() {
-        let router = build_router(test_state().await);
-        let cookie = logged_in_cookie(&router).await;
-
-        let create_resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/hosts")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_allow_ips":["10.0.0.0/24"],"access_login":{"username":"viewer","password":"s3cret"}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(create_resp.status(), StatusCode::OK);
-        let created = body_json(create_resp).await;
-        assert_eq!(created["access_allow_ips"], serde_json::json!(["10.0.0.0/24"]));
-        assert_eq!(created["access_login"]["username"], "viewer");
-        assert!(
-            created["access_login"].get("password_hash").is_none(),
-            "the argon2 hash must never be returned, even to an authenticated admin"
-        );
-
-        let list_resp = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/hosts")
-                    .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let json = body_json(list_resp).await;
-        assert_eq!(json[0]["access_allow_ips"], serde_json::json!(["10.0.0.0/24"]));
-        assert_eq!(json[0]["access_login"]["username"], "viewer");
-    }
-
-    #[tokio::test]
-    async fn create_host_with_an_invalid_access_allow_ips_entry_is_rejected() {
+    async fn create_host_with_a_nonexistent_acl_id_is_rejected() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
 
@@ -1283,180 +1303,16 @@ mod tests {
                     .uri("/api/hosts")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_allow_ips":["not-a-cidr"]}"#,
-                    ))
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        "acl_ids":["{}"]}}"#,
+                        Uuid::new_v4()
+                    )))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn create_host_with_an_empty_login_password_is_rejected() {
-        let router = build_router(test_state().await);
-        let cookie = logged_in_cookie(&router).await;
-
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/hosts")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_login":{"username":"viewer","password":""}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn update_host_with_a_blank_password_keeps_the_existing_login_gate_working() {
-        // The admin UI's edit form can only ever prefill a login gate's
-        // username, never its password (GET/PUT never return the hash) --
-        // this is the actual usability behavior that gap requires: a PUT
-        // that changes some other field (here, the username) but leaves
-        // password blank must keep the existing password working rather
-        // than erroring or silently clearing the gate.
-        let state = test_state().await;
-        let router = build_router(state.clone());
-        let cookie = logged_in_cookie(&router).await;
-
-        let create_resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/hosts")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_login":{"username":"viewer","password":"original-password"}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
-        let original_hash = state.hosts().iter().find(|h| h.id.to_string() == id).unwrap().access_login.as_ref().unwrap().password_hash.clone();
-
-        let update_resp = router
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/api/hosts/{id}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_login":{"username":"renamed-viewer","password":""}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(update_resp.status(), StatusCode::OK);
-
-        let updated = state.hosts().iter().find(|h| h.id.to_string() == id).unwrap().clone();
-        let login = updated.access_login.as_ref().unwrap();
-        assert_eq!(login.username, "renamed-viewer", "the username change must still apply");
-        assert_eq!(login.password_hash, original_hash, "a blank password on update must keep the existing hash unchanged");
-        assert!(auth::verify_password("original-password", &login.password_hash), "the original password must still work");
-    }
-
-    #[tokio::test]
-    async fn update_host_with_a_new_password_replaces_the_existing_hash() {
-        let state = test_state().await;
-        let router = build_router(state.clone());
-        let cookie = logged_in_cookie(&router).await;
-
-        let create_resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/hosts")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_login":{"username":"viewer","password":"original-password"}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
-
-        let update_resp = router
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/api/hosts/{id}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_login":{"username":"viewer","password":"a-brand-new-password"}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(update_resp.status(), StatusCode::OK);
-
-        let updated = state.hosts().iter().find(|h| h.id.to_string() == id).unwrap().clone();
-        let login = updated.access_login.as_ref().unwrap();
-        assert!(auth::verify_password("a-brand-new-password", &login.password_hash));
-        assert!(!auth::verify_password("original-password", &login.password_hash), "the old password must no longer work");
-    }
-
-    #[tokio::test]
-    async fn update_host_with_a_blank_password_and_no_existing_login_gate_is_rejected() {
-        let router = build_router(test_state().await);
-        let cookie = logged_in_cookie(&router).await;
-
-        let create_resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/hosts")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
-
-        let update_resp = router
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/api/hosts/{id}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(
-                        r#"{"domain":"internal.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
-                        "access_login":{"username":"viewer","password":""}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2210,5 +2066,294 @@ mod tests {
         assert_eq!(entry["name"], "ci pipeline");
         assert!(entry.get("token").is_none());
         assert!(entry.get("token_hash").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_ip_allow_acl_persists_and_appears_in_the_list() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let created = body_json(create_resp).await;
+        assert_eq!(created["name"], "office");
+        assert_eq!(created["kind"], "ip_allow");
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/acls")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["name"], "office");
+    }
+
+    #[tokio::test]
+    async fn create_ip_allow_acl_accepts_a_bare_ip_address_as_an_implicit_slash_32() {
+        // The form's own placeholder text advertises a bare IP
+        // ("203.0.113.5") right alongside a real CIDR -- it must
+        // actually be accepted, not just look like it should be.
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"name":"single-ip","kind":"ip_allow","ip_entries":["203.0.113.5"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_ip_allow_acl_with_no_entries_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"name":"empty","kind":"ip_allow","ip_entries":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_ip_allow_acl_with_an_invalid_cidr_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"name":"bad","kind":"ip_allow","ip_entries":["not-a-cidr"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_login_acl_hashes_passwords_and_never_returns_them() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"name":"viewers","kind":"login","credentials":[{"username":"alice","password":"s3cret"},{"username":"bob","password":"s3cret2"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let created = body_json(create_resp).await;
+        assert_eq!(created["name"], "viewers");
+        assert!(created.get("credentials").is_none(), "credentials, including hashes, must never be returned");
+    }
+
+    #[tokio::test]
+    async fn create_login_acl_with_no_credentials_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"name":"empty-login","kind":"login","credentials":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_acl_with_a_duplicate_name_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        for _ in 0..2 {
+            let _ = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/acls")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, cookie.clone())
+                        .body(axum::body::Body::from(r#"{"name":"dup","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/acls")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json.as_array().unwrap().len(), 1, "the second create with a duplicate name must have been rejected, not silently duplicated");
+    }
+
+    #[tokio::test]
+    async fn delete_acl_removes_it_and_repeated_delete_returns_404() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+
+        let delete_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/acls/{id}"))
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+        let repeat_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/acls/{id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeat_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_acl_still_selected_by_a_host_is_refused() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/acls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let acl_id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acl_ids":["{acl_id}"]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let delete_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/acls/{acl_id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn acl_endpoints_require_authentication() {
+        let router = build_router(test_state().await);
+
+        let resp = router
+            .oneshot(Request::builder().uri("/api/acls").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

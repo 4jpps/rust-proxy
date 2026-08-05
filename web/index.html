@@ -99,6 +99,7 @@
     <button type="button" class="tab-btn" data-tab="rules">Firewall Rules</button>
     <button type="button" class="tab-btn" data-tab="certs">Certificates</button>
     <button type="button" class="tab-btn" data-tab="dns">DNS Credentials</button>
+    <button type="button" class="tab-btn" data-tab="acls">ACLs</button>
     <button type="button" class="tab-btn" data-tab="tokens">API Tokens</button>
   </nav>
 
@@ -150,12 +151,11 @@
       <fieldset>
         <legend>Access control (optional)</legend>
         <div class="field-grid">
-          <label class="wide"><span>Allowed source IPs/CIDRs, comma-separated -- blank means unrestricted</span>
-            <input type="text" name="access_allow_ips" placeholder="10.0.0.0/24, 203.0.113.5"></label>
-          <label><span>Login username -- blank means no login gate</span>
-            <input type="text" name="access_login_username" placeholder="viewer"></label>
-          <label><span>Login password</span>
-            <input type="password" name="access_login_password" placeholder="(leave blank to keep unchanged when editing)"></label>
+          <label class="wide"><span>ACLs -- select none, one, or several. IP-allow lists combine by union (any
+            selected range is enough); Login lists combine by union too (any selected list's credentials work).
+            Selecting an IP-allow list gates by source IP; selecting a Login list also requires signing in.
+            Manage the lists themselves in the ACLs tab.</span>
+            <select name="acl_ids" multiple size="5"></select></label>
         </div>
       </fieldset>
 
@@ -252,6 +252,37 @@
       <div class="form-actions">
         <button type="submit">Add credential</button>
         <span class="error" id="dns-credential-error"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="tab-panel" id="tab-acls">
+    <h2>Access control lists</h2>
+    <p class="hint">Reusable, named lists a host can select none, one, or several of (see the host
+      form's "Access control" section). An <b>IP allow</b> list restricts by source IP/CIDR; a
+      <b>Login</b> list gates behind a real sign-in page and can hold multiple username/password pairs.</p>
+    <table id="acls-table"><thead><tr><th>Name</th><th>Kind</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
+    <form id="acl-form">
+      <div class="field-grid">
+        <label><span>Name</span><input type="text" name="name" placeholder="office network" required></label>
+        <label><span>Kind</span>
+          <select name="kind" id="acl-kind-select">
+            <option value="ip_allow">IP allow list</option>
+            <option value="login">Login (username/password)</option>
+          </select>
+        </label>
+      </div>
+      <div id="acl-ip-fields" class="field-grid">
+        <label class="wide"><span>Allowed source IPs/CIDRs, comma-separated</span>
+          <input type="text" name="ip_entries" placeholder="10.0.0.0/24, 203.0.113.5"></label>
+      </div>
+      <div id="acl-login-fields" style="display:none">
+        <div id="acl-credential-rows"></div>
+        <button type="button" id="acl-add-credential" style="margin-top:0.4rem">+ Add credential</button>
+      </div>
+      <div class="form-actions">
+        <button type="submit">Create ACL</button>
+        <span class="error" id="acl-error"></span>
       </div>
     </form>
   </section>
@@ -423,6 +454,10 @@ document.getElementById('tabs').addEventListener('click', (e) => {
 });
 
 async function refreshAll() {
+  // refreshAcls populates aclsById, which refreshHosts reads to render
+  // the Access column and the host form's ACL picker -- must resolve
+  // first, not run concurrently with it.
+  await refreshAcls();
   await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshDnsCredentials()]);
 }
 
@@ -463,14 +498,8 @@ function setHostFormMode(host) {
   form.acme_enabled.checked = host.acme_enabled;
   form.acme_challenge_type.value = host.acme_challenge_type;
   form.dns_credential_id.value = host.dns_credential_id || '';
-  form.access_allow_ips.value = (host.access_allow_ips || []).join(', ');
-  form.access_login_username.value = host.access_login ? host.access_login.username : '';
-  // Password hashes are never sent back by the API (see HostAuth's
-  // #[serde(skip_serializing)]) -- left blank here always. Submitting
-  // with a login username but a blank password is rejected by the
-  // server, so an operator editing a login-gated host must re-type
-  // its password (or clear the username to remove the gate entirely).
-  form.access_login_password.value = '';
+  const aclIds = new Set(host.acl_ids || []);
+  for (const opt of form.acl_ids.options) opt.selected = aclIds.has(opt.value);
   form.redirect_target.value = host.redirect ? host.redirect.target : '';
   form.redirect_preserve_path.checked = host.redirect ? host.redirect.preserve_path : true;
   form.redirect_status.value = host.redirect ? host.redirect.status : 'permanent';
@@ -491,10 +520,7 @@ async function refreshHosts() {
   tbody.innerHTML = '';
   for (const h of hosts) {
     const tr = document.createElement('tr');
-    const access = [
-      h.access_allow_ips && h.access_allow_ips.length ? `${h.access_allow_ips.length} IP range${h.access_allow_ips.length === 1 ? '' : 's'}` : '',
-      h.access_login ? `login: ${esc(h.access_login.username)}` : '',
-    ].filter(Boolean).join(', ');
+    const access = (h.acl_ids || []).map((id) => (aclsById[id] ? esc(aclsById[id].name) : '(deleted)')).join(', ');
     const target = h.redirect
       ? `→ ${esc(h.redirect.target)} (${h.redirect.status === 'temporary' ? '302' : '301'})`
       : esc(h.upstream);
@@ -521,9 +547,7 @@ async function refreshHosts() {
 document.getElementById('host-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
-  const allowIps = (fd.get('access_allow_ips') || '').split(',').map(s => s.trim()).filter(Boolean);
-  const loginUsername = fd.get('access_login_username');
-  const loginPassword = fd.get('access_login_password');
+  const aclIds = Array.from(document.querySelector('#host-form select[name=acl_ids]').selectedOptions).map((o) => o.value);
   const redirectTarget = fd.get('redirect_target');
   const dnsCredentialId = fd.get('dns_credential_id');
   const body = {
@@ -532,8 +556,7 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
     force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
     acme_challenge_type: fd.get('acme_challenge_type'),
     dns_credential_id: dnsCredentialId ? dnsCredentialId : null,
-    access_allow_ips: allowIps,
-    access_login: loginUsername ? { username: loginUsername, password: loginPassword } : null,
+    acl_ids: aclIds,
     redirect: redirectTarget
       ? { target: redirectTarget, preserve_path: fd.get('redirect_preserve_path') === 'on', status: fd.get('redirect_status') }
       : null,
@@ -677,6 +700,83 @@ document.getElementById('dns-credential-form').addEventListener('submit', async 
     refreshDnsCredentials();
   } else {
     document.getElementById('dns-credential-error').textContent = (await resp.json()).error || 'failed';
+  }
+});
+
+// Keyed by id, refreshed by refreshAcls() -- refreshHosts reads this to
+// render ACL names in the Access column instead of raw ids.
+let aclsById = {};
+
+document.getElementById('acl-kind-select').addEventListener('change', (e) => {
+  const isLogin = e.target.value === 'login';
+  document.getElementById('acl-ip-fields').style.display = isLogin ? 'none' : 'grid';
+  document.getElementById('acl-login-fields').style.display = isLogin ? 'block' : 'none';
+});
+
+function addAclCredentialRow() {
+  const row = document.createElement('div');
+  row.className = 'field-grid';
+  row.style.marginTop = '0.4rem';
+  row.innerHTML = `
+    <label><span>Username</span><input type="text" class="acl-cred-username" placeholder="viewer"></label>
+    <label><span>Password</span><input type="password" class="acl-cred-password"></label>
+    <button type="button" class="acl-cred-remove" style="align-self:end">Remove</button>`;
+  row.querySelector('.acl-cred-remove').addEventListener('click', () => row.remove());
+  document.getElementById('acl-credential-rows').appendChild(row);
+}
+document.getElementById('acl-add-credential').addEventListener('click', addAclCredentialRow);
+addAclCredentialRow();
+
+async function refreshAcls() {
+  const acls = await (await api('/api/acls')).json();
+  aclsById = Object.fromEntries(acls.map((a) => [a.id, a]));
+
+  const tbody = document.querySelector('#acls-table tbody');
+  tbody.innerHTML = '';
+  for (const a of acls) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${esc(a.name)}</td><td>${a.kind === 'login' ? 'Login' : 'IP allow'}</td>
+      <td>${new Date(a.created_at).toLocaleString()}</td>
+      <td><button class="danger" data-id="${a.id}">Delete</button></td>`;
+    tr.querySelector('button').addEventListener('click', async () => {
+      if (!confirm(`Delete ACL "${a.name}"? Any host still selecting it must be updated first.`)) return;
+      const resp = await api(`/api/acls/${a.id}`, { method: 'DELETE' });
+      if (resp.ok) refreshAll();
+      else document.getElementById('acl-error').textContent = (await resp.json()).error || 'failed';
+    });
+    tbody.appendChild(tr);
+  }
+
+  const select = document.querySelector('#host-form select[name=acl_ids]');
+  const selected = new Set(Array.from(select.selectedOptions).map((o) => o.value));
+  select.innerHTML = acls.map((a) => `<option value="${esc(a.id)}">${esc(a.name)} (${a.kind === 'login' ? 'login' : 'IP allow'})</option>`).join('');
+  for (const opt of select.options) opt.selected = selected.has(opt.value);
+}
+
+document.getElementById('acl-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const kind = fd.get('kind');
+  const body = { name: fd.get('name'), kind };
+  if (kind === 'login') {
+    body.credentials = Array.from(document.querySelectorAll('#acl-credential-rows > div')).map((row) => ({
+      username: row.querySelector('.acl-cred-username').value,
+      password: row.querySelector('.acl-cred-password').value,
+    })).filter((c) => c.username || c.password);
+  } else {
+    body.ip_entries = (fd.get('ip_entries') || '').split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  const resp = await api('/api/acls', { method: 'POST', body: JSON.stringify(body) });
+  if (resp.ok) {
+    e.target.reset();
+    document.getElementById('acl-credential-rows').innerHTML = '';
+    addAclCredentialRow();
+    document.getElementById('acl-ip-fields').style.display = 'grid';
+    document.getElementById('acl-login-fields').style.display = 'none';
+    document.getElementById('acl-error').textContent = '';
+    refreshAll();
+  } else {
+    document.getElementById('acl-error').textContent = (await resp.json()).error || 'failed';
   }
 });
 

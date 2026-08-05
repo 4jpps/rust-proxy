@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **Reusable, named ACLs replace per-host inline access control.** A
+  host used to carry its own `access_allow_ips`/`access_login` fields
+  directly -- sharing the same office IP range or login across five
+  hosts meant retyping (and re-hashing) it five times, and there was no
+  way to update one shared rule in one place. Access control is now a
+  first-class resource: create a named **IP allow** list (one or more
+  CIDRs/bare IPs) or **Login** list (one or more username/password
+  pairs, argon2-hashed) once from the new ACLs tab, then select none,
+  one, or several of them per host. A host with multiple selected lists
+  of the same kind unions them -- any selected IP range is enough, any
+  selected list's credentials work -- while the IP-gate and login-gate
+  remain the same two independent sequential checks as before (an
+  allowed IP still doesn't bypass a configured login). Resolution
+  happens live from sqlite on every request (`db::resolve_acl_ids`),
+  the same precedent already set by bearer-token auth's live DB lookup,
+  rather than hot-reloaded state -- ACL definitions change rarely
+  enough that this is the simpler design. Deleting an ACL still
+  selected by a live host is refused, same guard already used for DNS
+  credentials. Existing hosts' inline `access_allow_ips`/`access_login`
+  data is migrated automatically and losslessly into an auto-created,
+  per-host-named ACL the first time the daemon starts on the new schema
+  (`db::migrate_legacy_host_access`) -- no manual re-entry needed on
+  upgrade. See `config::{AclList,AclKind}`, `db::resolve_acl_ids`, and
+  `api::routes`'s `/api/acls` handlers.
 - **`main.rs` startup sequencing pulled into a new `bootstrap` module.**
   DB connect + seed/load hosts+port_rules+the default DNS credential +
   resolve the admin identity + load certs from disk used to all be
@@ -119,25 +143,28 @@
   otherwise). Wildcard domains always use dns-01 regardless of this
   setting, since no CA offers http-01 for them. See `acme::http01` and
   `acme::resolve_challenge_type`.
-- Per-host access lists -- an IP allow list (`access_allow_ips`) and/or
-  a login gate (`access_login`), enforced at the application layer
-  before a request reaches the upstream, independent of
-  `network.bind_ranges` and the nftables firewall. The most-cited
-  real-world use of Nginx Proxy Manager's raw config-injection escape
-  hatch, covered here as a structured feature instead. `access_login`
-  serves a real HTML login page (`proxy::login`) and a signed,
-  `HttpOnly`/`Secure` session cookie scoped to that one host, rather
-  than an HTTP Basic Auth prompt -- password managers reliably recognize
-  and offer to save a real login form, unlike Basic Auth's browser-
-  native dialog. Passwords are argon2-hashed server-side and never
-  stored or returned in plaintext. See `proxy::access`/`proxy::login`.
+- Per-host access lists -- an IP allow list and/or a login gate,
+  enforced at the application layer before a request reaches the
+  upstream, independent of `network.bind_ranges` and the nftables
+  firewall. The most-cited real-world use of Nginx Proxy Manager's raw
+  config-injection escape hatch, covered here as a structured feature
+  instead. (Originally per-host inline fields; superseded by the
+  reusable ACL system above -- this bullet describes the underlying
+  mechanism, which the ACL rewrite kept, not the now-removed inline
+  fields.) The login gate serves a real HTML login page (`proxy::login`)
+  and a signed, `HttpOnly`/`Secure` session cookie scoped to that one
+  host, rather than an HTTP Basic Auth prompt -- password managers
+  reliably recognize and offer to save a real login form, unlike Basic
+  Auth's browser-native dialog. Passwords are argon2-hashed server-side
+  and never stored or returned in plaintext. See
+  `proxy::access`/`proxy::login`.
 - Redirection hosts -- a host can now be a pure redirect (`redirect`:
   `{"target", "preserve_path", "status"}`) instead of a reverse proxy;
   `upstream` becomes ignored/optional. `preserve_path` (default `true`)
   appends the visited path/query onto `target`; `status` is
   `"permanent"` (301, default) or `"temporary"` (302). Same as Nginx
   Proxy Manager's Redirection Hosts, it still gets its own ACME cert and
-  its own `access_allow_ips`/`access_login` -- only the final response
+  its own ACL selection -- only the final response
   differs from a normal proxy host. See `config::RedirectTarget` and
   `proxy::http::redirect_target_response`.
 - Custom/uploaded certificates -- `POST /api/certs` publishes a

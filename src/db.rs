@@ -15,7 +15,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::config::{AcmeChallengeType, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost, RedirectStatus, RedirectTarget};
+use crate::config::{AcmeChallengeType, AclKind, AclList, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost, RedirectStatus, RedirectTarget};
 
 pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let url = if db_path.as_os_str() == ":memory:" {
@@ -72,6 +72,57 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_preserve_path INTEGER NOT NULL DEFAULT 1").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_status TEXT NOT NULL DEFAULT 'permanent'").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN dns_credential_id TEXT").execute(pool).await;
+    // Comma-joined ACL UUIDs -- same convention as the (now-legacy,
+    // still-present-but-unread-by-new-code) access_allow_ips column
+    // above. The access_allow_ips/access_login_* columns are left in
+    // place, not dropped: migrate_legacy_host_access below reads them
+    // once to preserve any pre-existing per-host access control as a
+    // real ACL, and DROP COLUMN support varies enough across sqlite
+    // versions in the wild that leaving a few unused columns behind is
+    // a safer bet than risking that migration failing outright.
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''").execute(pool).await;
+
+    // Metadata only -- kind is 'ip_allow' or 'login'; entries live in
+    // the two tables below, keyed by acl_list_id. name is UNIQUE so an
+    // operator gets an immediate, clear conflict error rather than two
+    // indistinguishable lists in the picker.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS acl_lists (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS acl_ip_entries (
+            id TEXT PRIMARY KEY,
+            acl_list_id TEXT NOT NULL,
+            cidr TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS acl_credentials (
+            id TEXT PRIMARY KEY,
+            acl_list_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    migrate_legacy_host_access(pool).await?;
 
     sqlx::query(
         r#"
@@ -360,6 +411,136 @@ pub async fn delete_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<bool, 
     Ok(result.rows_affected() > 0)
 }
 
+fn acl_kind_to_str(kind: AclKind) -> &'static str {
+    match kind {
+        AclKind::IpAllow => "ip_allow",
+        AclKind::Login => "login",
+    }
+}
+
+fn acl_kind_from_str(s: &str) -> AclKind {
+    match s {
+        "login" => AclKind::Login,
+        _ => AclKind::IpAllow,
+    }
+}
+
+pub async fn create_acl_list(pool: &SqlitePool, id: Uuid, name: &str, kind: AclKind, created_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO acl_lists (id, name, kind, created_at) VALUES (?, ?, ?, ?)")
+        .bind(id.to_string())
+        .bind(name)
+        .bind(acl_kind_to_str(kind))
+        .bind(created_at.to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn add_acl_ip_entries(pool: &SqlitePool, acl_list_id: Uuid, cidrs: &[String]) -> Result<(), sqlx::Error> {
+    for cidr in cidrs {
+        sqlx::query("INSERT INTO acl_ip_entries (id, acl_list_id, cidr) VALUES (?, ?, ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(acl_list_id.to_string())
+            .bind(cidr)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// `credentials` is `(username, password_hash)` pairs -- hashing
+/// happens at the API layer, same as every other credential this
+/// project stores (admin identity, host logins before this replaced
+/// them).
+pub async fn add_acl_credentials(pool: &SqlitePool, acl_list_id: Uuid, credentials: &[(String, String)]) -> Result<(), sqlx::Error> {
+    for (username, password_hash) in credentials {
+        sqlx::query("INSERT INTO acl_credentials (id, acl_list_id, username, password_hash) VALUES (?, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(acl_list_id.to_string())
+            .bind(username)
+            .bind(password_hash)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, name, kind, created_at FROM acl_lists ORDER BY created_at ASC").fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(AclList {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
+                name: row.get("name"),
+                kind: acl_kind_from_str(&row.get::<String, _>("kind")),
+                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at")).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+            })
+        })
+        .collect()
+}
+
+pub async fn acl_list_name_exists(pool: &SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query("SELECT 1 FROM acl_lists WHERE name = ?").bind(name).fetch_optional(pool).await?;
+    Ok(row.is_some())
+}
+
+/// Deletes the list and its entries. Doesn't check whether any host
+/// still references it by id -- see `api::routes::delete_acl_list`,
+/// which refuses the request at the API layer while any live host's
+/// `acl_ids` still contains it, the same guard already used for DNS
+/// credentials.
+pub async fn delete_acl_list(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM acl_lists WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    let deleted = result.rows_affected() > 0;
+    if deleted {
+        sqlx::query("DELETE FROM acl_ip_entries WHERE acl_list_id = ?").bind(id.to_string()).execute(pool).await?;
+        sqlx::query("DELETE FROM acl_credentials WHERE acl_list_id = ?").bind(id.to_string()).execute(pool).await?;
+    }
+    Ok(deleted)
+}
+
+/// What a host with `acl_ids` selected actually resolves to at request
+/// time -- the union of every selected `IpAllow` list's CIDRs, and the
+/// union of every selected `Login` list's credentials. Both empty means
+/// no restriction of that kind at all (matches the pre-ACL-system
+/// default of "empty access_allow_ips/no access_login").
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedAcls {
+    pub allow_ips: Vec<ipnet::Ipv4Net>,
+    pub credentials: Vec<HostAuth>,
+}
+
+pub async fn resolve_acl_ids(pool: &SqlitePool, acl_ids: &[Uuid]) -> Result<ResolvedAcls, sqlx::Error> {
+    let mut resolved = ResolvedAcls::default();
+    for &acl_id in acl_ids {
+        let Some(list_row) = sqlx::query("SELECT kind FROM acl_lists WHERE id = ?").bind(acl_id.to_string()).fetch_optional(pool).await? else {
+            // Referenced by a host but the list itself was deleted out
+            // from under it (shouldn't normally happen -- delete_acl_list
+            // is guarded at the API layer -- but a dangling id must never
+            // silently grant access, only ever silently contribute
+            // nothing).
+            continue;
+        };
+        match acl_kind_from_str(&list_row.get::<String, _>("kind")) {
+            AclKind::IpAllow => {
+                let rows = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?").bind(acl_id.to_string()).fetch_all(pool).await?;
+                resolved.allow_ips.extend(rows.into_iter().filter_map(|r| r.get::<String, _>("cidr").parse::<ipnet::Ipv4Net>().ok()));
+            }
+            AclKind::Login => {
+                let rows = sqlx::query("SELECT username, password_hash FROM acl_credentials WHERE acl_list_id = ?")
+                    .bind(acl_id.to_string())
+                    .fetch_all(pool)
+                    .await?;
+                resolved.credentials.extend(rows.into_iter().map(|r| HostAuth {
+                    username: r.get("username"),
+                    password_hash: r.get("password_hash"),
+                }));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 pub struct AdminIdentityRow {
     pub username: String,
     pub password_hash: String,
@@ -398,11 +579,62 @@ pub async fn create_admin_identity_if_absent(pool: &SqlitePool, username: &str, 
     Ok(result.rows_affected() > 0)
 }
 
+/// One-time upgrade path: any host with pre-ACL-system inline
+/// `access_allow_ips`/`access_login_*` data (from before the reusable
+/// ACL system existed) gets that data preserved as a dedicated,
+/// auto-created per-host ACL (named `"<domain> (migrated)"`) instead of
+/// silently losing its access control on upgrade. Only touches hosts
+/// whose `acl_ids` is still empty (the column's own default), so this
+/// is safe to run on every startup -- a host only ever gets migrated
+/// once, even though the legacy columns are deliberately left populated
+/// afterward (see `run_migrations`'s comment on why they're not dropped).
+async fn migrate_legacy_host_access(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, domain, access_allow_ips, access_login_username, access_login_password_hash \
+         FROM hosts WHERE acl_ids = '' AND (access_allow_ips != '' OR access_login_username IS NOT NULL)",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let host_id: String = row.get("id");
+        let domain: String = row.get("domain");
+        let allow_ips: String = row.get("access_allow_ips");
+        let login_username: Option<String> = row.get("access_login_username");
+        let login_password_hash: Option<String> = row.get("access_login_password_hash");
+
+        let mut new_acl_ids = Vec::new();
+
+        if !allow_ips.is_empty() {
+            let acl_id = Uuid::new_v4();
+            create_acl_list(pool, acl_id, &format!("{domain} (migrated)"), AclKind::IpAllow, Utc::now()).await?;
+            let cidrs: Vec<String> = allow_ips.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+            add_acl_ip_entries(pool, acl_id, &cidrs).await?;
+            new_acl_ids.push(acl_id);
+        }
+
+        if let (Some(username), Some(password_hash)) = (login_username, login_password_hash) {
+            let acl_id = Uuid::new_v4();
+            create_acl_list(pool, acl_id, &format!("{domain} (migrated login)"), AclKind::Login, Utc::now()).await?;
+            add_acl_credentials(pool, acl_id, &[(username, password_hash)]).await?;
+            new_acl_ids.push(acl_id);
+        }
+
+        let acl_ids_csv = new_acl_ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
+        sqlx::query("UPDATE hosts SET acl_ids = ? WHERE id = ?")
+            .bind(acl_ids_csv)
+            .bind(host_id)
+            .execute(pool)
+            .await?;
+        tracing::info!(domain, "migrated legacy per-host access control into a new ACL");
+    }
+    Ok(())
+}
+
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, acme_challenge_type, \
-         access_allow_ips, access_login_username, access_login_password_hash, \
-         redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -413,19 +645,12 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 "dns01" => AcmeChallengeType::Dns01,
                 _ => AcmeChallengeType::Auto,
             };
-            let access_allow_ips = row
-                .get::<String, _>("access_allow_ips")
+            let acl_ids = row
+                .get::<String, _>("acl_ids")
                 .split(',')
                 .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse().ok())
+                .filter_map(|s| Uuid::parse_str(s).ok())
                 .collect();
-            let access_login = match (
-                row.get::<Option<String>, _>("access_login_username"),
-                row.get::<Option<String>, _>("access_login_password_hash"),
-            ) {
-                (Some(username), Some(password_hash)) => Some(HostAuth { username, password_hash }),
-                _ => None,
-            };
             let redirect = row.get::<Option<String>, _>("redirect_target").map(|target| RedirectTarget {
                 target,
                 preserve_path: row.get::<i64, _>("redirect_preserve_path") != 0,
@@ -445,8 +670,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 force_https: row.get::<i64, _>("force_https") != 0,
                 acme_enabled: row.get::<i64, _>("acme_enabled") != 0,
                 acme_challenge_type: challenge_type,
-                access_allow_ips,
-                access_login,
+                acl_ids,
                 dns_credential_id,
                 redirect,
                 enabled: row.get::<i64, _>("enabled") != 0,
@@ -464,11 +688,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             AcmeChallengeType::Http01 => "http01",
             AcmeChallengeType::Dns01 => "dns01",
         };
-        let access_allow_ips = h.access_allow_ips.iter().map(|net| net.to_string()).collect::<Vec<_>>().join(",");
-        let (login_username, login_password_hash) = match &h.access_login {
-            Some(auth) => (Some(auth.username.as_str()), Some(auth.password_hash.as_str())),
-            None => (None, None),
-        };
+        let acl_ids = h.acl_ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
         let (redirect_target, redirect_preserve_path, redirect_status) = match &h.redirect {
             Some(redirect) => (
                 Some(redirect.target.as_str()),
@@ -482,9 +702,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, websockets, force_https, acme_enabled, \
-             acme_challenge_type, access_allow_ips, access_login_username, access_login_password_hash, \
-             redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -495,9 +714,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.force_https as i64)
         .bind(h.acme_enabled as i64)
         .bind(challenge_type)
-        .bind(access_allow_ips)
-        .bind(login_username)
-        .bind(login_password_hash)
+        .bind(acl_ids)
         .bind(redirect_target)
         .bind(redirect_preserve_path)
         .bind(redirect_status)
@@ -579,8 +796,7 @@ mod tests {
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
             enabled: true,
@@ -614,29 +830,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_control_fields_round_trip_through_sqlite() {
+    async fn acl_ids_round_trip_through_sqlite() {
         let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "test acl", AclKind::IpAllow, Utc::now()).await.unwrap();
         let mut host = sample_host();
-        host.access_allow_ips = vec!["10.0.0.0/24".parse().unwrap(), "192.168.1.0/24".parse().unwrap()];
-        host.access_login = Some(crate::config::HostAuth {
-            username: "viewer".into(),
-            password_hash: "$argon2id$fake$hash".into(),
-        });
+        host.acl_ids = vec![acl_id];
         save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
-        assert_eq!(loaded[0].access_allow_ips, host.access_allow_ips);
-        assert_eq!(loaded[0].access_login, host.access_login);
+        assert_eq!(loaded[0].acl_ids, host.acl_ids);
     }
 
     #[tokio::test]
-    async fn access_control_fields_default_to_unrestricted_when_absent() {
+    async fn acl_ids_default_to_unrestricted_when_absent() {
         let pool = memory_pool().await;
         save_hosts(&pool, std::slice::from_ref(&sample_host())).await.unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
-        assert!(loaded[0].access_allow_ips.is_empty());
-        assert!(loaded[0].access_login.is_none());
+        assert!(loaded[0].acl_ids.is_empty());
         assert!(loaded[0].redirect.is_none());
     }
 

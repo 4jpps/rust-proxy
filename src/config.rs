@@ -197,22 +197,22 @@ pub struct ProxyHost {
     /// them).
     #[serde(default)]
     pub acme_challenge_type: AcmeChallengeType,
-    /// Client IP ranges allowed to reach this host. Empty (the default)
-    /// means unrestricted -- every other source IP is rejected with 403
-    /// before the request ever reaches the upstream. Application-layer
-    /// only (see `proxy::access`), independent of `network.bind_ranges`
-    /// and the nftables firewall, same as Nginx Proxy Manager's own
-    /// access lists.
+    /// Named, reusable ACLs this host has selected -- see `AclList`.
+    /// Empty (the default) means no access restriction at all: every
+    /// source IP passes and there's no login gate. Selecting one or
+    /// more `IpAllow`-kind ACLs restricts source IPs to the union of
+    /// their entries (an IP passes if it's in ANY selected list);
+    /// selecting one or more `Login`-kind ACLs adds a login-page gate
+    /// (see `proxy::login`) accepting ANY credential from ANY selected
+    /// list's entries. The two kinds are independent gates, checked in
+    /// that order (IP allow list, then login), same as the single
+    /// inline `access_allow_ips`/`access_login` fields this replaced --
+    /// only the source of the data changed, not the enforcement model.
+    /// Resolved against the `acl_lists`/`acl_ip_entries`/
+    /// `acl_credentials` DB tables at request time by
+    /// `proxy::mod::resolve_host_acls`, not stored inline here.
     #[serde(default)]
-    pub access_allow_ips: Vec<Ipv4Net>,
-    /// A login-page gate: a visitor without a valid session cookie for
-    /// this host gets a real HTML login page instead of the upstream
-    /// (see `proxy::login`), not an HTTP Basic Auth challenge -- Basic
-    /// Auth's browser-native prompt is poorly supported by most password
-    /// managers. `None` (the default) means no auth required. Checked
-    /// after the IP allow list, before the request reaches the upstream.
-    #[serde(default)]
-    pub access_login: Option<HostAuth>,
+    pub acl_ids: Vec<Uuid>,
     /// Which named `dns_credentials` DB row (see `db::create_dns_credential`)
     /// to use for this host's dns-01 issuance. `None` means either this
     /// host never needs dns-01 (http-01, or ACME disabled), or -- when it
@@ -224,8 +224,8 @@ pub struct ProxyHost {
     /// When set, this host answers every matched request with a redirect
     /// to `RedirectTarget::target` instead of proxying to `upstream`.
     /// Domain matching, TLS/ACME issuance, the firewall rule, and access
-    /// control (`access_allow_ips`/`access_login`) are all identical
-    /// either way -- a redirect host still gets its own real cert, same
+    /// control (`acl_ids`) are all identical either way -- a redirect
+    /// host still gets its own real cert, same
     /// as Nginx Proxy Manager's own Redirection Hosts. `None` (the
     /// default) is a normal reverse-proxy host.
     #[serde(default)]
@@ -288,6 +288,31 @@ pub struct HostAuth {
     /// never listed with their hash either).
     #[serde(skip_serializing)]
     pub password_hash: String,
+}
+
+/// A named, reusable access-control list -- see `ProxyHost.acl_ids`'s
+/// doc comment for how hosts select and combine these. Metadata only
+/// (no entries): `AclKind::IpAllow`'s CIDRs live in `db::AclIpEntry`
+/// rows, `AclKind::Login`'s credentials in `db::AclCredential` rows --
+/// kept out of this struct so listing ACLs (e.g. for a host's picker)
+/// never has to pull every list's full entry set along with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclList {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: AclKind,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AclKind {
+    /// A list of CIDRs; a source IP passes if it's inside any entry
+    /// across every `IpAllow` list a host has selected.
+    IpAllow,
+    /// A list of username/password_hash pairs; a login succeeds if it
+    /// matches any entry across every `Login` list a host has selected.
+    Login,
 }
 
 fn default_https_port() -> u16 {
@@ -692,8 +717,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
             enabled: true,
@@ -715,8 +739,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
             enabled: true,
@@ -737,8 +760,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
             enabled: true,
@@ -759,8 +781,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
             enabled: true,
@@ -781,8 +802,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: Some(RedirectTarget {
                 target: "https://new.example.com".into(),
@@ -807,8 +827,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: Some(RedirectTarget {
                 target: "new.example.com".into(),
@@ -892,8 +911,7 @@ dns_api_token = "token-placeholder"
                 force_https: true,
                 acme_enabled: true,
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-                access_allow_ips: vec![],
-                access_login: None,
+                acl_ids: vec![],
                 dns_credential_id: None,
                 redirect: None,
                 enabled: true,
@@ -919,8 +937,7 @@ dns_api_token = "token-placeholder"
                 force_https: true,
                 acme_enabled: true,
                 acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-                access_allow_ips: vec![],
-                access_login: None,
+                acl_ids: vec![],
                 dns_credential_id: None,
                 redirect: None,
                 enabled: true,
@@ -942,8 +959,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
             enabled: true,
@@ -974,8 +990,7 @@ dns_api_token = "token-placeholder"
             force_https: true,
             acme_enabled: true,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
             enabled: true,

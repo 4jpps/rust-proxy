@@ -65,6 +65,13 @@ pub fn verify_credentials(auth: &HostAuth, username: &str, password: &str) -> bo
     username == auth.username && crate::api::auth::verify_password(password, &auth.password_hash)
 }
 
+/// Union match across every credential pulled in by a host's selected
+/// Login ACLs -- succeeds if the submitted username/password matches ANY
+/// one of them, per the union-within-kind semantics the ACL system uses.
+pub fn verify_credentials_any(credentials: &[HostAuth], username: &str, password: &str) -> bool {
+    credentials.iter().any(|auth| verify_credentials(auth, username, password))
+}
+
 pub fn sign_session(admin_session_secret: &str, domain: &str, username: &str) -> String {
     let key = derive_key(admin_session_secret);
     let payload = SessionPayload {

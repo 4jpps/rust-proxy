@@ -217,17 +217,29 @@ async fn handle_https_request(
         return Ok(not_found());
     };
 
-    if !access::ip_allowed(&host.access_allow_ips, peer_ip) {
+    let resolved_acls = if host.acl_ids.is_empty() {
+        crate::db::ResolvedAcls::default()
+    } else {
+        match crate::db::resolve_acl_ids(state.db(), &host.acl_ids).await {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                tracing::error!(domain = %host.domain, error = %err, "failed to resolve host ACLs");
+                return Ok(bad_gateway());
+            }
+        }
+    };
+
+    if !access::ip_allowed(&resolved_acls.allow_ips, peer_ip) {
         return Ok(forbidden());
     }
 
-    if let Some(auth) = &host.access_login {
+    if !resolved_acls.credentials.is_empty() {
         let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
             .zip(state.admin_identity())
             .map(|(token, identity)| login::verify_session(&identity.session_secret, &host.domain, &token))
             .unwrap_or(false);
         if !has_valid_session {
-            return Ok(handle_login_gate(&state, &host.domain, auth, req).await);
+            return Ok(handle_login_gate(&state, &host.domain, &resolved_acls.credentials, req).await);
         }
     }
 
@@ -266,7 +278,7 @@ fn find_cookie(req: &Request<Incoming>, name: &str) -> Option<String> {
 async fn handle_login_gate(
     state: &AppState,
     domain: &str,
-    auth: &crate::config::HostAuth,
+    credentials: &[crate::config::HostAuth],
     req: Request<Incoming>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
     if req.method() == hyper::Method::POST && req.uri().path() == login::LOGIN_SUBMIT_PATH {
@@ -277,7 +289,7 @@ async fn handle_login_gate(
         let Ok(submission) = serde_json::from_slice::<login::LoginSubmission>(&body_bytes) else {
             return login_page_response(domain, "/", Some("invalid request"), hyper::StatusCode::BAD_REQUEST);
         };
-        if login::verify_credentials(auth, &submission.username, &submission.password) {
+        if login::verify_credentials_any(credentials, &submission.username, &submission.password) {
             let Some(identity) = state.admin_identity() else {
                 // No admin identity resolved yet (e.g. instance awaiting
                 // first-launch setup) -- the host-level login gate
@@ -285,7 +297,7 @@ async fn handle_login_gate(
                 // so there's nothing to sign with.
                 return service_unavailable();
             };
-            let token = login::sign_session(&identity.session_secret, domain, &auth.username);
+            let token = login::sign_session(&identity.session_secret, domain, &submission.username);
             return login_success_response(&token);
         }
         return login_page_response(
@@ -520,7 +532,42 @@ mod tests {
         state
     }
 
-    fn access_host(domain: &str, access_allow_ips: Vec<ipnet::Ipv4Net>, access_login: Option<crate::config::HostAuth>) -> ProxyHost {
+    async fn test_state_with_access(
+        domain: &str,
+        access_allow_ips: Vec<ipnet::Ipv4Net>,
+        access_login: Option<crate::config::HostAuth>,
+    ) -> AppState {
+        let state = test_state_with_cert(domain).await;
+        let host = access_host(state.db(), domain, access_allow_ips, access_login).await;
+        state.set_hosts(vec![host]);
+        state
+    }
+
+    /// Creates the ACL list(s) needed to back the given IP-allow/login
+    /// requirements (via the same `db::` CRUD the real API uses) and
+    /// returns a host whose `acl_ids` selects them -- resolution happens
+    /// live via `db::resolve_acl_ids` on every request, same as
+    /// production, so these tests exercise the real DB-backed path.
+    async fn access_host(
+        pool: &sqlx::SqlitePool,
+        domain: &str,
+        access_allow_ips: Vec<ipnet::Ipv4Net>,
+        access_login: Option<crate::config::HostAuth>,
+    ) -> ProxyHost {
+        let mut acl_ids = Vec::new();
+        if !access_allow_ips.is_empty() {
+            let acl_id = Uuid::new_v4();
+            crate::db::create_acl_list(pool, acl_id, "test ip allow", crate::config::AclKind::IpAllow, chrono::Utc::now()).await.unwrap();
+            let cidrs: Vec<String> = access_allow_ips.iter().map(|net| net.to_string()).collect();
+            crate::db::add_acl_ip_entries(pool, acl_id, &cidrs).await.unwrap();
+            acl_ids.push(acl_id);
+        }
+        if let Some(auth) = access_login {
+            let acl_id = Uuid::new_v4();
+            crate::db::create_acl_list(pool, acl_id, "test login", crate::config::AclKind::Login, chrono::Utc::now()).await.unwrap();
+            crate::db::add_acl_credentials(pool, acl_id, &[(auth.username.clone(), auth.password_hash.clone())]).await.unwrap();
+            acl_ids.push(acl_id);
+        }
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
@@ -531,8 +578,7 @@ mod tests {
             force_https: false,
             acme_enabled: false,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips,
-            access_login,
+            acl_ids,
             dns_credential_id: None,
             redirect: None,
             enabled: true,
@@ -599,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_from_an_ip_outside_the_allow_list_is_forbidden() {
-        let state = test_state_with_host(access_host("example.com", vec!["192.168.1.0/24".parse().unwrap()], None)).await;
+        let state = test_state_with_access("example.com", vec!["192.168.1.0/24".parse().unwrap()], None).await;
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
@@ -614,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_from_an_allowed_ip_without_a_login_gate_configured_is_not_blocked() {
-        let state = test_state_with_host(access_host("example.com", vec!["10.0.0.0/24".parse().unwrap()], None)).await;
+        let state = test_state_with_access("example.com", vec!["10.0.0.0/24".parse().unwrap()], None).await;
         let resp = send_test_request(
             state,
             "10.0.0.42".parse().unwrap(),
@@ -638,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_without_a_session_gets_the_login_page_instead_of_the_upstream() {
-        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let state = test_state_with_access("example.com", vec![], Some(viewer_auth())).await;
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
@@ -659,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_submission_with_correct_credentials_sets_a_session_cookie() {
-        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let state = test_state_with_access("example.com", vec![], Some(viewer_auth())).await;
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
@@ -678,7 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_submission_with_wrong_credentials_is_rejected_without_a_cookie() {
-        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let state = test_state_with_access("example.com", vec![], Some(viewer_auth())).await;
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
@@ -695,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_with_a_valid_session_cookie_passes_through_to_the_upstream_lookup() {
         let token = login::sign_session("test-secret", "example.com", "viewer");
-        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let state = test_state_with_access("example.com", vec![], Some(viewer_auth())).await;
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
@@ -713,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_signed_for_a_different_domain_does_not_bypass_the_login_gate() {
         let token = login::sign_session("test-secret", "other.example.com", "viewer");
-        let state = test_state_with_host(access_host("example.com", vec![], Some(viewer_auth()))).await;
+        let state = test_state_with_access("example.com", vec![], Some(viewer_auth())).await;
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
@@ -738,8 +784,7 @@ mod tests {
             force_https: false,
             acme_enabled: false,
             acme_challenge_type: crate::config::AcmeChallengeType::Auto,
-            access_allow_ips: vec![],
-            access_login: None,
+            acl_ids: vec![],
             dns_credential_id: None,
             redirect: Some(redirect),
             enabled: true,
@@ -779,8 +824,12 @@ mod tests {
             status: crate::config::RedirectStatus::Permanent,
         };
         let mut host = redirect_host("example.com", target);
-        host.access_allow_ips = vec!["192.168.1.0/24".parse().unwrap()];
-        let state = test_state_with_host(host).await;
+        let state = test_state_with_cert("example.com").await;
+        let acl_id = Uuid::new_v4();
+        crate::db::create_acl_list(state.db(), acl_id, "test ip allow", crate::config::AclKind::IpAllow, chrono::Utc::now()).await.unwrap();
+        crate::db::add_acl_ip_entries(state.db(), acl_id, &["192.168.1.0/24".to_string()]).await.unwrap();
+        host.acl_ids = vec![acl_id];
+        state.set_hosts(vec![host]);
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
