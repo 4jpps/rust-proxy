@@ -627,7 +627,8 @@ mod tests {
         ProxyHost {
             id: uuid::Uuid::new_v4(),
             domain: domain.into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:8000".into(),
             upstream_https: false,
@@ -759,9 +760,11 @@ mod tests {
         let cfg = Config {
             network: NetworkConfig { bind_ranges: vec![] },
             admin: AdminConfig {
-                bind_ip: "127.0.0.1".parse().unwrap(),
+                bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),

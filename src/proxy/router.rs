@@ -3,9 +3,9 @@
 //! `ProxyHost` should handle it. No I/O -- fully unit-testable, and kept
 //! separate so listener code never has to duplicate matching rules.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
-use crate::config::ProxyHost;
+use crate::config::{host_bind_ips, ProxyHost};
 
 /// Case-insensitive per RFC 4343 -- DNS names/SNI/Host headers aren't
 /// case-sensitive, and a client (or a misbehaving upstream) may send
@@ -13,9 +13,13 @@ use crate::config::ProxyHost;
 /// `*.parent` wildcard host covering exactly one label under `parent` --
 /// the same single-level semantics as an X.509 wildcard cert (`*.a.com`
 /// matches `x.a.com`, never `x.y.a.com`).
-pub fn match_host<'a>(hosts: &'a [ProxyHost], bind_ip: Ipv4Addr, bind_port: u16, name: &str) -> Option<&'a ProxyHost> {
+///
+/// `bind_ip` is the family+address the connection actually arrived on
+/// (whichever of `bind_ip_v4`/`bind_ip_v6` the listener that accepted it
+/// was bound to) -- a host matches on either family it's configured for.
+pub fn match_host<'a>(hosts: &'a [ProxyHost], bind_ip: IpAddr, bind_port: u16, name: &str) -> Option<&'a ProxyHost> {
     let name = strip_port_suffix(name);
-    let is_candidate = |h: &&ProxyHost, domain: &str| h.enabled && h.bind_ip == bind_ip && h.bind_port == bind_port && h.domain.eq_ignore_ascii_case(domain);
+    let is_candidate = |h: &&ProxyHost, domain: &str| h.enabled && h.bind_port == bind_port && host_bind_ips(h).contains(&bind_ip) && h.domain.eq_ignore_ascii_case(domain);
 
     if let Some(host) = hosts.iter().find(|h| is_candidate(h, name)) {
         return Some(host);
@@ -36,14 +40,12 @@ fn strip_port_suffix(name: &str) -> &str {
 }
 
 /// Every unique `(bind_ip, bind_port)` an enabled host wants a TLS/HTTP
-/// listener on -- what the supervisor diffs against currently-running
-/// listeners to decide what to spawn/stop.
-pub fn https_listener_keys(hosts: &[ProxyHost]) -> Vec<(Ipv4Addr, u16)> {
-    let mut keys: Vec<(Ipv4Addr, u16)> = hosts
-        .iter()
-        .filter(|h| h.enabled)
-        .map(|h| (h.bind_ip, h.bind_port))
-        .collect();
+/// listener on -- one entry per family a host is configured for, so a
+/// dual-stack host (both `bind_ip_v4` and `bind_ip_v6` set) produces two
+/// keys and gets two real listener sockets. What the supervisor diffs
+/// against currently-running listeners to decide what to spawn/stop.
+pub fn https_listener_keys(hosts: &[ProxyHost]) -> Vec<(IpAddr, u16)> {
+    let mut keys: Vec<(IpAddr, u16)> = hosts.iter().filter(|h| h.enabled).flat_map(|h| host_bind_ips(h).into_iter().map(|ip| (ip, h.bind_port))).collect();
     keys.sort();
     keys.dedup();
     keys
@@ -55,11 +57,11 @@ pub fn https_listener_keys(hosts: &[ProxyHost]) -> Vec<(Ipv4Addr, u16)> {
 /// that doesn't otherwise force HTTPS. The listener itself (`proxy::mod`)
 /// always checks for a pending challenge before falling back to the
 /// redirect response, so one listener per bind_ip serves both purposes.
-pub fn redirect_listener_keys(hosts: &[ProxyHost]) -> Vec<(Ipv4Addr, u16)> {
-    let mut keys: Vec<(Ipv4Addr, u16)> = hosts
+pub fn redirect_listener_keys(hosts: &[ProxyHost]) -> Vec<(IpAddr, u16)> {
+    let mut keys: Vec<(IpAddr, u16)> = hosts
         .iter()
         .filter(|h| h.enabled && (h.force_https || crate::acme::opens_port_80_for_acme(h)))
-        .map(|h| (h.bind_ip, 80u16))
+        .flat_map(|h| host_bind_ips(h).into_iter().map(|ip| (ip, 80u16)))
         .collect();
     keys.sort();
     keys.dedup();
@@ -75,7 +77,8 @@ mod tests {
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
-            bind_ip: bind_ip.parse().unwrap(),
+            bind_ip_v4: Some(bind_ip.parse().unwrap()),
+            bind_ip_v6: None,
             bind_port,
             upstream: "127.0.0.1:8000".into(),
             upstream_https: false,

@@ -19,7 +19,7 @@ pub mod tls;
 pub mod upstream_tls;
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -41,9 +41,9 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     // links, so any prior install is this same provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut https: HashMap<(Ipv4Addr, u16), JoinHandle<()>> = HashMap::new();
-    let mut redirects: HashMap<(Ipv4Addr, u16), JoinHandle<()>> = HashMap::new();
-    let mut passthroughs: HashMap<(Ipv4Addr, u16, Protocol), JoinHandle<()>> = HashMap::new();
+    let mut https: HashMap<(IpAddr, u16), JoinHandle<()>> = HashMap::new();
+    let mut redirects: HashMap<(IpAddr, u16), JoinHandle<()>> = HashMap::new();
+    let mut passthroughs: HashMap<(IpAddr, u16, Protocol), JoinHandle<()>> = HashMap::new();
 
     // `Notify::notify_waiters` only wakes tasks already parked in
     // `.notified().await` at the moment it's called -- a change that lands
@@ -64,9 +64,9 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 
 fn reconcile(
     state: &AppState,
-    https: &mut HashMap<(Ipv4Addr, u16), JoinHandle<()>>,
-    redirects: &mut HashMap<(Ipv4Addr, u16), JoinHandle<()>>,
-    passthroughs: &mut HashMap<(Ipv4Addr, u16, Protocol), JoinHandle<()>>,
+    https: &mut HashMap<(IpAddr, u16), JoinHandle<()>>,
+    redirects: &mut HashMap<(IpAddr, u16), JoinHandle<()>>,
+    passthroughs: &mut HashMap<(IpAddr, u16, Protocol), JoinHandle<()>>,
 ) {
     let hosts = state.hosts();
     let port_rules = state.port_rules();
@@ -99,11 +99,13 @@ fn reconcile_map<K: std::hash::Hash + Eq + Copy, F: Fn(&K) -> JoinHandle<()>>(
     }
 }
 
-fn passthrough_keys(port_rules: &[crate::config::PortRule]) -> Vec<(Ipv4Addr, u16, Protocol)> {
+fn passthrough_keys(port_rules: &[crate::config::PortRule]) -> Vec<(IpAddr, u16, Protocol)> {
     let mut keys = Vec::new();
     for rule in port_rules.iter().filter(|r| r.enabled && r.passthrough_target.is_some()) {
-        for port in rule.port_start..=rule.port_end {
-            keys.push((rule.bind_ip, port, rule.protocol));
+        for bind_ip in crate::config::port_rule_bind_ips(rule) {
+            for port in rule.port_start..=rule.port_end {
+                keys.push((bind_ip, port, rule.protocol));
+            }
         }
     }
     keys.sort_by_key(|(ip, port, proto)| (*ip, *port, matches!(proto, Protocol::Udp)));
@@ -111,7 +113,7 @@ fn passthrough_keys(port_rules: &[crate::config::PortRule]) -> Vec<(Ipv4Addr, u1
     keys
 }
 
-fn spawn_https_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> JoinHandle<()> {
+fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
         let addr = SocketAddr::from((bind_ip, bind_port));
         let listener = match TcpListener::bind(addr).await {
@@ -133,14 +135,7 @@ fn spawn_https_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> J
                     continue;
                 }
             };
-            // The listener only ever binds an IPv4 `bind_ip`, so `peer`
-            // is always `V4` in practice; `UNSPECIFIED` is an unreachable
-            // fallback that fails closed (matches no `access_allow_ips`
-            // range) rather than panicking.
-            let peer_ip = match peer.ip() {
-                std::net::IpAddr::V4(v4) => v4,
-                std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-            };
+            let peer_ip = peer.ip();
             let acceptor = acceptor.clone();
             let state = state.clone();
             tokio::spawn(async move {
@@ -196,9 +191,9 @@ fn build_https_server_config(state: AppState) -> rustls::ServerConfig {
 
 async fn handle_https_request(
     state: AppState,
-    bind_ip: Ipv4Addr,
+    bind_ip: IpAddr,
     bind_port: u16,
-    peer_ip: Ipv4Addr,
+    peer_ip: IpAddr,
     sni: Option<String>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
@@ -400,7 +395,7 @@ fn login_success_response(token: &str) -> Response<BoxBody<Bytes, hyper::Error>>
 /// challenge fetch (checked first -- see `http::http01_challenge_response`,
 /// since the CA's validator never follows a redirect) and, for anything
 /// else, the `force_https` redirect to the same path on `https`.
-fn spawn_redirect_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -> JoinHandle<()> {
+fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
         let addr = SocketAddr::from((bind_ip, bind_port));
         let listener = match TcpListener::bind(addr).await {
@@ -440,13 +435,13 @@ fn spawn_redirect_listener(state: AppState, bind_ip: Ipv4Addr, bind_port: u16) -
 
 fn spawn_passthrough_listener(
     port_rules: &[crate::config::PortRule],
-    bind_ip: Ipv4Addr,
+    bind_ip: IpAddr,
     port: u16,
     protocol: Protocol,
 ) -> JoinHandle<()> {
     let target = port_rules
         .iter()
-        .find(|r| r.enabled && r.bind_ip == bind_ip && (r.port_start..=r.port_end).contains(&port) && r.protocol == protocol)
+        .find(|r| r.enabled && crate::config::port_rule_bind_ips(r).contains(&bind_ip) && (r.port_start..=r.port_end).contains(&port) && r.protocol == protocol)
         .and_then(|r| r.passthrough_target.clone());
 
     let bind_addr = SocketAddr::from((bind_ip, port));
@@ -518,7 +513,8 @@ mod tests {
     fn rule(bind_ip: &str, start: u16, end: u16, proto: Protocol, target: Option<&str>) -> PortRule {
         PortRule {
             id: Uuid::new_v4(),
-            bind_ip: bind_ip.parse().unwrap(),
+            bind_ip_v4: Some(bind_ip.parse().unwrap()),
+            bind_ip_v6: None,
             port_start: start,
             port_end: end,
             protocol: proto,
@@ -557,9 +553,11 @@ mod tests {
         let cfg = Config {
             network: NetworkConfig { bind_ranges: vec![] },
             admin: AdminConfig {
-                bind_ip: "127.0.0.1".parse().unwrap(),
+                bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
@@ -633,7 +631,8 @@ mod tests {
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:1".into(),
             upstream_https: false,
@@ -661,13 +660,13 @@ mod tests {
     /// uses them unchanged -- only `peer_ip` and the request itself vary.
     async fn send_test_request(
         state: AppState,
-        peer_ip: Ipv4Addr,
+        peer_ip: IpAddr,
         method: &str,
         path: &str,
         cookie: Option<String>,
         json_body: Option<serde_json::Value>,
     ) -> Response<Incoming> {
-        let bind_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let bind_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let bind_port = 443;
         let sni = Some("example.com".to_string());
 
@@ -738,7 +737,7 @@ mod tests {
         let state = test_state_with_cert("first.example.com").await;
         state.set_hosts(vec![host_a, host_b]);
 
-        let bind_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let bind_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let bind_port = 443;
         let stale_sni = Some("first.example.com".to_string());
 
@@ -803,7 +802,7 @@ mod tests {
         let acceptor = TlsAcceptor::from(Arc::new(build_https_server_config(state.clone())));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let bind_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let bind_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let bind_port = 443;
 
         tokio::spawn(async move {
@@ -990,7 +989,8 @@ mod tests {
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: String::new(),
             upstream_https: false,

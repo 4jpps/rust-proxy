@@ -272,9 +272,11 @@ mod tests {
         let cfg = Config {
             network: NetworkConfig { bind_ranges: vec![] },
             admin: AdminConfig {
-                bind_ip: "127.0.0.1".parse().unwrap(),
+                bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),

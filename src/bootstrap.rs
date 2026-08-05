@@ -94,9 +94,11 @@ mod tests {
         Config {
             network: crate::config::NetworkConfig { bind_ranges: vec![] },
             admin: crate::config::AdminConfig {
-                bind_ip: Ipv4Addr::UNSPECIFIED,
+                bind_ip_v4: Some(Ipv4Addr::UNSPECIFIED),
+                bind_ip_v6: None,
                 bind_port: 8084,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: None,
                 admin_username: None,
                 admin_password_hash: None,
@@ -129,7 +131,8 @@ mod tests {
         cfg.hosts.push(ProxyHost {
             id: uuid::Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:8000".into(),
             upstream_https: false,

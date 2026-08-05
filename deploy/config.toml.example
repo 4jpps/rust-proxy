@@ -15,14 +15,15 @@
 # bind_ranges = ["10.0.0.0/29"]
 
 [admin]
-# bind_ip/bind_port are deliberately omitted here -- they default to
-# 0.0.0.0:8084 (see config.rs's AdminConfig), so the admin UI/setup
-# wizard is reachable from the network on a genuinely fresh install
-# with zero edits to this file. nftables mirrors that: SSH/80/443 are
-# always open unconditionally, and the admin port itself is open to
+# bind_ip_v4/bind_ip_v6/bind_port are deliberately omitted here -- they
+# default to 0.0.0.0/::/8084 (see config.rs's AdminConfig), so the admin
+# UI/setup wizard is reachable from the network on a genuinely fresh
+# install with zero edits to this file. nftables mirrors that: SSH/80/443
+# are always open unconditionally, and the admin port itself is open to
 # any source until allowed_ips (below) narrows it down. Override
-# bind_ip/bind_port here only if you want something other than "every
-# interface, port 8084".
+# bind_ip_v4/bind_ip_v6/bind_port here only if you want something other
+# than "every interface, port 8084"; at least one of bind_ip_v4/
+# bind_ip_v6 must be set, so only remove one if the other stays.
 #
 # Only these source IPs/CIDRs may reach the admin UI/API -- enforced by
 # nftables, not just the application. Empty (the default) means
@@ -30,6 +31,12 @@
 # know it, to actually narrow the admin port down at the firewall
 # layer, not just the application layer.
 allowed_ips = []
+# true (the default) matches today's behavior -- the admin port gets a
+# real nftables accept rule (open, or scoped to allowed_ips above). Set
+# to false to keep the admin port off the wire entirely -- reachable
+# only via loopback (e.g. an SSH tunnel), never a real firewall accept
+# rule for it at all.
+# expose_admin_port = true
 # admin.session_secret/admin_username/admin_password_hash are
 # deliberately omitted -- leaving all three unset (never just one or
 # two -- config validation rejects a partial set) means the admin UI

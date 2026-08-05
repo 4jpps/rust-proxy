@@ -88,6 +88,15 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_https INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_tls_verify INTEGER NOT NULL DEFAULT 1").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_preserve_host INTEGER NOT NULL DEFAULT 1").execute(pool).await;
+    // Dual-stack bind: the old single `bind_ip` column (always IPv4) is
+    // left in place, not dropped (same DROP-COLUMN-portability reasoning
+    // as acl_ids above), and its value is copied into bind_ip_v4 once so
+    // a pre-existing row's original single-family bind is preserved
+    // exactly instead of silently gaining an unwanted v6 bind or losing
+    // its v4 one.
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
+    let _ = sqlx::query("UPDATE hosts SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
 
     // Metadata only -- kind is 'ip_allow' or 'login'; entries live in
     // the two tables below, keyed by acl_list_id. name is UNIQUE so an
@@ -148,12 +157,17 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             protocol TEXT NOT NULL,
             description TEXT NOT NULL,
             passthrough_target TEXT,
-            enabled INTEGER NOT NULL
+            enabled INTEGER NOT NULL,
+            bind_ip_v4 TEXT,
+            bind_ip_v6 TEXT
         )
         "#,
     )
     .execute(pool)
     .await?;
+    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
+    let _ = sqlx::query("UPDATE port_rules SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
 
     // Only `token_hash` is ever persisted -- the plaintext token is shown
     // to the caller exactly once, at creation, and never stored anywhere.
@@ -754,7 +768,7 @@ pub async fn delete_acl_list(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::
 /// default of "empty access_allow_ips/no access_login").
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedAcls {
-    pub allow_ips: Vec<ipnet::Ipv4Net>,
+    pub allow_ips: Vec<ipnet::IpNet>,
     pub credentials: Vec<HostAuth>,
 }
 
@@ -772,7 +786,7 @@ pub async fn resolve_acl_ids(pool: &SqlitePool, acl_ids: &[Uuid]) -> Result<Reso
         match acl_kind_from_str(&list_row.get::<String, _>("kind")) {
             AclKind::IpAllow => {
                 let rows = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?").bind(acl_id.to_string()).fetch_all(pool).await?;
-                resolved.allow_ips.extend(rows.into_iter().filter_map(|r| r.get::<String, _>("cidr").parse::<ipnet::Ipv4Net>().ok()));
+                resolved.allow_ips.extend(rows.into_iter().filter_map(|r| r.get::<String, _>("cidr").parse::<ipnet::IpNet>().ok()));
             }
             AclKind::Login => {
                 let rows = sqlx::query("SELECT username, password_hash FROM acl_credentials WHERE acl_list_id = ?")
@@ -899,7 +913,7 @@ async fn migrate_legacy_host_access(pool: &SqlitePool) -> Result<(), sqlx::Error
 
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, domain, bind_ip, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
+        "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
          acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled FROM hosts",
     )
     .fetch_all(pool)
@@ -929,7 +943,8 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
             Ok(ProxyHost {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 domain: row.get("domain"),
-                bind_ip: row.get::<String, _>("bind_ip").parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                bind_ip_v4: row.get::<Option<String>, _>("bind_ip_v4").and_then(|s| s.parse().ok()),
+                bind_ip_v6: row.get::<Option<String>, _>("bind_ip_v6").and_then(|s| s.parse().ok()),
                 bind_port: row.get::<i64, _>("bind_port") as u16,
                 upstream: row.get("upstream"),
                 upstream_https: row.get::<i64, _>("upstream_https") != 0,
@@ -970,13 +985,20 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             None => (None, true as i64, "permanent"),
         };
         sqlx::query(
-            "INSERT INTO hosts (id, domain, bind_ip, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
+            "INSERT INTO hosts (id, domain, bind_ip, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
              acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
-        .bind(h.bind_ip.to_string())
+        // Legacy `bind_ip` column (NOT NULL) is kept populated with
+        // whichever family is set (v4 preferred) purely so the column's
+        // own constraint is satisfied -- nothing reads it anymore, see
+        // `load_hosts` above and the migration comment near its ALTER
+        // TABLE.
+        .bind(h.bind_ip_v4.map(|ip| ip.to_string()).or_else(|| h.bind_ip_v6.map(|ip| ip.to_string())).unwrap_or_else(|| "0.0.0.0".to_string()))
+        .bind(h.bind_ip_v4.map(|ip| ip.to_string()))
+        .bind(h.bind_ip_v6.map(|ip| ip.to_string()))
         .bind(h.bind_port as i64)
         .bind(&h.upstream)
         .bind(h.upstream_https as i64)
@@ -999,7 +1021,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
 }
 
 pub async fn load_port_rules(pool: &SqlitePool) -> Result<Vec<PortRule>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, bind_ip, port_start, port_end, protocol, description, passthrough_target, enabled FROM port_rules")
+    let rows = sqlx::query("SELECT id, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, enabled FROM port_rules")
         .fetch_all(pool)
         .await?;
     rows.into_iter()
@@ -1010,7 +1032,8 @@ pub async fn load_port_rules(pool: &SqlitePool) -> Result<Vec<PortRule>, sqlx::E
             };
             Ok(PortRule {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
-                bind_ip: row.get::<String, _>("bind_ip").parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+                bind_ip_v4: row.get::<Option<String>, _>("bind_ip_v4").and_then(|s| s.parse().ok()),
+                bind_ip_v6: row.get::<Option<String>, _>("bind_ip_v6").and_then(|s| s.parse().ok()),
                 port_start: row.get::<i64, _>("port_start") as u16,
                 port_end: row.get::<i64, _>("port_end") as u16,
                 protocol,
@@ -1031,10 +1054,12 @@ pub async fn save_port_rules(pool: &SqlitePool, rules: &[PortRule]) -> Result<()
             Protocol::Udp => "udp",
         };
         sqlx::query(
-            "INSERT INTO port_rules (id, bind_ip, port_start, port_end, protocol, description, passthrough_target, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO port_rules (id, bind_ip, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(r.id.to_string())
-        .bind(r.bind_ip.to_string())
+        .bind(r.bind_ip_v4.map(|ip| ip.to_string()).or_else(|| r.bind_ip_v6.map(|ip| ip.to_string())).unwrap_or_else(|| "0.0.0.0".to_string()))
+        .bind(r.bind_ip_v4.map(|ip| ip.to_string()))
+        .bind(r.bind_ip_v6.map(|ip| ip.to_string()))
         .bind(r.port_start as i64)
         .bind(r.port_end as i64)
         .bind(protocol)
@@ -1061,7 +1086,8 @@ mod tests {
         ProxyHost {
             id: Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:8000".into(),
             upstream_https: false,
@@ -1081,7 +1107,8 @@ mod tests {
     fn sample_rule() -> PortRule {
         PortRule {
             id: Uuid::new_v4(),
-            bind_ip: "10.0.0.4".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.4".parse().unwrap()),
+            bind_ip_v6: None,
             port_start: 21115,
             port_end: 21119,
             protocol: Protocol::Tcp,
@@ -1427,6 +1454,24 @@ mod tests {
         assert_eq!(entries[0].description.as_deref(), Some("HQ"));
         assert_eq!(entries[1].id, id2);
         assert!(entries[1].description.is_none());
+    }
+
+    #[tokio::test]
+    async fn acl_ip_entries_support_ipv6_cidrs_end_to_end() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "v6 office", AclKind::IpAllow, Utc::now()).await.unwrap();
+        add_acl_ip_entry(&pool, acl_id, "2001:db8::/32", Some("v6 HQ")).await.unwrap();
+        add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", None).await.unwrap();
+
+        let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.cidr == "2001:db8::/32"));
+
+        let resolved = resolve_acl_ids(&pool, &[acl_id]).await.unwrap();
+        assert_eq!(resolved.allow_ips.len(), 2);
+        assert!(resolved.allow_ips.iter().any(|net| matches!(net, ipnet::IpNet::V6(_)) && net.to_string() == "2001:db8::/32"));
+        assert!(resolved.allow_ips.iter().any(|net| matches!(net, ipnet::IpNet::V4(_))));
     }
 
     #[tokio::test]

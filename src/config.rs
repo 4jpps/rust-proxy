@@ -3,10 +3,10 @@
 //! initial load, but after startup they're mutated through the admin API
 //! and persisted to sqlite -- see `state.rs`.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use ipnet::Ipv4Net;
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -43,8 +43,12 @@ pub struct NetworkConfig {
     /// dedicated LXC subnet) and wants a bind_ip typo caught at
     /// config-validation time instead of silently failing to bind at
     /// runtime -- not something every deployment needs to think about.
+    /// Holds both IPv4 and IPv6 ranges (`ipnet::IpNet` covers either) --
+    /// a bind_ip_v4/bind_ip_v6 is checked against whichever ranges here
+    /// are the same family, ranges of the other family are simply never
+    /// matched against it.
     #[serde(default)]
-    pub bind_ranges: Vec<Ipv4Net>,
+    pub bind_ranges: Vec<IpNet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,23 +59,46 @@ pub struct AdminConfig {
     /// `nftables::generator`'s admin rule is the actual gatekeeper for
     /// who can reach it (see `allowed_ips` below); this only controls
     /// which local interface(s) the listener itself is bound to.
-    #[serde(default = "default_admin_bind_ip")]
-    pub bind_ip: Ipv4Addr,
+    /// `None` means "don't bind this family at all" -- at least one of
+    /// `bind_ip_v4`/`bind_ip_v6` must be set (see `Config::validate`).
+    #[serde(default = "default_admin_bind_ip_v4")]
+    pub bind_ip_v4: Option<Ipv4Addr>,
+    /// Same as `bind_ip_v4`, for IPv6 -- defaults to `::` (every
+    /// interface, IPv6's equivalent of 0.0.0.0), so a fresh install is
+    /// dual-stack-reachable out of the box, matching `bind_ip_v4`'s own
+    /// reasoning.
+    #[serde(default = "default_admin_bind_ip_v6")]
+    pub bind_ip_v6: Option<Ipv6Addr>,
     /// Defaults to 8084 -- deliberately not 8080, the extremely common
     /// default for a dozen other self-hosted tools, to cut down on
     /// same-host port collisions.
     #[serde(default = "default_admin_bind_port")]
     pub bind_port: u16,
-    /// IPs/CIDRs allowed to reach the admin UI/API. Enforced both at the
-    /// application layer and mirrored into the nftables default-DROP
-    /// posture (see `nftables`). Empty (the default) means unrestricted
-    /// -- deliberately, not loopback-only: paired with `bind_ip`
-    /// defaulting to 0.0.0.0 above, this is what actually makes the
-    /// first-launch setup wizard reachable from the network out of the
-    /// box. Set this once you know your real management network/IP to
-    /// narrow it down -- see `nftables::generator::write_admin_rule`.
+    /// IPs/CIDRs allowed to reach the admin UI/API -- IPv4 and IPv6
+    /// alike. Enforced both at the application layer and mirrored into
+    /// the nftables default-DROP posture (see `nftables`). Empty (the
+    /// default) means unrestricted -- deliberately, not loopback-only:
+    /// paired with `bind_ip_v4`/`bind_ip_v6` defaulting to unspecified
+    /// above, this is what actually makes the first-launch setup wizard
+    /// reachable from the network out of the box. Set this once you know
+    /// your real management network/IP to narrow it down -- see
+    /// `nftables::generator::write_admin_rule`.
     #[serde(default)]
-    pub allowed_ips: Vec<Ipv4Net>,
+    pub allowed_ips: Vec<IpNet>,
+    /// `true` (the default) mirrors today's behavior: `nftables::generator`
+    /// emits an accept rule for the admin port (open to any source, or
+    /// scoped to `allowed_ips` if set). `false` emits no accept rule for
+    /// it at all -- default-DROP then keeps the admin port unreachable
+    /// from the network entirely, leaving only loopback (`iif "lo"
+    /// accept`, already unconditional) able to reach it, e.g. for an
+    /// operator who only ever administers this box over an SSH tunnel
+    /// and wants the admin port to never appear reachable on the wire.
+    /// This only controls the firewall rule -- the listener itself still
+    /// binds per `bind_ip_v4`/`bind_ip_v6` either way; a `false` here
+    /// with a non-loopback bind_ip relies entirely on the firewall (not
+    /// the listener) to keep it unreachable.
+    #[serde(default = "default_true")]
+    pub expose_admin_port: bool,
     /// HMAC key signing admin session tokens. `None` means "not set in
     /// config.toml" -- the resolved admin identity then falls back to
     /// whatever's in the `admin_identity` sqlite table (populated by the
@@ -95,8 +122,20 @@ fn default_db_path() -> PathBuf {
     PathBuf::from("/etc/rust-proxy/rust-proxy.db")
 }
 
-fn default_admin_bind_ip() -> Ipv4Addr {
-    Ipv4Addr::UNSPECIFIED
+fn default_admin_bind_ip_v4() -> Option<Ipv4Addr> {
+    Some(Ipv4Addr::UNSPECIFIED)
+}
+
+fn default_admin_bind_ip_v6() -> Option<Ipv6Addr> {
+    Some(Ipv6Addr::UNSPECIFIED)
+}
+
+fn default_bind_ip_v4() -> Option<Ipv4Addr> {
+    Some(Ipv4Addr::UNSPECIFIED)
+}
+
+fn default_bind_ip_v6() -> Option<Ipv6Addr> {
+    Some(Ipv6Addr::UNSPECIFIED)
 }
 
 fn default_admin_bind_port() -> u16 {
@@ -185,7 +224,7 @@ fn default_renew_before_days() -> i64 {
     30
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Tcp,
@@ -197,7 +236,16 @@ pub struct ProxyHost {
     #[serde(default = "Uuid::new_v4")]
     pub id: Uuid,
     pub domain: String,
-    pub bind_ip: Ipv4Addr,
+    /// `None` means "don't listen on this family for this host" -- at
+    /// least one of `bind_ip_v4`/`bind_ip_v6` must be set (see
+    /// `Config::validate`). Both default to unspecified (0.0.0.0/`::`),
+    /// so a host is dual-stack-reachable on every interface unless
+    /// narrowed down explicitly, same reasoning as `AdminConfig`'s own
+    /// bind fields.
+    #[serde(default = "default_bind_ip_v4")]
+    pub bind_ip_v4: Option<Ipv4Addr>,
+    #[serde(default = "default_bind_ip_v6")]
+    pub bind_ip_v6: Option<Ipv6Addr>,
     #[serde(default = "default_https_port")]
     pub bind_port: u16,
     /// `host:port` of the upstream this domain proxies to. Ignored
@@ -396,7 +444,10 @@ pub fn is_wildcard_domain(domain: &str) -> bool {
 pub struct PortRule {
     #[serde(default = "Uuid::new_v4")]
     pub id: Uuid,
-    pub bind_ip: Ipv4Addr,
+    #[serde(default = "default_bind_ip_v4")]
+    pub bind_ip_v4: Option<Ipv4Addr>,
+    #[serde(default = "default_bind_ip_v6")]
+    pub bind_ip_v6: Option<Ipv6Addr>,
     pub port_start: u16,
     pub port_end: u16,
     pub protocol: Protocol,
@@ -450,7 +501,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_bind_ip(&self.network.bind_ranges, self.admin.bind_ip, "admin")?;
+        validate_dual_bind(&self.network.bind_ranges, self.admin.bind_ip_v4, self.admin.bind_ip_v6, "admin")?;
         let identity_fields_set = [
             self.admin.session_secret.is_some(),
             self.admin.admin_username.is_some(),
@@ -486,11 +537,11 @@ impl Config {
         // share the same socket key (SNI-based virtual hosting on one
         // listener), so that check is separate: `seen_host_domains` only
         // rejects the same domain appearing twice on the same bind.
-        let mut seen_socket_binds: Vec<(Ipv4Addr, u16, Protocol)> = Vec::new();
-        let mut seen_host_domains: Vec<(Ipv4Addr, u16, String)> = Vec::new();
+        let mut seen_socket_binds: Vec<(IpAddr, u16, Protocol)> = Vec::new();
+        let mut seen_host_domains: Vec<(IpAddr, u16, String)> = Vec::new();
 
         for host in &self.hosts {
-            validate_bind_ip(&self.network.bind_ranges, host.bind_ip, "hosts")?;
+            validate_dual_bind(&self.network.bind_ranges, host.bind_ip_v4, host.bind_ip_v6, "hosts")?;
             validate_port(host.bind_port, "hosts.bind_port")?;
             validate_domain(&host.domain)?;
             match &host.redirect {
@@ -505,45 +556,63 @@ impl Config {
                 }
             }
 
-            let domain_key = (host.bind_ip, host.bind_port, host.domain.to_ascii_lowercase());
-            if seen_host_domains.contains(&domain_key) {
-                return Err(ConfigError::Validation(format!(
-                    "duplicate host {} on {}:{}",
-                    host.domain, host.bind_ip, host.bind_port
-                )));
-            }
-            seen_host_domains.push(domain_key);
+            for bind_ip in host_bind_ips(host) {
+                let domain_key = (bind_ip, host.bind_port, host.domain.to_ascii_lowercase());
+                if seen_host_domains.contains(&domain_key) {
+                    return Err(ConfigError::Validation(format!("duplicate host {} on {}:{}", host.domain, bind_ip, host.bind_port)));
+                }
+                seen_host_domains.push(domain_key);
 
-            let socket_key = (host.bind_ip, host.bind_port, Protocol::Tcp);
-            if !seen_socket_binds.contains(&socket_key) {
-                seen_socket_binds.push(socket_key);
+                let socket_key = (bind_ip, host.bind_port, Protocol::Tcp);
+                if !seen_socket_binds.contains(&socket_key) {
+                    seen_socket_binds.push(socket_key);
+                }
             }
         }
 
         for rule in &self.port_rules {
-            validate_bind_ip(&self.network.bind_ranges, rule.bind_ip, "port_rules")?;
+            validate_dual_bind(&self.network.bind_ranges, rule.bind_ip_v4, rule.bind_ip_v6, "port_rules")?;
             validate_port(rule.port_start, "port_rules.port_start")?;
             validate_port(rule.port_end, "port_rules.port_end")?;
             if rule.port_start > rule.port_end {
-                return Err(ConfigError::Validation(format!(
-                    "port_rules entry has port_start {} > port_end {}",
-                    rule.port_start, rule.port_end
-                )));
+                return Err(ConfigError::Validation(format!("port_rules entry has port_start {} > port_end {}", rule.port_start, rule.port_end)));
             }
-            for port in rule.port_start..=rule.port_end {
-                let key = (rule.bind_ip, port, rule.protocol);
-                if seen_socket_binds.contains(&key) {
-                    return Err(ConfigError::Validation(format!(
-                        "port_rules entry conflicts with an existing bind at {}:{}/{:?}",
-                        rule.bind_ip, port, rule.protocol
-                    )));
+            for bind_ip in port_rule_bind_ips(rule) {
+                for port in rule.port_start..=rule.port_end {
+                    let key = (bind_ip, port, rule.protocol);
+                    if seen_socket_binds.contains(&key) {
+                        return Err(ConfigError::Validation(format!("port_rules entry conflicts with an existing bind at {bind_ip}:{port}/{:?}", rule.protocol)));
+                    }
+                    seen_socket_binds.push(key);
                 }
-                seen_socket_binds.push(key);
             }
         }
 
         Ok(())
     }
+}
+
+/// Every family this host is actually configured to bind -- `IpAddr::V4`
+/// for `bind_ip_v4` when set, `IpAddr::V6` for `bind_ip_v6` when set, both
+/// if both are set. Used anywhere dedup/validation needs to walk each
+/// socket a host actually claims.
+pub fn host_bind_ips(host: &ProxyHost) -> Vec<IpAddr> {
+    dual_bind_ips(host.bind_ip_v4, host.bind_ip_v6)
+}
+
+pub fn port_rule_bind_ips(rule: &PortRule) -> Vec<IpAddr> {
+    dual_bind_ips(rule.bind_ip_v4, rule.bind_ip_v6)
+}
+
+fn dual_bind_ips(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> Vec<IpAddr> {
+    let mut ips = Vec::with_capacity(2);
+    if let Some(v4) = v4 {
+        ips.push(IpAddr::V4(v4));
+    }
+    if let Some(v6) = v6 {
+        ips.push(IpAddr::V6(v6));
+    }
+    ips
 }
 
 /// Empty domains are rejected outright; `*.` is only accepted as a single
@@ -580,27 +649,50 @@ pub(crate) fn validate_redirect_target(target: &str) -> Result<(), ConfigError> 
     Ok(())
 }
 
-pub(crate) fn validate_bind_ip(allowed: &[Ipv4Net], ip: Ipv4Addr, ctx: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_bind_ip(allowed: &[IpNet], ip: IpAddr, ctx: &str) -> Result<(), ConfigError> {
     if ip.is_unspecified() {
-        // 0.0.0.0 means "every interface", not one specific address --
+        // 0.0.0.0/:: means "every interface", not one specific address --
         // it's never meaningfully "outside" a configured bind_ranges
         // allowlist the way a single real IP could be, so there's
-        // nothing to range-check. Matters most for admin.bind_ip, whose
-        // own default is now 0.0.0.0 (see AdminConfig) -- without this,
-        // any operator who set network.bind_ranges without also
-        // explicitly overriding admin.bind_ip would fail validation on
-        // a field they never touched.
+        // nothing to range-check. Matters most for admin.bind_ip_v4/_v6,
+        // whose own defaults are now unspecified (see AdminConfig) --
+        // without this, any operator who set network.bind_ranges without
+        // also explicitly overriding the admin bind fields would fail
+        // validation on a field they never touched.
         return Ok(());
     }
-    if allowed.is_empty() {
-        // Unrestricted -- no configured ranges to check against.
+    // Only ranges of the same family as `ip` are meaningful to check --
+    // an IPv4 bind_ip is never "inside" an IPv6 range or vice versa, and
+    // an operator who only configured v4 ranges shouldn't have that
+    // silently reject every v6 bind as if it were an empty allowlist (or
+    // the reverse).
+    let same_family: Vec<&IpNet> = allowed.iter().filter(|net| net.addr().is_ipv4() == ip.is_ipv4()).collect();
+    if same_family.is_empty() {
+        // Unrestricted -- no configured ranges of this family to check against.
         return Ok(());
     }
-    if !allowed.iter().any(|net| net.contains(&ip)) {
-        let ranges = allowed.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
-        return Err(ConfigError::Validation(format!(
-            "{ctx} bind_ip {ip} is not inside any of network.bind_ranges ({ranges})"
-        )));
+    if !same_family.iter().any(|net| net.contains(&ip)) {
+        let ranges = same_family.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+        return Err(ConfigError::Validation(format!("{ctx} bind_ip {ip} is not inside any of network.bind_ranges ({ranges})")));
+    }
+    Ok(())
+}
+
+/// At least one of `v4`/`v6` must be set -- a host/port_rule/admin with
+/// both `None` binds nothing at all, which is never a useful
+/// configuration (silently listening on neither family is almost
+/// certainly a mistake, not an intentionally-disabled bind -- there's no
+/// "enabled: false" story for a bind pair the way there is for
+/// `ProxyHost.enabled`).
+pub(crate) fn validate_dual_bind(allowed: &[IpNet], v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>, ctx: &str) -> Result<(), ConfigError> {
+    if v4.is_none() && v6.is_none() {
+        return Err(ConfigError::Validation(format!("{ctx} must set at least one of bind_ip_v4/bind_ip_v6")));
+    }
+    if let Some(v4) = v4 {
+        validate_bind_ip(allowed, IpAddr::V4(v4), ctx)?;
+    }
+    if let Some(v6) = v6 {
+        validate_bind_ip(allowed, IpAddr::V6(v6), ctx)?;
     }
     Ok(())
 }
@@ -622,7 +714,7 @@ mod tests {
 bind_ranges = ["10.0.0.0/29"]
 
 [admin]
-bind_ip = "10.0.0.1"
+bind_ip_v4 = "10.0.0.1"
 bind_port = 8080
 session_secret = "test-secret-do-not-use-in-prod"
 admin_username = "admin"
@@ -647,7 +739,8 @@ dns_api_token = "token-placeholder"
 
         let cfg = Config::load(&path).expect("should create a valid default and load it");
         assert!(path.is_file(), "should have written the default config file");
-        assert_eq!(cfg.admin.bind_ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(cfg.admin.bind_ip_v4, Some(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.admin.bind_ip_v6, Some(Ipv6Addr::UNSPECIFIED));
         assert_eq!(cfg.admin.bind_port, 8084);
         assert!(cfg.admin.session_secret.is_none(), "the default must not bake in a fixed admin identity");
 
@@ -662,7 +755,7 @@ dns_api_token = "token-placeholder"
         std::fs::write(&path, base_toml()).unwrap();
 
         let cfg = Config::load(&path).expect("should load the existing file as-is");
-        assert_eq!(cfg.admin.bind_ip, "10.0.0.1".parse::<Ipv4Addr>().unwrap(), "must not have replaced the operator's own config");
+        assert_eq!(cfg.admin.bind_ip_v4, Some("10.0.0.1".parse::<Ipv4Addr>().unwrap()), "must not have replaced the operator's own config");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -707,10 +800,10 @@ dns_api_token = "token-placeholder"
     #[test]
     fn admin_bind_ip_and_port_default_to_0000_and_8084_when_omitted() {
         let toml_str = base_toml()
-            .replace(r#"bind_ip = "10.0.0.1""#, "")
+            .replace(r#"bind_ip_v4 = "10.0.0.1""#, "")
             .replace("bind_port = 8080", "");
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
-        assert_eq!(cfg.admin.bind_ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(cfg.admin.bind_ip_v4, Some(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cfg.admin.bind_port, 8084);
         assert!(cfg.validate().is_ok(), "0.0.0.0 must not fail bind_ranges membership validation");
     }
@@ -721,7 +814,7 @@ dns_api_token = "token-placeholder"
         // 0.0.0.0 is never literally inside that range, but it means
         // "every interface", so it must not be rejected as if it were
         // one specific out-of-range address.
-        let toml_str = base_toml().replace(r#"bind_ip = "10.0.0.1""#, r#"bind_ip = "0.0.0.0""#);
+        let toml_str = base_toml().replace(r#"bind_ip_v4 = "10.0.0.1""#, r#"bind_ip_v4 = "0.0.0.0""#);
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert!(cfg.validate().is_ok());
     }
@@ -767,7 +860,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "198.51.100.9".parse().unwrap(),
+            bind_ip_v4: Some("198.51.100.9".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
             upstream_https: false,
@@ -792,7 +886,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "192.168.1.50".parse().unwrap(),
+            bind_ip_v4: Some("192.168.1.50".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
             upstream_https: false,
@@ -816,7 +911,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "192.168.1.5".parse().unwrap(),
+            bind_ip_v4: Some("192.168.1.5".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:8000".into(),
             upstream_https: false,
@@ -840,7 +936,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "no-port-here".into(),
             upstream_https: false,
@@ -864,7 +961,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "old.example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: String::new(),
             upstream_https: false,
@@ -892,7 +990,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "old.example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: String::new(),
             upstream_https: false,
@@ -919,7 +1018,8 @@ dns_api_token = "token-placeholder"
         let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
         cfg.port_rules.push(PortRule {
             id: Uuid::new_v4(),
-            bind_ip: "10.0.0.4".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.4".parse().unwrap()),
+            bind_ip_v6: None,
             port_start: 21119,
             port_end: 21115,
             protocol: Protocol::Tcp,
@@ -935,7 +1035,8 @@ dns_api_token = "token-placeholder"
         let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
         cfg.port_rules.push(PortRule {
             id: Uuid::new_v4(),
-            bind_ip: "10.0.0.4".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.4".parse().unwrap()),
+            bind_ip_v6: None,
             port_start: 0,
             port_end: 0,
             protocol: Protocol::Udp,
@@ -951,7 +1052,8 @@ dns_api_token = "token-placeholder"
         let mut cfg: Config = toml::from_str(&base_toml()).unwrap();
         cfg.port_rules.push(PortRule {
             id: Uuid::new_v4(),
-            bind_ip: "10.0.0.4".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.4".parse().unwrap()),
+            bind_ip_v6: None,
             port_start: 21115,
             port_end: 21119,
             protocol: Protocol::Tcp,
@@ -961,7 +1063,8 @@ dns_api_token = "token-placeholder"
         });
         cfg.port_rules.push(PortRule {
             id: Uuid::new_v4(),
-            bind_ip: "10.0.0.4".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.4".parse().unwrap()),
+            bind_ip_v6: None,
             port_start: 21116,
             port_end: 21116,
             protocol: Protocol::Udp,
@@ -979,7 +1082,8 @@ dns_api_token = "token-placeholder"
             cfg.hosts.push(ProxyHost {
                 id: Uuid::new_v4(),
                 domain: "dup.example.com".into(),
-                bind_ip: "10.0.0.2".parse().unwrap(),
+                bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 443,
                 upstream: "127.0.0.1:9000".into(),
                 upstream_https: false,
@@ -1008,7 +1112,8 @@ dns_api_token = "token-placeholder"
             cfg.hosts.push(ProxyHost {
                 id: Uuid::new_v4(),
                 domain: domain.into(),
-                bind_ip: "10.0.0.2".parse().unwrap(),
+                bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 443,
                 upstream: "127.0.0.1:9000".into(),
                 upstream_https: false,
@@ -1033,7 +1138,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
             upstream_https: false,
@@ -1050,7 +1156,8 @@ dns_api_token = "token-placeholder"
         });
         cfg.port_rules.push(PortRule {
             id: Uuid::new_v4(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             port_start: 443,
             port_end: 443,
             protocol: Protocol::Tcp,
@@ -1067,7 +1174,8 @@ dns_api_token = "token-placeholder"
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
             domain: "*.pages.example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:9000".into(),
             upstream_https: false,

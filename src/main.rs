@@ -3,6 +3,7 @@ mod api;
 mod bootstrap;
 mod config;
 mod db;
+mod localip;
 mod logging;
 mod nftables;
 mod proxy;

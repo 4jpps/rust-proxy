@@ -290,9 +290,11 @@ mod tests {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
             },
             admin: AdminConfig {
-                bind_ip: "10.0.0.1".parse().unwrap(),
+                bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
@@ -327,7 +329,8 @@ mod tests {
         state.set_hosts(vec![ProxyHost {
             id: uuid::Uuid::new_v4(),
             domain: "example.com".into(),
-            bind_ip: "10.0.0.2".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 443,
             upstream: "127.0.0.1:8000".into(),
             upstream_https: false,
@@ -352,7 +355,8 @@ mod tests {
         let state = test_state().await;
         state.set_port_rules(vec![PortRule {
             id: uuid::Uuid::new_v4(),
-            bind_ip: "10.0.0.4".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.4".parse().unwrap()),
+            bind_ip_v6: None,
             port_start: 21115,
             port_end: 21119,
             protocol: Protocol::Tcp,
@@ -399,7 +403,8 @@ mod tests {
                 s.set_hosts(vec![ProxyHost {
                     id: uuid::Uuid::new_v4(),
                     domain: format!("host-{i}.example.com"),
-                    bind_ip: "10.0.0.2".parse().unwrap(),
+                    bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+                    bind_ip_v6: None,
                     bind_port: 443,
                     upstream: "127.0.0.1:8000".into(),
                     upstream_https: false,

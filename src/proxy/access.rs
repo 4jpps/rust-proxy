@@ -6,14 +6,15 @@
 //! HTML rendering, enough machinery of its own to warrant a separate
 //! module.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
-use ipnet::Ipv4Net;
+use ipnet::IpNet;
 
 /// `allow_ips` empty means unrestricted (the default) -- every source IP
 /// passes. Otherwise `addr` must fall inside at least one configured
-/// range.
-pub fn ip_allowed(allow_ips: &[Ipv4Net], addr: Ipv4Addr) -> bool {
+/// range of the *same family* -- a v4 range never matches a v6 `addr`
+/// and vice versa, same reasoning as `config::validate_bind_ip`.
+pub fn ip_allowed(allow_ips: &[IpNet], addr: IpAddr) -> bool {
     allow_ips.is_empty() || allow_ips.iter().any(|net| net.contains(&addr))
 }
 
@@ -21,11 +22,11 @@ pub fn ip_allowed(allow_ips: &[Ipv4Net], addr: Ipv4Addr) -> bool {
 mod tests {
     use super::*;
 
-    fn net(cidr: &str) -> Ipv4Net {
+    fn net(cidr: &str) -> IpNet {
         cidr.parse().unwrap()
     }
 
-    fn ip(addr: &str) -> Ipv4Addr {
+    fn ip(addr: &str) -> IpAddr {
         addr.parse().unwrap()
     }
 
@@ -50,5 +51,19 @@ mod tests {
     fn ip_matching_any_one_of_several_ranges_passes() {
         let allow = vec![net("10.0.0.0/24"), net("192.168.1.0/24")];
         assert!(ip_allowed(&allow, ip("192.168.1.50")));
+    }
+
+    #[test]
+    fn ipv6_address_matches_an_ipv6_range() {
+        let allow = vec![net("2001:db8::/32")];
+        assert!(ip_allowed(&allow, ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn ipv6_address_never_matches_an_ipv4_range_and_vice_versa() {
+        let allow = vec![net("10.0.0.0/24")];
+        assert!(!ip_allowed(&allow, ip("::1")));
+        let allow = vec![net("2001:db8::/32")];
+        assert!(!ip_allowed(&allow, ip("10.0.0.5")));
     }
 }

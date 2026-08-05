@@ -4,7 +4,7 @@
 //! never sees the change, so a persistence failure can't silently diverge
 //! from what's actually running.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
@@ -51,6 +51,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(admin_ui))
         .route("/api/setup-status", get(setup_status))
         .route("/api/setup", post(setup))
+        .route("/api/network/local-ips", get(list_local_ips))
+        .route("/api/version", get(get_version))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .merge(protected)
@@ -209,6 +211,28 @@ async fn setup_status(State(state): State<AppState>) -> Json<SetupStatusResponse
     })
 }
 
+/// Unauthenticated (same reasoning as `/api/setup-status`) -- the setup
+/// wizard needs this to populate the admin bind_ip pickers before any
+/// admin account exists to authenticate as. Just this host's own
+/// interface addresses, nothing sensitive beyond what `ip addr` already
+/// shows to anyone with a shell on the box.
+async fn list_local_ips() -> Json<Vec<crate::localip::LocalIp>> {
+    Json(crate::localip::list_local_ips())
+}
+
+#[derive(Serialize)]
+struct VersionResponse {
+    version: &'static str,
+}
+
+/// Unauthenticated, same reasoning as `/api/setup-status` -- the footer
+/// showing this needs to render before login too. `CARGO_PKG_VERSION` is
+/// baked in at compile time from Cargo.toml, so this is always exactly
+/// the version actually running, not something that can drift.
+async fn get_version() -> Json<VersionResponse> {
+    Json(VersionResponse { version: env!("CARGO_PKG_VERSION") })
+}
+
 #[derive(Deserialize)]
 struct SetupRequest {
     username: String,
@@ -364,7 +388,10 @@ async fn list_hosts(State(state): State<AppState>) -> Json<Vec<ProxyHost>> {
 #[derive(Deserialize)]
 struct HostRequest {
     domain: String,
-    bind_ip: Ipv4Addr,
+    #[serde(default)]
+    bind_ip_v4: Option<Ipv4Addr>,
+    #[serde(default)]
+    bind_ip_v6: Option<Ipv6Addr>,
     bind_port: u16,
     /// Required unless `redirect` is set, in which case it's ignored and
     /// may be omitted entirely.
@@ -418,7 +445,7 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
             }
         }
     }
-    crate::config::validate_bind_ip(&state.network().bind_ranges, req.bind_ip, "hosts")
+    crate::config::validate_dual_bind(&state.network().bind_ranges, req.bind_ip_v4, req.bind_ip_v6, "hosts")
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(())
 }
@@ -441,17 +468,18 @@ async fn validate_acl_ids(state: &AppState, acl_ids: &[Uuid]) -> Result<(), ApiE
     Ok(())
 }
 
-/// Accepts either a real CIDR (`10.0.0.0/24`) or a bare IPv4 address
-/// (`203.0.113.5`, treated as `/32`) -- the admin UI's own placeholder
-/// text advertises both forms side by side ("10.0.0.0/24, 203.0.113.5"),
-/// so a bare address must actually work rather than 400ing on exactly
-/// what the UI suggested typing.
+/// Accepts either a real CIDR (`10.0.0.0/24` or `2001:db8::/32`) or a
+/// bare IPv4/IPv6 address (`203.0.113.5`/`2001:db8::1`, treated as a
+/// `/32`/`/128`) -- the admin UI's own placeholder text advertises a
+/// bare address alongside a real CIDR, so a bare address must actually
+/// work rather than 400ing on exactly what the UI suggested typing.
 fn normalize_cidr(s: &str) -> Result<String, ApiError> {
-    if let Ok(net) = s.parse::<ipnet::Ipv4Net>() {
+    if let Ok(net) = s.parse::<ipnet::IpNet>() {
         return Ok(net.to_string());
     }
-    if let Ok(addr) = s.parse::<std::net::Ipv4Addr>() {
-        return Ok(format!("{addr}/32"));
+    if let Ok(addr) = s.parse::<std::net::IpAddr>() {
+        let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
+        return Ok(format!("{addr}/{prefix_len}"));
     }
     Err(ApiError::BadRequest(format!("invalid CIDR or IP address: {s}")))
 }
@@ -698,7 +726,8 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
     let host = ProxyHost {
         id: Uuid::new_v4(),
         domain: body.domain,
-        bind_ip: body.bind_ip,
+        bind_ip_v4: body.bind_ip_v4,
+        bind_ip_v6: body.bind_ip_v6,
         bind_port: body.bind_port,
         upstream: body.upstream,
         upstream_https: body.upstream_https,
@@ -733,7 +762,8 @@ async fn update_host(
     let updated = ProxyHost {
         id,
         domain: body.domain,
-        bind_ip: body.bind_ip,
+        bind_ip_v4: body.bind_ip_v4,
+        bind_ip_v6: body.bind_ip_v6,
         bind_port: body.bind_port,
         upstream: body.upstream,
         upstream_https: body.upstream_https,
@@ -796,7 +826,10 @@ async fn list_port_rules(State(state): State<AppState>) -> Json<Vec<PortRule>> {
 
 #[derive(Deserialize)]
 struct PortRuleRequest {
-    bind_ip: Ipv4Addr,
+    #[serde(default)]
+    bind_ip_v4: Option<Ipv4Addr>,
+    #[serde(default)]
+    bind_ip_v6: Option<Ipv6Addr>,
     port_start: u16,
     port_end: u16,
     protocol: Protocol,
@@ -815,7 +848,7 @@ fn validate_port_rule_request(state: &AppState, req: &PortRuleRequest) -> Result
     if req.port_start > req.port_end {
         return Err(ApiError::BadRequest("port_start must be <= port_end".into()));
     }
-    crate::config::validate_bind_ip(&state.network().bind_ranges, req.bind_ip, "port_rules")
+    crate::config::validate_dual_bind(&state.network().bind_ranges, req.bind_ip_v4, req.bind_ip_v6, "port_rules")
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(())
 }
@@ -824,7 +857,8 @@ async fn create_port_rule(State(state): State<AppState>, Json(body): Json<PortRu
     validate_port_rule_request(&state, &body)?;
     let rule = PortRule {
         id: Uuid::new_v4(),
-        bind_ip: body.bind_ip,
+        bind_ip_v4: body.bind_ip_v4,
+        bind_ip_v6: body.bind_ip_v6,
         port_start: body.port_start,
         port_end: body.port_end,
         protocol: body.protocol,
@@ -849,7 +883,8 @@ async fn update_port_rule(
     validate_port_rule_request(&state, &body)?;
     let updated = PortRule {
         id,
-        bind_ip: body.bind_ip,
+        bind_ip_v4: body.bind_ip_v4,
+        bind_ip_v6: body.bind_ip_v6,
         port_start: body.port_start,
         port_end: body.port_end,
         protocol: body.protocol,
@@ -1267,9 +1302,11 @@ mod tests {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
             },
             admin: AdminConfig {
-                bind_ip: "10.0.0.1".parse().unwrap(),
+                bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: Some("test-secret-key".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
@@ -1299,9 +1336,11 @@ mod tests {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
             },
             admin: AdminConfig {
-                bind_ip: "10.0.0.1".parse().unwrap(),
+                bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: None,
                 admin_username: None,
                 admin_password_hash: None,
@@ -1335,9 +1374,11 @@ mod tests {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
             },
             admin: AdminConfig {
-                bind_ip: "10.0.0.1".parse().unwrap(),
+                bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
+                expose_admin_port: true,
                 session_secret: Some("test-secret-key".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
@@ -1492,6 +1533,18 @@ mod tests {
             .unwrap();
         let json = body_json(resp).await;
         assert_eq!(json["configured"], true);
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_is_unauthenticated_and_reports_the_crate_version() {
+        let router = build_router(test_state().await);
+        let resp = router
+            .oneshot(Request::builder().uri("/api/version").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
@@ -1659,7 +1712,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}"#,
+                        r#"{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}"#,
                     ))
                     .unwrap(),
             )
@@ -1695,7 +1748,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"192.168.1.5","bind_port":443,"upstream":"127.0.0.1:8000"}"#,
+                        r#"{"domain":"example.com","bind_ip_v4":"192.168.1.5","bind_port":443,"upstream":"127.0.0.1:8000"}"#,
                     ))
                     .unwrap(),
             )
@@ -1717,7 +1770,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(format!(
-                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
+                        r#"{{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000",
                         "acl_ids":["{}"]}}"#,
                         Uuid::new_v4()
                     )))
@@ -1750,7 +1803,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}"#,
+                        r#"{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}"#,
                     ))
                     .unwrap(),
             )
@@ -1910,7 +1963,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(format!(
-                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01","dns_credential_id":"{cred_id}"}}"#
+                        r#"{{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01","dns_credential_id":"{cred_id}"}}"#
                     )))
                     .unwrap(),
             )
@@ -1946,7 +1999,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(format!(
-                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01","dns_credential_id":"{bogus_id}"}}"#
+                        r#"{{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01","dns_credential_id":"{bogus_id}"}}"#
                     )))
                     .unwrap(),
             )
@@ -1978,7 +2031,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
+                        r#"{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
                     ))
                     .unwrap(),
             )
@@ -2014,7 +2067,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
+                        r#"{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
                     ))
                     .unwrap(),
             )
@@ -2052,7 +2105,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
+                        r#"{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"dns01"}"#,
                     ))
                     .unwrap(),
             )
@@ -2074,7 +2127,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"http01"}"#,
+                        r#"{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_challenge_type":"http01"}"#,
                     ))
                     .unwrap(),
             )
@@ -2097,7 +2150,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
-                        r#"{"domain":"old.example.com","bind_ip":"10.0.0.2","bind_port":443,"acme_enabled":false,
+                        r#"{"domain":"old.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"acme_enabled":false,
                         "redirect":{"target":"https://new.example.com","preserve_path":true,"status":"permanent"}}"#,
                     ))
                     .unwrap(),
@@ -2135,7 +2188,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
                     .body(axum::body::Body::from(
-                        r#"{"domain":"old.example.com","bind_ip":"10.0.0.2","bind_port":443,
+                        r#"{"domain":"old.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,
                         "redirect":{"target":"new.example.com","preserve_path":true,"status":"permanent"}}"#,
                     ))
                     .unwrap(),
@@ -2228,7 +2281,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
-                        r#"{"domain":"custom.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":true,"acme_challenge_type":"http01"}"#,
+                        r#"{"domain":"custom.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":true,"acme_challenge_type":"http01"}"#,
                     ))
                     .unwrap(),
             )
@@ -2327,7 +2380,7 @@ mod tests {
             let router = router.clone();
             let cookie = cookie.clone();
             handles.push(tokio::spawn(async move {
-                let body = format!(r#"{{"domain":"host{i}.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}}"#);
+                let body = format!(r#"{{"domain":"host{i}.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}}"#);
                 router
                     .oneshot(
                         Request::builder()
@@ -2573,6 +2626,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_ip_allow_acl_accepts_ipv6_cidrs_and_bare_addresses() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let acl_id = create_acl(&router, &cookie, r#"{"name":"v6-office","kind":"ip_allow","ip_entries":["2001:db8::/32"]}"#).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/acls/{acl_id}/ip-entries"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"cidr":"2001:db8::42"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let added = body_json(resp).await;
+        assert_eq!(added["cidr"], "2001:db8::42/128", "a bare IPv6 address must be normalized to a /128, same as IPv4's /32");
+    }
+
+    #[tokio::test]
     async fn create_ip_allow_acl_with_no_entries_is_rejected() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
@@ -2769,7 +2845,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(format!(
-                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,"acl_ids":["{acl_id}"]}}"#
+                        r#"{{"domain":"example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,"acl_ids":["{acl_id}"]}}"#
                     )))
                     .unwrap(),
             )

@@ -52,6 +52,8 @@
   .overlay-panel { background: Canvas; color: CanvasText; border: 1px solid #8884; border-radius: 8px;
     padding: 1.2rem 1.4rem; max-width: 640px; width: 100%; max-height: 85vh; overflow-y: auto; }
   #acl-manage-table { margin: 0.6rem 0; }
+  footer { margin: 2.5rem 0 1rem; padding-top: 0.8rem; border-top: 1px solid #8884;
+    font-size: 0.78rem; opacity: 0.6; text-align: center; }
 </style>
 </head>
 <body>
@@ -126,7 +128,8 @@
         <legend>Basics</legend>
         <div class="field-grid">
           <label><span>Domain</span><input type="text" name="domain" placeholder="app.example.com" required></label>
-          <label><span>Bind IP</span><input type="text" name="bind_ip" placeholder="10.0.0.2" required></label>
+          <label><span>Bind IPv4</span><select name="bind_ip_v4" class="bind-ip-v4-select"></select></label>
+          <label><span>Bind IPv6</span><select name="bind_ip_v6" class="bind-ip-v6-select"></select></label>
           <label><span>Bind port</span><input type="number" name="bind_port" value="443" required></label>
           <label class="wide"><span>Upstream (host:port) -- leave blank if this host is a pure redirect below</span>
             <input type="text" name="upstream" placeholder="127.0.0.1:8000"></label>
@@ -208,7 +211,8 @@
     </tr></thead><tbody></tbody></table>
     <form id="rule-form">
       <div class="field-grid">
-        <label><span>Bind IP</span><input type="text" name="bind_ip" placeholder="10.0.0.4" required></label>
+        <label><span>Bind IPv4</span><select name="bind_ip_v4" class="bind-ip-v4-select"></select></label>
+        <label><span>Bind IPv6</span><select name="bind_ip_v6" class="bind-ip-v6-select"></select></label>
         <label><span>From port</span><input type="number" name="port_start" required></label>
         <label><span>To port</span><input type="number" name="port_end" required></label>
         <label><span>Protocol</span><select name="protocol"><option value="tcp">tcp</option><option value="udp">udp</option></select></label>
@@ -540,7 +544,7 @@ async function refreshAll() {
   // both dns_credential_id selects (read by refreshHosts and
   // refreshStandaloneCerts) -- both must resolve before anything that
   // reads them, not run concurrently with it.
-  await Promise.all([refreshAcls(), refreshDnsCredentials()]);
+  await Promise.all([refreshAcls(), refreshDnsCredentials(), populateBindIpSelects()]);
   await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts(), refreshAcmeSettings()]);
 }
 
@@ -573,7 +577,8 @@ function setHostFormMode(host) {
     return;
   }
   form.domain.value = host.domain;
-  form.bind_ip.value = host.bind_ip;
+  setBindIpSelectValue(form.bind_ip_v4, host.bind_ip_v4);
+  setBindIpSelectValue(form.bind_ip_v6, host.bind_ip_v6);
   form.bind_port.value = host.bind_port;
   form.upstream.value = host.upstream || '';
   form.upstream_https.checked = host.upstream_https;
@@ -620,8 +625,55 @@ document.querySelector('#host-form input[name=domain]').addEventListener('input'
   }
 });
 
+// Populates every bind_ip_v4/bind_ip_v6 <select> on the page (host form,
+// port-rule form) with this box's real, actually-usable addresses --
+// see /api/network/local-ips -- plus an "All interfaces" wildcard entry
+// and a "None" entry (empty value) for disabling that family entirely.
+// Re-fetched on every refreshAll() call, same as everything else here;
+// cheap on the server (a single `ip -json addr` invocation).
+async function populateBindIpSelects() {
+  const localIps = await (await api('/api/network/local-ips')).json();
+  const v4 = localIps.filter((ip) => !ip.address.includes(':'));
+  const v6 = localIps.filter((ip) => ip.address.includes(':'));
+
+  for (const select of document.querySelectorAll('.bind-ip-v4-select')) {
+    renderBindIpOptions(select, v4, '0.0.0.0', 'All interfaces (0.0.0.0)');
+  }
+  for (const select of document.querySelectorAll('.bind-ip-v6-select')) {
+    renderBindIpOptions(select, v6, '::', 'All interfaces (::)');
+  }
+}
+
+function renderBindIpOptions(select, addresses, wildcard, wildcardLabel) {
+  const previous = select.value;
+  const options = [
+    '<option value="">None (don\'t bind this family)</option>',
+    `<option value="${wildcard}" selected>${wildcardLabel}</option>`,
+    ...addresses.map((ip) => `<option value="${esc(ip.address)}">${esc(ip.address)} (${esc(ip.interface)})</option>`),
+  ];
+  select.innerHTML = options.join('');
+  setBindIpSelectValue(select, previous || wildcard);
+}
+
+// Selecting an address the dropdown doesn't already have an <option> for
+// (e.g. editing a host whose bind_ip was set by hand, or before this
+// box's interfaces changed) adds one on the fly instead of silently
+// falling back to the first option and changing the host's bind_ip out
+// from under the operator the moment they open it for editing.
+function setBindIpSelectValue(select, value) {
+  const v = value || '';
+  if (v && !Array.from(select.options).some((o) => o.value === v)) {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v;
+    select.appendChild(opt);
+  }
+  select.value = v;
+}
+
 async function refreshHosts() {
   const hosts = await (await api('/api/hosts')).json();
+  hosts.sort((a, b) => a.domain.localeCompare(b.domain));
   const tbody = document.querySelector('#hosts-table tbody');
   tbody.innerHTML = '';
   for (const h of hosts) {
@@ -630,7 +682,8 @@ async function refreshHosts() {
     const target = h.redirect
       ? `→ ${esc(h.redirect.target)} (${h.redirect.status === 'temporary' ? '302' : '301'})`
       : esc(h.upstream) + (h.upstream_https ? ` (https${h.upstream_tls_verify ? '' : ', unverified'})` : '');
-    tr.innerHTML = `<td>${esc(h.domain)}</td><td>${esc(h.bind_ip)}:${h.bind_port}</td><td>${target}</td>
+    const bindIps = [h.bind_ip_v4, h.bind_ip_v6].filter(Boolean).map(esc).join(' / ') || '—';
+    tr.innerHTML = `<td>${esc(h.domain)}</td><td>${bindIps}:${h.bind_port}</td><td>${target}</td>
       <td>${h.websockets ? 'yes' : ''}</td><td>${h.force_https ? 'yes' : ''}</td><td>${h.acme_enabled ? 'yes' : ''}</td>
       <td>${esc(h.acme_challenge_type)}</td>
       <td>${access}</td>
@@ -657,7 +710,7 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
   const redirectTarget = fd.get('redirect_target');
   const dnsCredentialId = fd.get('dns_credential_id');
   const body = {
-    domain: fd.get('domain'), bind_ip: fd.get('bind_ip'), bind_port: Number(fd.get('bind_port')),
+    domain: fd.get('domain'), bind_ip_v4: fd.get('bind_ip_v4') || null, bind_ip_v6: fd.get('bind_ip_v6') || null, bind_port: Number(fd.get('bind_port')),
     upstream: fd.get('upstream'),
     upstream_https: fd.get('upstream_https') === 'on',
     upstream_tls_verify: fd.get('upstream_tls_verify') === 'on',
@@ -686,7 +739,8 @@ async function refreshRules() {
   for (const r of rules) {
     const ports = r.port_start === r.port_end ? r.port_start : `${r.port_start}-${r.port_end}`;
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${esc(r.bind_ip)}</td><td>${ports}</td><td>${esc(r.protocol)}</td>
+    const bindIps = [r.bind_ip_v4, r.bind_ip_v6].filter(Boolean).map(esc).join(' / ') || '—';
+    tr.innerHTML = `<td>${bindIps}</td><td>${ports}</td><td>${esc(r.protocol)}</td>
       <td>${r.passthrough_target ? esc(r.passthrough_target) : '<em>firewall only</em>'}</td><td>${esc(r.description)}</td>
       <td>${r.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${r.id}">Delete</button></td>`;
     tr.querySelector('button').addEventListener('click', async () => {
@@ -702,7 +756,8 @@ document.getElementById('rule-form').addEventListener('submit', async (e) => {
   const fd = new FormData(e.target);
   const target = fd.get('passthrough_target');
   const body = {
-    bind_ip: fd.get('bind_ip'), port_start: Number(fd.get('port_start')), port_end: Number(fd.get('port_end')),
+    bind_ip_v4: fd.get('bind_ip_v4') || null, bind_ip_v6: fd.get('bind_ip_v6') || null,
+    port_start: Number(fd.get('port_start')), port_end: Number(fd.get('port_end')),
     protocol: fd.get('protocol'), description: fd.get('description') || '',
     passthrough_target: target ? target : null, enabled: fd.get('enabled') === 'on',
   };
@@ -1163,6 +1218,16 @@ fetch('/api/setup-status')
   .catch(() => {
     api('/api/dashboard').then(() => showApp()).catch(() => showLogin());
   });
+fetch('/api/version')
+  .then((r) => r.json())
+  .then((v) => {
+    document.getElementById('footer-version').textContent = `v${v.version}`;
+  })
+  .catch(() => {});
 </script>
+
+<footer>
+  &copy; 2026 Jeff Parrish PC Services &middot; rust-proxy <span id="footer-version"></span>
+</footer>
 </body>
 </html>

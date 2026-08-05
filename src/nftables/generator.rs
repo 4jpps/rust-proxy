@@ -16,9 +16,11 @@
 //! close.
 
 use std::fmt::Write as _;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
-use crate::config::{AdminConfig, PortRule, Protocol, ProxyHost};
+use ipnet::IpNet;
+
+use crate::config::{host_bind_ips, port_rule_bind_ips, AdminConfig, PortRule, Protocol, ProxyHost};
 
 pub const TABLE_NAME: &str = "rust_proxy";
 
@@ -65,20 +67,42 @@ pub fn generate_ruleset(hosts: &[ProxyHost], port_rules: &[PortRule], admin: &Ad
     out
 }
 
-/// `ip daddr X` only matches a packet whose *actual* destination
-/// address is literally `X` -- for a listener bound to a real, single
-/// IP that's exactly right, but 0.0.0.0 (`Ipv4Addr::UNSPECIFIED`) never
-/// appears as a real packet's destination on the wire (it means "every
-/// interface" to the *bind()* call, not a literal address to match).
-/// Emitting `ip daddr 0.0.0.0` would silently produce a rule that can
-/// never match anything, firewalling off a listener that's actually
-/// live on every real interface -- so this clause is omitted entirely
-/// (matching any destination) whenever the bind address is unspecified.
-fn daddr_clause(ip: Ipv4Addr) -> String {
+/// `ip daddr X`/`ip6 daddr X` only matches a packet whose *actual*
+/// destination address is literally `X` -- for a listener bound to a
+/// real, single IP that's exactly right, but an unspecified address
+/// (`0.0.0.0`/`::`) never appears as a real packet's destination on the
+/// wire (it means "every interface" to the *bind()* call, not a literal
+/// address to match). Emitting `ip daddr 0.0.0.0` would silently produce
+/// a rule that can never match anything, firewalling off a listener
+/// that's actually live on every real interface -- so this clause is
+/// omitted entirely (matching any destination) whenever the bind address
+/// is unspecified. `ip`/`ip6` is chosen by `ip`'s own family -- nftables
+/// requires the matching keyword for each address family, they aren't
+/// interchangeable.
+fn daddr_clause(ip: IpAddr) -> String {
     if ip.is_unspecified() {
         String::new()
-    } else {
+    } else if ip.is_ipv4() {
         format!("ip daddr {ip} ")
+    } else {
+        format!("ip6 daddr {ip} ")
+    }
+}
+
+/// `ip saddr { ... }`/`ip6 saddr { ... }` for whichever of `allowed`
+/// matches `ip`'s family -- nftables rejects mixing v4 and v6 addresses
+/// in one `saddr` set, and a rule scoped to a v4 `daddr` only ever needs
+/// v4 sources checked against it anyway (a v6 client could never reach a
+/// v4-only bind in the first place). Returns `None` when there are no
+/// allowed sources of the matching family, so the caller can fall back
+/// to its own "no restriction" rule for that family.
+fn saddr_clause(ip: IpAddr, allowed: &[IpNet]) -> Option<String> {
+    let sources: Vec<String> = allowed.iter().filter(|net| net.addr().is_ipv4() == ip.is_ipv4()).map(|net| net.to_string()).collect();
+    if sources.is_empty() {
+        None
+    } else {
+        let keyword = if ip.is_ipv4() { "ip" } else { "ip6" };
+        Some(format!("{keyword} saddr {{ {} }} ", sources.join(", ")))
     }
 }
 
@@ -100,44 +124,68 @@ fn write_always_open_rules(out: &mut String) {
     let _ = writeln!(out);
 }
 
+fn admin_bind_ips(admin: &AdminConfig) -> Vec<IpAddr> {
+    let mut ips = Vec::with_capacity(2);
+    if let Some(v4) = admin.bind_ip_v4 {
+        ips.push(IpAddr::V4(v4));
+    }
+    if let Some(v6) = admin.bind_ip_v6 {
+        ips.push(IpAddr::V6(v6));
+    }
+    ips
+}
+
 fn write_admin_rule(out: &mut String, admin: &AdminConfig) {
+    if !admin.expose_admin_port {
+        // Deliberately no accept rule at all -- default-DROP then keeps
+        // the admin port unreachable from the network entirely (only
+        // `iif "lo" accept`, already unconditional above, can still
+        // reach it). See `AdminConfig::expose_admin_port`'s doc comment.
+        let _ = writeln!(out, "        # admin UI -- not exposed via the firewall (expose_admin_port = false); reachable via loopback only");
+        let _ = writeln!(out);
+        return;
+    }
     let _ = writeln!(out, "        # admin UI");
-    let daddr = daddr_clause(admin.bind_ip);
-    if admin.allowed_ips.is_empty() {
-        // No explicit allowlist configured -- open to any source, same
-        // "reachable out of the box" reasoning as write_always_open_rules
-        // above. Matches admin.bind_ip's own default of 0.0.0.0 (see
-        // AdminConfig): a fresh install's first-launch setup wizard must
-        // actually be reachable from the network without any config.toml
-        // edits at all. Set admin.allowed_ips once you know your real
-        // management network/IP to narrow this down -- the source-IP
-        // restriction below is what actually enforces it, at the
-        // firewall layer, not just at the application layer.
-        let _ = writeln!(out, "        tcp dport {} {daddr}accept", admin.bind_port);
-    } else {
-        let sources = admin
-            .allowed_ips
-            .iter()
-            .map(|net| net.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(out, "        tcp dport {} {daddr}ip saddr {{ {} }} accept", admin.bind_port, sources);
+    for bind_ip in admin_bind_ips(admin) {
+        let daddr = daddr_clause(bind_ip);
+        if admin.allowed_ips.is_empty() {
+            // No explicit allowlist configured -- open to any source,
+            // same "reachable out of the box" reasoning as
+            // write_always_open_rules above. Matches the admin bind
+            // fields' own default of unspecified (see AdminConfig): a
+            // fresh install's first-launch setup wizard must actually be
+            // reachable from the network without any config.toml edits
+            // at all. Set admin.allowed_ips once you know your real
+            // management network/IP to narrow this down -- the
+            // source-IP restriction below is what actually enforces it,
+            // at the firewall layer, not just at the application layer.
+            let _ = writeln!(out, "        tcp dport {} {daddr}accept", admin.bind_port);
+        } else if let Some(saddr) = saddr_clause(bind_ip, &admin.allowed_ips) {
+            let _ = writeln!(out, "        tcp dport {} {daddr}{saddr}accept", admin.bind_port);
+        }
+        // An allowlist was configured but has no entries of this bind's
+        // family -- deliberately emit no accept rule for it at all
+        // (default-DROP then blocks it), rather than falling back to
+        // "open": an operator who configured a v4-only allowlist almost
+        // certainly didn't mean "and leave v6 wide open by omission."
     }
     let _ = writeln!(out);
 }
 
 fn write_host_rules(out: &mut String, host: &ProxyHost) {
     let _ = writeln!(out, "        # host: {}", host.domain);
-    let daddr = daddr_clause(host.bind_ip);
-    let _ = writeln!(out, "        tcp dport {} {daddr}accept", host.bind_port);
-    if host.force_https || crate::acme::opens_port_80_for_acme(host) {
-        // Redundant with write_always_open_rules's unconditional port 80
-        // accept above, but kept: this rule's own bind_ip-scoped comment
-        // is useful context when reading the generated ruleset, and
-        // nftables rule evaluation order means either one matching is
-        // sufficient regardless of which is "the" one actually doing the
-        // work.
-        let _ = writeln!(out, "        tcp dport 80 {daddr}accept");
+    for bind_ip in host_bind_ips(host) {
+        let daddr = daddr_clause(bind_ip);
+        let _ = writeln!(out, "        tcp dport {} {daddr}accept", host.bind_port);
+        if host.force_https || crate::acme::opens_port_80_for_acme(host) {
+            // Redundant with write_always_open_rules's unconditional port 80
+            // accept above, but kept: this rule's own bind_ip-scoped comment
+            // is useful context when reading the generated ruleset, and
+            // nftables rule evaluation order means either one matching is
+            // sufficient regardless of which is "the" one actually doing the
+            // work.
+            let _ = writeln!(out, "        tcp dport 80 {daddr}accept");
+        }
     }
     let _ = writeln!(out);
 }
@@ -155,8 +203,10 @@ fn write_port_rule(out: &mut String, rule: &PortRule) {
     if !rule.description.is_empty() {
         let _ = writeln!(out, "        # port rule: {}", rule.description);
     }
-    let daddr = daddr_clause(rule.bind_ip);
-    let _ = writeln!(out, "        {proto} dport {port_expr} {daddr}accept");
+    for bind_ip in port_rule_bind_ips(rule) {
+        let daddr = daddr_clause(bind_ip);
+        let _ = writeln!(out, "        {proto} dport {port_expr} {daddr}accept");
+    }
     let _ = writeln!(out);
 }
 
@@ -167,9 +217,11 @@ mod tests {
 
     fn admin() -> AdminConfig {
         AdminConfig {
-            bind_ip: "10.0.0.1".parse().unwrap(),
+            bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: 8080,
             allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
+            expose_admin_port: true,
             session_secret: Some("test".into()),
             admin_username: Some("admin".into()),
             admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
@@ -181,7 +233,8 @@ mod tests {
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
-            bind_ip: bind_ip.parse().unwrap(),
+            bind_ip_v4: Some(bind_ip.parse().unwrap()),
+            bind_ip_v6: None,
             bind_port: port,
             upstream: "127.0.0.1:8000".into(),
             upstream_https: false,
@@ -201,7 +254,8 @@ mod tests {
     fn port_rule(bind_ip: &str, start: u16, end: u16, proto: Protocol, desc: &str) -> PortRule {
         PortRule {
             id: Uuid::new_v4(),
-            bind_ip: bind_ip.parse().unwrap(),
+            bind_ip_v4: Some(bind_ip.parse().unwrap()),
+            bind_ip_v6: None,
             port_start: start,
             port_end: end,
             protocol: proto,
@@ -326,13 +380,14 @@ mod tests {
         let mut a = admin();
         a.allowed_ips = vec![];
         let out = generate_ruleset(&[], &[], &a);
-        assert!(out.contains(&format!("tcp dport {} ip daddr {} accept", a.bind_port, a.bind_ip)));
+        assert!(out.contains(&format!("tcp dport {} ip daddr {} accept", a.bind_port, a.bind_ip_v4.unwrap())));
     }
 
     #[test]
     fn admin_rule_omits_the_daddr_clause_when_bind_ip_is_unspecified() {
         let mut a = admin();
-        a.bind_ip = Ipv4Addr::UNSPECIFIED;
+        a.bind_ip_v4 = Some(std::net::Ipv4Addr::UNSPECIFIED);
+        a.bind_ip_v6 = None;
         a.allowed_ips = vec![];
         let out = generate_ruleset(&[], &[], &a);
         assert!(out.contains(&format!("tcp dport {} accept", a.bind_port)), "got: {out}");
@@ -365,5 +420,73 @@ mod tests {
         for unused in ["10.0.0.5", "10.0.0.6"] {
             assert!(!out.contains(unused), "unassigned ip {unused} leaked into ruleset");
         }
+    }
+
+    #[test]
+    fn ipv6_only_host_emits_ip6_daddr_not_ip_daddr() {
+        let mut h = host("example.com", "10.0.0.2", 443, false);
+        h.bind_ip_v4 = None;
+        h.bind_ip_v6 = Some("2001:db8::1".parse().unwrap());
+        let out = generate_ruleset(&[h], &[], &admin());
+        assert!(out.contains("tcp dport 443 ip6 daddr 2001:db8::1 accept"));
+        assert!(!out.contains("ip daddr 2001:db8::1"), "an IPv6 address must never be matched with the v4-only `ip daddr` keyword");
+    }
+
+    #[test]
+    fn dual_stack_host_emits_a_rule_for_each_family() {
+        let mut h = host("example.com", "10.0.0.2", 443, true);
+        h.bind_ip_v6 = Some("2001:db8::1".parse().unwrap());
+        let out = generate_ruleset(&[h], &[], &admin());
+        assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
+        assert!(out.contains("tcp dport 443 ip6 daddr 2001:db8::1 accept"));
+        assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
+        assert!(out.contains("tcp dport 80 ip6 daddr 2001:db8::1 accept"));
+    }
+
+    #[test]
+    fn ipv6_port_rule_uses_ip6_daddr() {
+        let mut rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
+        rule.bind_ip_v4 = None;
+        rule.bind_ip_v6 = Some("2001:db8::5".parse().unwrap());
+        let out = generate_ruleset(&[], &[rule], &admin());
+        assert!(out.contains("tcp dport 22 ip6 daddr 2001:db8::5 accept"));
+    }
+
+    #[test]
+    fn admin_allowlist_with_only_v4_entries_leaves_a_v6_bind_unopened() {
+        // A configured allowlist that only lists v4 sources must not
+        // silently fall back to "wide open" for a v6 bind that has no
+        // matching entries -- default-DROP should keep it closed instead.
+        let mut a = admin();
+        a.bind_ip_v6 = Some(std::net::Ipv6Addr::UNSPECIFIED);
+        let out = generate_ruleset(&[], &[], &a);
+        assert!(out.contains("tcp dport 8080 ip daddr 10.0.0.1 ip saddr { 10.0.0.1/32 } accept"));
+        assert!(!out.contains("ip6 daddr"), "no v6 accept rule should have been emitted since allowed_ips has no v6 entries");
+    }
+
+    #[test]
+    fn admin_allowlist_with_a_v6_entry_opens_the_v6_bind_to_it() {
+        let mut a = admin();
+        a.bind_ip_v6 = Some(std::net::Ipv6Addr::UNSPECIFIED);
+        a.allowed_ips.push("2001:db8::/32".parse().unwrap());
+        let out = generate_ruleset(&[], &[], &a);
+        assert!(out.contains("tcp dport 8080 ip6 saddr { 2001:db8::/32 } accept"));
+    }
+
+    #[test]
+    fn expose_admin_port_false_emits_no_accept_rule_for_the_admin_port() {
+        let mut a = admin();
+        a.expose_admin_port = false;
+        let out = generate_ruleset(&[], &[], &a);
+        assert!(!out.contains("dport 8080"), "no accept rule should mention the admin port at all when expose_admin_port is false");
+    }
+
+    #[test]
+    fn expose_admin_port_false_does_not_affect_host_or_port_rule_firewall_entries() {
+        let mut a = admin();
+        a.expose_admin_port = false;
+        let h = host("example.com", "10.0.0.2", 443, false);
+        let out = generate_ruleset(&[h], &[], &a);
+        assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
     }
 }
