@@ -31,7 +31,12 @@
   next time an `AcmeClient` is built (a restart, or the next init retry
   after an earlier failure) -- there's no RFC 8555 account-contact-update
   call here, so an already-running client keeps using whatever email it
-  registered with until then; the UI's hint text says so. See
+  registered with until then; the UI's hint text says so.
+  `acme.contact_email` is also no longer a required config.toml field
+  (`toml::from_str` used to fail outright if it was missing) -- same
+  "config.toml is only ever a seed, the DB-backed value takes over from
+  there" precedence the admin identity fields already use, not a
+  required setting. See
   `state::AppState::acme_contact_email`/`set_acme_contact_email` and
   `db::{load,set}_acme_contact_email`.
 - **Standalone DNS-01 certificates, decoupled from any host.** Built

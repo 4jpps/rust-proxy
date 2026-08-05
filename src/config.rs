@@ -129,6 +129,15 @@ impl Default for DnsProviderKind {
 pub struct AcmeConfig {
     #[serde(default = "default_acme_directory")]
     pub directory_url: String,
+    /// Defaults to empty (not required) -- same "config.toml is only
+    /// for seeding, the DB-backed value (settable from the admin UI's
+    /// ACME settings section or the setup wizard) takes over from
+    /// there" precedence `admin_username`/`admin_password_hash`/
+    /// `session_secret` already use. See
+    /// `state::AppState::acme_contact_email`'s doc comment for the
+    /// exact precedence rule. Left blank, ACME issuance won't work
+    /// until an operator sets one via the admin UI.
+    #[serde(default)]
     pub contact_email: String,
     #[serde(default)]
     pub dns_provider: DnsProviderKind,
@@ -645,6 +654,19 @@ dns_api_token = "token-placeholder"
         let toml_str = base_toml().replace("test-secret-do-not-use-in-prod", "");
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn acme_contact_email_defaults_to_blank_when_omitted() {
+        // config.toml is only ever a seed for contact_email -- like the
+        // admin identity fields, the DB-backed value (set via the admin
+        // UI's ACME settings section or the setup wizard) takes over
+        // from there. A config.toml that never mentions contact_email
+        // at all must still parse and validate cleanly.
+        let toml_str = base_toml().replace(r#"contact_email = "admin@example.com""#, "");
+        let cfg: Config = toml::from_str(&toml_str).expect("contact_email must be optional, not a required field");
+        assert_eq!(cfg.acme.contact_email, "");
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

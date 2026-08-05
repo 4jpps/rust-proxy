@@ -50,9 +50,18 @@ allowed_ips = []
 db_path = "/var/lib/rust-proxy/rust-proxy.db"
 
 [acme]
-contact_email = "admin@example.com"
 cert_dir = "/var/lib/rust-proxy/certs"
 account_key_path = "/var/lib/rust-proxy/acme-account.key"
+# contact_email is deliberately omitted here -- same "config.toml is
+# only for seeding, the DB-backed value (set from the admin UI's ACME
+# settings section, or the setup wizard's optional field) takes over
+# from there" precedence the admin identity fields above use. Set it
+# here only if you'd rather manage it as part of this file -- when set
+# here, config.toml always wins over the admin UI on every read, same
+# as the admin identity fields. Left unset everywhere, ACME issuance
+# won't work until an operator sets one via the admin UI.
+#
+# contact_email = "admin@example.com"
 # dns_provider/dns_api_token are also deliberately omitted here -- add a
 # named DNS-01 credential from the admin UI's "DNS credentials" section
 # (or the setup wizard's optional step) instead. Uncomment below only if
