@@ -288,6 +288,7 @@ mod tests {
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         }
     }

@@ -308,6 +308,11 @@ async fn handle_https_request(
         return Ok(http::redirect_target_response(&req, redirect));
     }
 
+    let mut req = req;
+    if let Some(path_rewrite) = &host.path_rewrite {
+        apply_path_rewrite(&mut req, path_rewrite);
+    }
+
     let Ok(upstream) = resolve_upstream(&host.upstream) else {
         return Ok(bad_gateway());
     };
@@ -325,6 +330,35 @@ async fn handle_https_request(
             tracing::warn!(domain = %host.domain, error = %err, "upstream request failed");
             Ok(bad_gateway())
         }
+    }
+}
+
+/// Rewrites `req`'s path (leaving the query string intact) per
+/// `rewrite`'s pattern/replacement -- see `config::ProxyHost::path_rewrite`'s
+/// doc comment for the exact semantics. A no-op if the pattern doesn't
+/// compile (already validated at host-save time, see
+/// `api::routes::validate_host_request`, so this should never actually
+/// happen in practice) or doesn't match this request's path at all.
+fn apply_path_rewrite<B>(req: &mut Request<B>, rewrite: &crate::config::PathRewrite) {
+    let Ok(re) = regex::Regex::new(&rewrite.pattern) else {
+        return;
+    };
+    let original_path = req.uri().path();
+    if !re.is_match(original_path) {
+        return;
+    }
+    let new_path = re.replace(original_path, rewrite.replacement.as_str()).into_owned();
+    let new_path_and_query = match req.uri().query() {
+        Some(query) => format!("{new_path}?{query}"),
+        None => new_path,
+    };
+    let Ok(path_and_query) = hyper::http::uri::PathAndQuery::try_from(new_path_and_query) else {
+        return;
+    };
+    let mut parts = req.uri().clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    if let Ok(new_uri) = hyper::http::Uri::from_parts(parts) {
+        *req.uri_mut() = new_uri;
     }
 }
 
@@ -529,6 +563,51 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    fn path_rewrite(pattern: &str, replacement: &str) -> crate::config::PathRewrite {
+        crate::config::PathRewrite { pattern: pattern.into(), replacement: replacement.into() }
+    }
+
+    #[test]
+    fn apply_path_rewrite_inserts_gitlab_wikis_segment_for_a_bare_project_path() {
+        let rw = path_rewrite(r"^/([^/]+/[^/]+)(?:/(.*))?$", "/$1/-/wikis/$2");
+        let mut req = Request::builder().uri("/jpps/rust-proxy").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/");
+    }
+
+    #[test]
+    fn apply_path_rewrite_preserves_a_deeper_path_after_the_project() {
+        let rw = path_rewrite(r"^/([^/]+/[^/]+)(?:/(.*))?$", "/$1/-/wikis/$2");
+        let mut req = Request::builder().uri("/jpps/rust-proxy/getting-started").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/getting-started");
+    }
+
+    #[test]
+    fn apply_path_rewrite_preserves_the_query_string() {
+        let rw = path_rewrite(r"^/old(/.*)?$", "/new$1");
+        let mut req = Request::builder().uri("/old/page?x=1&y=2").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/new/page");
+        assert_eq!(req.uri().query(), Some("x=1&y=2"));
+    }
+
+    #[test]
+    fn apply_path_rewrite_leaves_a_non_matching_path_untouched() {
+        let rw = path_rewrite(r"^/only-this-path$", "/rewritten");
+        let mut req = Request::builder().uri("/something-else").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/something-else");
+    }
+
+    #[test]
+    fn apply_path_rewrite_leaves_the_request_untouched_when_the_pattern_is_invalid() {
+        let rw = path_rewrite("(unclosed", "/rewritten");
+        let mut req = Request::builder().uri("/original").body(()).unwrap();
+        apply_path_rewrite(&mut req, &rw);
+        assert_eq!(req.uri().path(), "/original");
+    }
+
     fn rule(bind_ip: &str, start: u16, end: u16, proto: Protocol, target: Option<&str>) -> PortRule {
         PortRule {
             id: Uuid::new_v4(),
@@ -662,6 +741,7 @@ mod tests {
             acl_ids,
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         }
     }
@@ -1052,6 +1132,7 @@ mod tests {
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: Some(redirect),
+            path_rewrite: None,
             enabled: true,
         }
     }

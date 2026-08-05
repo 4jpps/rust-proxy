@@ -459,6 +459,12 @@ struct HostRequest {
     /// is deserialized straight from the request with no separate DTO.
     #[serde(default)]
     redirect: Option<crate::config::RedirectTarget>,
+    /// See `config::ProxyHost::path_rewrite`'s doc comment. `pattern` is
+    /// validated as a real, compilable regex in `validate_host_request`
+    /// -- an invalid pattern is rejected at save time, not discovered
+    /// the first time a request hits this host.
+    #[serde(default)]
+    path_rewrite: Option<crate::config::PathRewrite>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -482,6 +488,9 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     }
     crate::config::validate_dual_bind(&state.network().bind_ranges, req.bind_ip_v4, req.bind_ip_v6, "hosts")
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if let Some(path_rewrite) = &req.path_rewrite {
+        regex::Regex::new(&path_rewrite.pattern).map_err(|e| ApiError::BadRequest(format!("invalid path_rewrite pattern: {e}")))?;
+    }
     Ok(())
 }
 
@@ -775,6 +784,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         acl_ids: body.acl_ids,
         dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
+        path_rewrite: body.path_rewrite,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -811,6 +821,7 @@ async fn update_host(
         acl_ids: body.acl_ids,
         dns_credential_id: body.dns_credential_id,
         redirect: body.redirect,
+        path_rewrite: body.path_rewrite,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;
@@ -2252,6 +2263,69 @@ mod tests {
             .unwrap();
         let json = body_json(list_resp).await;
         assert_eq!(json[0]["redirect"]["target"], "https://new.example.com");
+    }
+
+    #[tokio::test]
+    async fn create_host_with_a_path_rewrite_persists_and_appears_in_the_list() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"wiki.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,
+                        "path_rewrite":{"pattern":"^/([^/]+/[^/]+)(?:/(.*))?$","replacement":"/$1/-/wikis/$2"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let created = body_json(create_resp).await;
+        assert_eq!(created["path_rewrite"]["pattern"], "^/([^/]+/[^/]+)(?:/(.*))?$");
+        assert_eq!(created["path_rewrite"]["replacement"], "/$1/-/wikis/$2");
+
+        let list_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/hosts")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body_json(list_resp).await;
+        assert_eq!(json[0]["path_rewrite"]["replacement"], "/$1/-/wikis/$2");
+    }
+
+    #[tokio::test]
+    async fn create_host_with_an_invalid_path_rewrite_pattern_is_rejected() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"wiki.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,
+                        "path_rewrite":{"pattern":"(unclosed","replacement":"/whatever"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -196,6 +196,19 @@
         </div>
       </fieldset>
 
+      <fieldset>
+        <legend>Path rewrite (optional, advanced)</legend>
+        <p class="hint">Rewrites the request path before it's sent to Upstream -- leave both blank unless you
+          specifically need it. Pattern is a regular expression matched against the incoming path; replacement
+          can use <code>$1</code>, <code>$2</code>, etc. for pattern's capture groups. Example: mount a GitLab
+          project's wiki at a clean URL with pattern <code>^/([^/]+/[^/]+)(?:/(.*))?$</code> and replacement
+          <code>/$1/-/wikis/$2</code>.</p>
+        <div class="field-grid">
+          <label class="wide"><span>Pattern</span><input type="text" name="path_rewrite_pattern" placeholder="^/([^/]+/[^/]+)(?:/(.*))?$"></label>
+          <label class="wide"><span>Replacement</span><input type="text" name="path_rewrite_replacement" placeholder="/$1/-/wikis/$2"></label>
+        </div>
+      </fieldset>
+
       <div class="form-actions">
         <button type="submit" id="host-form-submit">Add host</button>
         <button type="button" id="host-form-cancel" style="display:none">Cancel edit</button>
@@ -611,6 +624,8 @@ function setHostFormMode(host) {
   form.redirect_target.value = host.redirect ? host.redirect.target : '';
   form.redirect_preserve_path.checked = host.redirect ? host.redirect.preserve_path : true;
   form.redirect_status.value = host.redirect ? host.redirect.status : 'permanent';
+  form.path_rewrite_pattern.value = host.path_rewrite ? host.path_rewrite.pattern : '';
+  form.path_rewrite_replacement.value = host.path_rewrite ? host.path_rewrite.replacement : '';
 }
 
 document.getElementById('host-form-cancel').addEventListener('click', () => setHostFormMode(null));
@@ -724,6 +739,8 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
   const aclIds = Array.from(document.querySelector('#host-form select[name=acl_ids]').selectedOptions).map((o) => o.value);
   const redirectTarget = fd.get('redirect_target');
   const dnsCredentialId = fd.get('dns_credential_id');
+  const pathRewritePattern = fd.get('path_rewrite_pattern');
+  const pathRewriteReplacement = fd.get('path_rewrite_replacement');
   const body = {
     domain: fd.get('domain'), bind_ip_v4: fd.get('bind_ip_v4') || null, bind_ip_v6: fd.get('bind_ip_v6') || null, bind_port: Number(fd.get('bind_port')),
     upstream: fd.get('upstream'),
@@ -738,6 +755,7 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
     redirect: redirectTarget
       ? { target: redirectTarget, preserve_path: fd.get('redirect_preserve_path') === 'on', status: fd.get('redirect_status') }
       : null,
+    path_rewrite: (pathRewritePattern && pathRewriteReplacement) ? { pattern: pathRewritePattern, replacement: pathRewriteReplacement } : null,
     enabled: fd.get('enabled') === 'on',
   };
   const resp = editingHostId

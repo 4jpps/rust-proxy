@@ -331,8 +331,30 @@ pub struct ProxyHost {
     /// default) is a normal reverse-proxy host.
     #[serde(default)]
     pub redirect: Option<RedirectTarget>,
+    /// Rewrites the request path before it's forwarded to `upstream` --
+    /// `pattern` is matched against the incoming path (not the query
+    /// string) with `regex` crate syntax, and `replacement` is the
+    /// upstream path to use instead, with `$1`/`$2`/... substituted from
+    /// `pattern`'s capture groups (same as `regex::Regex::replace`'s own
+    /// replacement syntax; an unmatched optional group substitutes as
+    /// empty string). `None` (the default) forwards the original path
+    /// unchanged. Ignored on a `redirect` host (see `redirect` above --
+    /// there's no upstream request to rewrite the path of). A path that
+    /// doesn't match `pattern` at all is forwarded unchanged, not
+    /// rejected -- e.g. useful for mounting a whole external site's wiki
+    /// under a clean URL: pattern `^/([^/]+/[^/]+)(?:/(.*))?$`,
+    /// replacement `/$1/-/wikis/$2`.
+    #[serde(default)]
+    pub path_rewrite: Option<PathRewrite>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// See `ProxyHost::path_rewrite`'s doc comment for the exact semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathRewrite {
+    pub pattern: String,
+    pub replacement: String,
 }
 
 /// Where a `redirect` host sends visitors, and how.
@@ -883,6 +905,7 @@ dns_api_token = "token-placeholder"
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -909,6 +932,7 @@ dns_api_token = "token-placeholder"
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok(), "bind_ip in the second range should be accepted");
@@ -934,6 +958,7 @@ dns_api_token = "token-placeholder"
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -959,6 +984,7 @@ dns_api_token = "token-placeholder"
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -988,6 +1014,7 @@ dns_api_token = "token-placeholder"
                 preserve_path: true,
                 status: RedirectStatus::Permanent,
             }),
+            path_rewrite: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -1017,6 +1044,7 @@ dns_api_token = "token-placeholder"
                 preserve_path: true,
                 status: RedirectStatus::Permanent,
             }),
+            path_rewrite: None,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1109,6 +1137,7 @@ dns_api_token = "token-placeholder"
                 acl_ids: vec![],
                 dns_credential_id: None,
                 redirect: None,
+                path_rewrite: None,
                 enabled: true,
             });
         }
@@ -1139,6 +1168,7 @@ dns_api_token = "token-placeholder"
                 acl_ids: vec![],
                 dns_credential_id: None,
                 redirect: None,
+                path_rewrite: None,
                 enabled: true,
             });
         }
@@ -1165,6 +1195,7 @@ dns_api_token = "token-placeholder"
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -1202,6 +1233,7 @@ dns_api_token = "token-placeholder"
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());

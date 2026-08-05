@@ -97,6 +97,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
     let _ = sqlx::query("UPDATE hosts SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
+    // Both NULL means no rewrite (ProxyHost.path_rewrite is None); both
+    // set together (the API layer never persists just one) means it is.
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_pattern TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_replacement TEXT").execute(pool).await;
 
     // Metadata only -- kind is 'ip_allow' or 'login'; entries live in
     // the two tables below, keyed by acl_list_id. name is UNIQUE so an
@@ -966,7 +970,7 @@ async fn migrate_legacy_host_access(pool: &SqlitePool) -> Result<(), sqlx::Error
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -992,6 +996,10 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 },
             });
             let dns_credential_id = row.get::<Option<String>, _>("dns_credential_id").and_then(|s| Uuid::parse_str(&s).ok());
+            let path_rewrite = match (row.get::<Option<String>, _>("path_rewrite_pattern"), row.get::<Option<String>, _>("path_rewrite_replacement")) {
+                (Some(pattern), Some(replacement)) => Some(crate::config::PathRewrite { pattern, replacement }),
+                _ => None,
+            };
             Ok(ProxyHost {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 domain: row.get("domain"),
@@ -1009,6 +1017,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 acl_ids,
                 dns_credential_id,
                 redirect,
+                path_rewrite,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1036,10 +1045,14 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             ),
             None => (None, true as i64, "permanent"),
         };
+        let (path_rewrite_pattern, path_rewrite_replacement) = match &h.path_rewrite {
+            Some(pr) => (Some(pr.pattern.as_str()), Some(pr.replacement.as_str())),
+            None => (None, None),
+        };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -1065,6 +1078,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(redirect_preserve_path)
         .bind(redirect_status)
         .bind(h.dns_credential_id.map(|id| id.to_string()))
+        .bind(path_rewrite_pattern)
+        .bind(path_rewrite_replacement)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -1161,6 +1176,7 @@ mod tests {
             acl_ids: vec![],
             dns_credential_id: None,
             redirect: None,
+            path_rewrite: None,
             enabled: true,
         }
     }
