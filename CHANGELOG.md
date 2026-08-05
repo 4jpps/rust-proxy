@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+- **Admin defaults to `0.0.0.0:8084`** (was a required field with no
+  default; 8084 to cut down on port collisions with the many
+  self-hosted tools defaulting to 8080), reachable from the network out
+  of the box so the first-launch setup wizard doesn't need any
+  config.toml edits to reach. nftables mirrors this: SSH (22), HTTP
+  (80), and HTTPS (443) are now always accepted unconditionally,
+  regardless of what hosts/port rules are (or aren't yet) configured --
+  a default-DROP firewall that could lock an operator out of SSH, or
+  out of the admin UI needed to fix the firewall itself, was a bricked
+  box waiting to happen. The admin port itself is open to any source
+  until `admin.allowed_ips` narrows it down. Fixed a real, previously
+  latent bug this work surfaced: the generated ruleset started with
+  `flush table inet rust_proxy`, which errors outright if that table
+  has never been created -- meaning a genuinely fresh host (nftables
+  has never seen this table before) would fail its very first sync
+  forever, since `nft -f -` aborts the rest of the script on that first
+  error and the `table { ... }` block that actually creates everything
+  never got to run. Fixed by emitting an idempotent `add table` first.
+  Verified against a real `nft` binary, not just the unit tests: the
+  bug reproduces exactly as described, and the fix resolves it.
+  `Config::load` also now writes a working default config.toml
+  automatically if the given path doesn't exist at all (not just via
+  `postinst`), and `nftables::validate_environment` checks `nft` is
+  actually usable once at startup with one clear, actionable error
+  message instead of that only surfacing buried in repeating sync
+  failures.
 - Admin UI redesign -- the single long scrolling page is now organized
   into tabs (Hosts, Firewall Rules, Certificates, DNS Credentials, API
   Tokens), and every form field gets a real `<label>` grouped into

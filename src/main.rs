@@ -82,6 +82,17 @@ async fn main() -> anyhow::Result<()> {
     let state = state::AppState::new(cfg, db_pool, hosts, port_rules, db_admin_identity);
     acme::load_certs_from_disk(&state)?;
 
+    // One clear, loud message right at boot if nftables isn't usable,
+    // instead of that only surfacing buried in `nftables sync failed`
+    // error lines once run_sync_loop's first iteration gets to it (and
+    // repeating on every fallback resync/hosts change after that with
+    // no clearer explanation). Deliberately non-fatal -- see
+    // nftables::validate_environment's own doc comment for why this
+    // must never abort startup.
+    if let Err(err) = nftables::validate_environment().await {
+        tracing::error!(error = %err, "nftables is not usable -- the firewall will not be enforced until this is fixed");
+    }
+
     tokio::try_join!(
         proxy::run(state.clone()),
         api::run(state.clone()),

@@ -49,11 +49,27 @@ pub struct NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
+    /// Defaults to 0.0.0.0 (every interface), not loopback -- the
+    /// first-launch setup wizard needs to be reachable from the network
+    /// on a genuinely fresh install with no config.toml edits at all.
+    /// `nftables::generator`'s admin rule is the actual gatekeeper for
+    /// who can reach it (see `allowed_ips` below); this only controls
+    /// which local interface(s) the listener itself is bound to.
+    #[serde(default = "default_admin_bind_ip")]
     pub bind_ip: Ipv4Addr,
+    /// Defaults to 8084 -- deliberately not 8080, the extremely common
+    /// default for a dozen other self-hosted tools, to cut down on
+    /// same-host port collisions.
+    #[serde(default = "default_admin_bind_port")]
     pub bind_port: u16,
     /// IPs/CIDRs allowed to reach the admin UI/API. Enforced both at the
     /// application layer and mirrored into the nftables default-DROP
-    /// posture (see `nftables`).
+    /// posture (see `nftables`). Empty (the default) means unrestricted
+    /// -- deliberately, not loopback-only: paired with `bind_ip`
+    /// defaulting to 0.0.0.0 above, this is what actually makes the
+    /// first-launch setup wizard reachable from the network out of the
+    /// box. Set this once you know your real management network/IP to
+    /// narrow it down -- see `nftables::generator::write_admin_rule`.
     #[serde(default)]
     pub allowed_ips: Vec<Ipv4Net>,
     /// HMAC key signing admin session tokens. `None` means "not set in
@@ -77,6 +93,14 @@ pub struct AdminConfig {
 
 fn default_db_path() -> PathBuf {
     PathBuf::from("/etc/rust-proxy/rust-proxy.db")
+}
+
+fn default_admin_bind_ip() -> Ipv4Addr {
+    Ipv4Addr::UNSPECIFIED
+}
+
+fn default_admin_bind_port() -> u16 {
+    8084
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,8 +348,32 @@ impl PortRule {
     }
 }
 
+/// The same file `postinst` installs verbatim on a fresh `.deb`
+/// install (see `deploy/debian/postinst`) and `deploy/config.toml.example`
+/// documents for manual installs -- embedded here too so a non-packaged
+/// run (`cargo run`, a manually-copied binary, a container with no
+/// postinst-equivalent step) gets the identical safe-by-default
+/// behavior instead of a hard failure. One source of truth: editing
+/// `deploy/config.toml.example` updates both paths at once.
+const DEFAULT_CONFIG_TOML: &str = include_str!("../deploy/config.toml.example");
+
 impl Config {
+    /// Loads `path`, creating it first (with `DEFAULT_CONFIG_TOML`'s
+    /// safe, working defaults -- 0.0.0.0:8084 admin, no admin identity
+    /// or DNS credential set, so a first-launch setup wizard serves
+    /// instead) if nothing exists there yet. Matches this project's
+    /// "no config file dependency" goal: a genuinely fresh environment
+    /// with no config.toml at all should still start cleanly and be
+    /// immediately configurable from the admin UI, not fail before it
+    /// ever gets that far.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+            }
+            std::fs::write(path, DEFAULT_CONFIG_TOML).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+            tracing::info!(path = %path.display(), "no config file found -- wrote a default one with safe, working settings");
+        }
         let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
         let cfg: Config = toml::from_str(&raw)?;
         cfg.validate()?;
@@ -464,6 +512,17 @@ pub(crate) fn validate_redirect_target(target: &str) -> Result<(), ConfigError> 
 }
 
 pub(crate) fn validate_bind_ip(allowed: &[Ipv4Net], ip: Ipv4Addr, ctx: &str) -> Result<(), ConfigError> {
+    if ip.is_unspecified() {
+        // 0.0.0.0 means "every interface", not one specific address --
+        // it's never meaningfully "outside" a configured bind_ranges
+        // allowlist the way a single real IP could be, so there's
+        // nothing to range-check. Matters most for admin.bind_ip, whose
+        // own default is now 0.0.0.0 (see AdminConfig) -- without this,
+        // any operator who set network.bind_ranges without also
+        // explicitly overriding admin.bind_ip would fail validation on
+        // a field they never touched.
+        return Ok(());
+    }
     if allowed.is_empty() {
         // Unrestricted -- no configured ranges to check against.
         return Ok(());
@@ -508,6 +567,38 @@ dns_api_token = "token-placeholder"
     }
 
     #[test]
+    fn load_creates_a_default_config_file_when_none_exists_yet() {
+        let dir = std::env::temp_dir().join(format!("rust-proxy-config-test-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Nested, not-yet-created parent dir too -- proves the parent
+        // gets created along with the file itself, matching a genuinely
+        // fresh environment where /etc/rust-proxy doesn't exist at all.
+        let path = dir.join("nested").join("config.toml");
+        assert!(!path.exists());
+
+        let cfg = Config::load(&path).expect("should create a valid default and load it");
+        assert!(path.is_file(), "should have written the default config file");
+        assert_eq!(cfg.admin.bind_ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(cfg.admin.bind_port, 8084);
+        assert!(cfg.admin.session_secret.is_none(), "the default must not bake in a fixed admin identity");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_does_not_overwrite_an_existing_config_file() {
+        let dir = std::env::temp_dir().join(format!("rust-proxy-config-test-{}", Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(&path, base_toml()).unwrap();
+
+        let cfg = Config::load(&path).expect("should load the existing file as-is");
+        assert_eq!(cfg.admin.bind_ip, "10.0.0.1".parse::<Ipv4Addr>().unwrap(), "must not have replaced the operator's own config");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parses_minimal_valid_config() {
         let cfg: Config = toml::from_str(&base_toml()).expect("should parse");
         assert!(cfg.validate().is_ok());
@@ -529,6 +620,28 @@ dns_api_token = "token-placeholder"
         let toml_str = base_toml().replace("test-secret-do-not-use-in-prod", "");
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn admin_bind_ip_and_port_default_to_0000_and_8084_when_omitted() {
+        let toml_str = base_toml()
+            .replace(r#"bind_ip = "10.0.0.1""#, "")
+            .replace("bind_port = 8080", "");
+        let cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        assert_eq!(cfg.admin.bind_ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(cfg.admin.bind_port, 8084);
+        assert!(cfg.validate().is_ok(), "0.0.0.0 must not fail bind_ranges membership validation");
+    }
+
+    #[test]
+    fn admin_bind_ip_of_0000_is_valid_even_with_bind_ranges_configured() {
+        // network.bind_ranges is set to 10.0.0.0/29 in base_toml() --
+        // 0.0.0.0 is never literally inside that range, but it means
+        // "every interface", so it must not be rejected as if it were
+        // one specific out-of-range address.
+        let toml_str = base_toml().replace(r#"bind_ip = "10.0.0.1""#, r#"bind_ip = "0.0.0.0""#);
+        let cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

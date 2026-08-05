@@ -21,6 +21,37 @@ use crate::state::AppState;
 /// correctness backstop.
 const FALLBACK_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Checks that `nft` is actually present and invocable before the sync
+/// loop starts silently retrying (and re-failing) forever. Called once
+/// at startup (see `main.rs`) so a missing/broken nftables setup
+/// produces one clear, actionable message right at boot -- not just an
+/// `nftables sync failed` error line indistinguishable from any other
+/// transient failure, appearing only once `run_sync_loop`'s first
+/// iteration gets around to it and repeating every
+/// `FALLBACK_RESYNC_INTERVAL` (or on every hosts/port_rules change)
+/// after that with no clearer explanation.
+///
+/// Deliberately non-fatal: this returns a `String` describing the
+/// problem for `main.rs` to log loudly, not a hard error that aborts
+/// startup. Proxying/ACME/the admin API all work regardless of whether
+/// the firewall layer is healthy -- crashing the whole daemon over a
+/// missing `nft` binary would be strictly worse for, say, a container
+/// or dev environment deliberately relying on an external firewall
+/// instead of `CAP_NET_ADMIN`.
+pub async fn validate_environment() -> Result<(), String> {
+    let output = Command::new("nft").arg("--version").output().await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "the `nft` binary was not found on PATH -- install the nftables package".to_string()
+        } else {
+            format!("couldn't run `nft --version`: {e}")
+        }
+    })?;
+    if !output.status.success() {
+        return Err(format!("`nft --version` exited with {}: {}", output.status, String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(())
+}
+
 pub async fn run_sync_loop(state: AppState) -> anyhow::Result<()> {
     loop {
         if let Err(err) = sync_once(&state).await {

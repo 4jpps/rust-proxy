@@ -15,16 +15,20 @@
 # bind_ranges = ["10.0.0.0/29"]
 
 [admin]
-# Safe, working defaults -- this file is installed verbatim as a fresh
-# install's real config.toml (see postinst), so these must work
-# out of the box, not be "replace me" placeholders. Change bind_ip to a
-# real LAN/subnet address (and widen allowed_ips to match) once you're
-# ready to reach the admin UI from more than just this host.
-bind_ip = "127.0.0.1"
-bind_port = 8080
+# bind_ip/bind_port are deliberately omitted here -- they default to
+# 0.0.0.0:8084 (see config.rs's AdminConfig), so the admin UI/setup
+# wizard is reachable from the network on a genuinely fresh install
+# with zero edits to this file. nftables mirrors that: SSH/80/443 are
+# always open unconditionally, and the admin port itself is open to
+# any source until allowed_ips (below) narrows it down. Override
+# bind_ip/bind_port here only if you want something other than "every
+# interface, port 8084".
+#
 # Only these source IPs/CIDRs may reach the admin UI/API -- enforced by
-# nftables, not just the application. Empty (the default) restricts to
-# loopback-only (see nftables::generator's fallback).
+# nftables, not just the application. Empty (the default) means
+# unrestricted; set this to your real management network/IP once you
+# know it, to actually narrow the admin port down at the firewall
+# layer, not just the application layer.
 allowed_ips = []
 # admin.session_secret/admin_username/admin_password_hash are
 # deliberately omitted -- leaving all three unset (never just one or

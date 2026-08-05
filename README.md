@@ -24,12 +24,18 @@ persistence tests run against an in-memory sqlite database.
 
 ## Configuration
 
-Copy `deploy/config.toml.example` to `/etc/rust-proxy/config.toml` -- its
-`[admin]`/`[acme]` sections are safe to run as-is (loopback-only admin
-UI, no admin account or DNS credential set), since the admin identity
-and any number of named DNS-01 credentials are normally created and
-managed from the admin UI (or the first-launch setup wizard it serves
-when unconfigured) and stored in sqlite, not `config.toml`. Each proxy
+`Config::load` writes `deploy/config.toml.example`'s content to the
+configured path automatically if nothing exists there yet (see
+`config::DEFAULT_CONFIG_TOML`) -- there's genuinely no config file
+dependency, even outside the `.deb`'s `postinst` step (`cargo run`, a
+manually-copied binary, a container with no provisioning step of its
+own all just work). Its `[admin]`/`[acme]` sections are safe to run
+as-is (admin UI on `0.0.0.0:8084`, reachable from the network out of
+the box; no admin account or DNS credential set), since the admin
+identity and any number of named DNS-01 credentials are normally
+created and managed from the admin UI (or the first-launch setup
+wizard it serves when unconfigured) and stored in sqlite, not
+`config.toml`. Each proxy
 host with `acme_enabled` and a dns-01 challenge type picks a named
 credential via `dns_credential_id` (falls back to the sole configured
 credential if there's exactly one and the host doesn't set it
@@ -107,6 +113,38 @@ Redirection Hosts, a redirect host still gets its own ACME cert and its
 own `access_allow_ips`/`access_login` -- domain matching, TLS, and
 access control are identical to a proxy host, only the final response
 differs.
+
+### Firewall
+
+`nftables::generator` builds a default-DROP `inet` table from scratch
+on every hosts/port-rule change, with an explicit ACCEPT carve-out for
+each configured host/port rule -- see [Architecture](#architecture)
+below. A small, fixed set of ports is always accepted unconditionally,
+regardless of what's configured (or not configured) yet:
+
+- **SSH (22)** -- a completely separate daemon this project has no
+  visibility into. A fresh install with zero port rules must never be
+  able to firewall off the very access an operator needs to configure
+  it in the first place.
+- **HTTP (80) and HTTPS (443)** -- the two ports this whole proxy
+  exists to serve. Per-host rules add narrower bind-ip-scoped
+  carve-outs on top of these, but a host that hasn't been created (or
+  fully configured) yet must not leave 80/443 unreachable network-wide.
+- **The admin port** (`admin.bind_port`, 8084 by default) -- open to
+  any source until `admin.allowed_ips` is set, matching
+  `admin.bind_ip`'s own 0.0.0.0 default: the first-launch setup wizard
+  needs to be reachable from the network with zero config.toml edits.
+  Set `admin.allowed_ips` once you know your real management
+  network/IP to narrow this down at the firewall layer, not just the
+  application layer.
+
+`nft` itself is validated once at startup (`nftables::validate_environment`)
+-- a missing/broken `nft` binary logs one clear, actionable error
+immediately rather than only showing up buried in repeating `nftables
+sync failed` lines. This is deliberately non-fatal: proxying/ACME/the
+admin API all work regardless of whether the firewall layer is healthy,
+so a missing `nft` (e.g. a container relying on an external firewall
+instead of `CAP_NET_ADMIN`) logs loudly but doesn't crash startup.
 
 A host doesn't have to use ACME at all -- set `acme_enabled = false` and
 upload a cert manually via `POST /api/certs` (an internal CA's cert, a
@@ -287,11 +325,13 @@ README for the full setup, including how to add both the `stable` and
 `testing` channels at once.)
 
 `postinst` creates the `rust-proxy` system user, installs a working
-default `/etc/rust-proxy/config.toml` on first install (loopback-only
-admin UI on port 8080, no admin account or DNS credential yet), and
-starts the service. Visit the admin UI once (`http://127.0.0.1:8080/`,
-or wherever you've pointed `admin.bind_ip` after editing the config) to
-finish setup -- it walks you through creating the admin account and,
+default `/etc/rust-proxy/config.toml` on first install (admin UI on
+`0.0.0.0:8084` -- reachable from the network out of the box, not just
+loopback; see [Configuration](#configuration) below for the firewall
+side of that -- no admin account or DNS credential yet), and starts the
+service. Visit the admin UI once (`http://<this-host's-ip>:8084/`, or
+wherever you've pointed `admin.bind_ip`/`admin.bind_port` after editing
+the config) to finish setup -- it walks you through creating the admin account and,
 optionally, an initial DNS-01 credential, both stored in the runtime
 database rather than the config file. An install with no DNS credential
 added yet still works -- it just can't issue dns-01 certs until one is

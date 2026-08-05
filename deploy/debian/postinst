@@ -32,12 +32,14 @@ configure)
         echo "rust-proxy: existing configuration in $CONFIG_FILE left untouched."
     else
         # config.toml.example's [admin]/[acme] sections are safe,
-        # working defaults (127.0.0.1, loopback-only, no admin identity
-        # or DNS credential set) -- installed verbatim, the daemon
-        # starts cleanly and the admin UI serves the first-launch setup
-        # wizard.
+        # working defaults (0.0.0.0:8084, no admin identity or DNS
+        # credential set) -- installed verbatim, the daemon starts
+        # cleanly and the admin UI serves the first-launch setup
+        # wizard, reachable from the network out of the box (not just
+        # loopback -- nftables keeps SSH/80/443 open unconditionally,
+        # and the admin port open until admin.allowed_ips is set).
         install -m 640 -o root -g rust-proxy /usr/share/doc/rust-proxy/config.toml.example "$CONFIG_FILE"
-        echo "rust-proxy: wrote a default $CONFIG_FILE (admin UI on http://127.0.0.1:8080/)."
+        echo "rust-proxy: wrote a default $CONFIG_FILE (admin UI on http://<this-host-ip>:8084/)."
         echo "rust-proxy: visit it once to finish setup -- it walks you through creating an admin account."
     fi
 
