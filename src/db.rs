@@ -203,7 +203,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             id TEXT PRIMARY KEY,
             domain TEXT NOT NULL UNIQUE,
             dns_credential_id TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            organization TEXT,
+            organizational_unit TEXT
         )
         "#,
     )
@@ -464,21 +466,40 @@ pub struct StandaloneCert {
     pub domain: String,
     pub dns_credential_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    /// Whatever was actually requested in the CSR at issuance time --
+    /// stored (not re-resolved against `acme.organization`/
+    /// `organizational_unit` on every renewal) so a renewal keeps
+    /// requesting the exact same Subject the cert was originally issued
+    /// with, even if the global config default changes later.
+    pub organization: Option<String>,
+    pub organizational_unit: Option<String>,
 }
 
-pub async fn create_standalone_cert(pool: &SqlitePool, id: Uuid, domain: &str, dns_credential_id: Option<Uuid>, created_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO standalone_certs (id, domain, dns_credential_id, created_at) VALUES (?, ?, ?, ?)")
+#[allow(clippy::too_many_arguments)]
+pub async fn create_standalone_cert(
+    pool: &SqlitePool,
+    id: Uuid,
+    domain: &str,
+    dns_credential_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    organization: Option<&str>,
+    organizational_unit: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO standalone_certs (id, domain, dns_credential_id, created_at, organization, organizational_unit) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(id.to_string())
         .bind(domain)
         .bind(dns_credential_id.map(|id| id.to_string()))
         .bind(created_at.to_rfc3339())
+        .bind(organization)
+        .bind(organizational_unit)
         .execute(pool)
         .await?;
     Ok(())
 }
 
 pub async fn list_standalone_certs(pool: &SqlitePool) -> Result<Vec<StandaloneCert>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, domain, dns_credential_id, created_at FROM standalone_certs ORDER BY created_at ASC").fetch_all(pool).await?;
+    let rows =
+        sqlx::query("SELECT id, domain, dns_credential_id, created_at, organization, organizational_unit FROM standalone_certs ORDER BY created_at ASC").fetch_all(pool).await?;
     rows.into_iter()
         .map(|row| {
             Ok(StandaloneCert {
@@ -486,6 +507,8 @@ pub async fn list_standalone_certs(pool: &SqlitePool) -> Result<Vec<StandaloneCe
                 domain: row.get("domain"),
                 dns_credential_id: row.get::<Option<String>, _>("dns_credential_id").and_then(|s| Uuid::parse_str(&s).ok()),
                 created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
+                organization: row.get("organization"),
+                organizational_unit: row.get("organizational_unit"),
             })
         })
         .collect()
@@ -1177,5 +1200,27 @@ mod tests {
         let row = load_admin_identity(&pool).await.unwrap().unwrap();
         assert_eq!(row.username, "admin", "the second call must not have overwritten the first");
         assert_eq!(row.password_hash, "hash-1");
+    }
+
+    #[tokio::test]
+    async fn standalone_cert_organization_and_organizational_unit_round_trip() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_standalone_cert(&pool, id, "*.example.com", None, Utc::now(), Some("Acme Corp"), Some("Platform Engineering")).await.unwrap();
+
+        let certs = list_standalone_certs(&pool).await.unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].organization.as_deref(), Some("Acme Corp"));
+        assert_eq!(certs[0].organizational_unit.as_deref(), Some("Platform Engineering"));
+    }
+
+    #[tokio::test]
+    async fn standalone_cert_organization_and_organizational_unit_default_to_none() {
+        let pool = memory_pool().await;
+        create_standalone_cert(&pool, Uuid::new_v4(), "*.example.com", None, Utc::now(), None, None).await.unwrap();
+
+        let certs = list_standalone_certs(&pool).await.unwrap();
+        assert!(certs[0].organization.is_none());
+        assert!(certs[0].organizational_unit.is_none());
     }
 }

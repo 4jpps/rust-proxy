@@ -83,10 +83,12 @@ backend needs to see its own `host:port` instead of the public-facing
 domain this proxy answers for.
 
 Each host picks its own ACME challenge type via `acme_challenge_type`:
-`auto` (the default) uses http-01 when the host has `force_https` on
-(port 80 is already open for the redirect, so no DNS provider
-credentials are needed) and falls back to dns-01 otherwise; `http01`
-and `dns01` force one or the other explicitly. A wildcard domain
+`auto` (the default) always prefers dns-01 -- it only depends on a
+working DNS provider credential, not on this daemon's own port 80
+actually being publicly reachable for the exact domain (NAT, a
+firewall, or the domain's own DNS not routing here yet can all silently
+break http-01 in ways invisible from this end); `http01` and `dns01`
+force one or the other explicitly. A wildcard domain
 (`*.example.com`) always uses dns-01 regardless of this setting -- CAs
 never offer http-01 for a wildcard identifier. Choosing `http01`
 without `force_https` still opens a port-80 listener/firewall rule for
@@ -285,7 +287,7 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 | POST   | `/api/acls`             | `{"name","kind"}` plus `"ip_entries"` (IP allow) or `"credentials"` (Login, `[{"username","password"}]`) |
 | DELETE | `/api/acls/:id`         | -- refused (409) while any host still selects it                                          |
 | GET    | `/api/dns01-certs`      | -- (`{id, domain, dns_credential_id, created_at}` per tracked standalone cert)             |
-| POST   | `/api/dns01-certs`      | `{"domain","dns_credential_id"}` -- issues synchronously (can take up to a minute); only persists on success |
+| POST   | `/api/dns01-certs`      | `{"domain","dns_credential_id","organization","organizational_unit"}` -- issues synchronously (can take up to a minute); only persists on success; `organization`/`organizational_unit` override the config.toml default for this one cert |
 | DELETE | `/api/dns01-certs/:id`  | -- stops renewal tracking only; the already-issued cert keeps working                     |
 | GET    | `/api/acme-settings`    | -- (`{contact_email, from_config}`; `from_config: true` means config.toml wins, edits here are refused) |
 | PUT    | `/api/acme-settings`    | `{"contact_email"}` -- 409 if config.toml already supplies `acme.contact_email`            |

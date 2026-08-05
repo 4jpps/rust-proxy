@@ -78,16 +78,19 @@ pub fn resolve_challenge_type(host: &ProxyHost) -> ChallengeMethod {
     match host.acme_challenge_type {
         AcmeChallengeType::Http01 => ChallengeMethod::Http01,
         AcmeChallengeType::Dns01 => ChallengeMethod::Dns01,
-        // http-01 needs port 80 reachable on this exact domain; nothing
-        // opens it without force_https, so Auto only picks http-01 when
-        // that's already true, falling back to dns-01 otherwise.
-        AcmeChallengeType::Auto => {
-            if host.force_https {
-                ChallengeMethod::Http01
-            } else {
-                ChallengeMethod::Dns01
-            }
-        }
+        // dns-01 doesn't depend on this daemon's own port 80 actually
+        // being publicly reachable for this exact domain (NAT, a
+        // firewall, or the domain's own DNS not routing to this host
+        // yet can all silently break http-01 in ways that are opaque
+        // from here -- confirmed live: a real host's http-01
+        // authorization failed outright, fast, with nothing on this
+        // end to show why). dns-01 only depends on a working DNS
+        // provider credential, already required for any wildcard host
+        // anyway. Auto now always prefers dns-01; explicit `http01`
+        // remains available for anyone who genuinely wants it (no DNS
+        // provider credentials needed at all, at the cost of requiring
+        // port 80 to actually be reachable).
+        AcmeChallengeType::Auto => ChallengeMethod::Dns01,
     }
 }
 
@@ -176,16 +179,16 @@ pub async fn issue_certificate(state: &AppState, client: &AcmeClient, http: &req
 /// Optional Subject O/OU to request in every CSR this issuance flow
 /// generates -- see `cert::generate_csr`'s doc comment for why this is
 /// only ever a request, never a guarantee, against most public CAs.
-#[derive(Debug, Clone, Copy, Default)]
-struct CsrIdentity<'a> {
-    organization: Option<&'a str>,
-    organizational_unit: Option<&'a str>,
+#[derive(Debug, Clone, Default)]
+struct CsrIdentity {
+    organization: Option<String>,
+    organizational_unit: Option<String>,
 }
 
-fn csr_identity(state: &AppState) -> CsrIdentity<'_> {
+fn csr_identity(state: &AppState) -> CsrIdentity {
     CsrIdentity {
-        organization: state.acme().organization.as_deref(),
-        organizational_unit: state.acme().organizational_unit.as_deref(),
+        organization: state.acme().organization.clone(),
+        organizational_unit: state.acme().organizational_unit.clone(),
     }
 }
 
@@ -213,18 +216,26 @@ fn domains_for_issuance(domain: &str) -> Vec<String> {
 /// step needed. http-01 is never an option here (there's no host to
 /// open a port-80 listener for, and CAs refuse http-01 for a wildcard
 /// identifier anyway), so this always goes through dns-01.
+/// `organization`/`organizational_unit` override the global
+/// `acme.organization`/`acme.organizational_unit` config.toml defaults
+/// for this one cert -- resolved by the caller (`api::routes::create_standalone_cert`)
+/// against whatever it decides to persist for future renewals, not
+/// re-resolved here.
 pub async fn issue_standalone_dns01_certificate(
     state: &AppState,
     client: &AcmeClient,
     http: &reqwest::Client,
     domain: &str,
     dns_credential_id: Option<uuid::Uuid>,
+    organization: Option<String>,
+    organizational_unit: Option<String>,
 ) -> Result<(), IssuanceError> {
     let domains = domains_for_issuance(domain);
     let (order_url, order, authzs) = create_order_and_authzs(client, &domains).await?;
     let credential = resolve_dns_credential(state.db(), domain, dns_credential_id).await?;
     let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
-    let issued = issue_via_dns01(client, dns01.as_ref(), &domains, &authzs, &order_url, &order.finalize, csr_identity(state)).await?;
+    let identity = CsrIdentity { organization, organizational_unit };
+    let issued = issue_via_dns01(client, dns01.as_ref(), &domains, &authzs, &order_url, &order.finalize, identity).await?;
     publish_cert(state, &domains, &issued).await
 }
 
@@ -265,7 +276,7 @@ async fn issue_via_dns01(
     authzs: &[(String, Authorization)],
     order_url: &str,
     finalize_url: &str,
-    identity: CsrIdentity<'_>,
+    identity: CsrIdentity,
 ) -> Result<IssuedCert, IssuanceError> {
     // Zone lookup wants a real domain, not the wildcard label -- no DNS
     // zone is ever literally named "*.something". `domains[0]` always
@@ -329,7 +340,7 @@ async fn issue_via_http01(
     authz_url: &str,
     order_url: &str,
     finalize_url: &str,
-    identity: CsrIdentity<'_>,
+    identity: CsrIdentity,
 ) -> Result<IssuedCert, IssuanceError> {
     let challenge = authz
         .challenges
@@ -365,7 +376,7 @@ struct IssuedCert {
 /// `Location`, used for polling) are two distinct RFC 8555 endpoints --
 /// conflating them is a real interop risk even though some servers are
 /// lenient about it.
-async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order_url: &str, finalize_url: &str, domains: &[String], identity: CsrIdentity<'_>) -> Result<IssuedCert, IssuanceError> {
+async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order_url: &str, finalize_url: &str, domains: &[String], identity: CsrIdentity) -> Result<IssuedCert, IssuanceError> {
     for (_, challenge_url) in pending {
         client.notify_challenge_ready(challenge_url).await?;
     }
@@ -382,7 +393,7 @@ async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order
         }
     }
 
-    let csr = cert::generate_csr(domains, identity.organization, identity.organizational_unit)?;
+    let csr = cert::generate_csr(domains, identity.organization.as_deref(), identity.organizational_unit.as_deref())?;
     let order = client.finalize(finalize_url, &csr.der).await?;
     let order = poll_until(
         || client.poll_order(order_url),
@@ -562,7 +573,17 @@ async fn renew_standalone_certs_if_needed(state: &AppState, client: &AcmeClient,
             continue;
         }
         tracing::info!(domain = %standalone.domain, "issuing/renewing standalone certificate");
-        if let Err(err) = issue_standalone_dns01_certificate(state, client, http, &standalone.domain, standalone.dns_credential_id).await {
+        if let Err(err) = issue_standalone_dns01_certificate(
+            state,
+            client,
+            http,
+            &standalone.domain,
+            standalone.dns_credential_id,
+            standalone.organization.clone(),
+            standalone.organizational_unit.clone(),
+        )
+        .await
+        {
             tracing::error!(domain = %standalone.domain, error = %err, "standalone certificate issuance/renewal failed");
         }
     }
@@ -624,13 +645,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_resolves_to_http01_when_force_https_is_set() {
+    fn auto_resolves_to_dns01_regardless_of_force_https() {
+        // dns-01 doesn't depend on this daemon's own port 80 being
+        // publicly reachable for the exact domain, unlike http-01 --
+        // Auto prefers it unconditionally now, force_https no longer
+        // factors in at all. Explicit `http01` still opts in to the
+        // old behavior for anyone who wants it.
         let h = host("example.com", true, AcmeChallengeType::Auto);
-        assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Http01);
-    }
-
-    #[test]
-    fn auto_resolves_to_dns01_without_force_https() {
+        assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Dns01);
         let h = host("example.com", false, AcmeChallengeType::Auto);
         assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Dns01);
     }

@@ -964,6 +964,8 @@ struct StandaloneCertSummary {
     domain: String,
     dns_credential_id: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
+    organization: Option<String>,
+    organizational_unit: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -971,6 +973,15 @@ struct CreateStandaloneCertRequest {
     domain: String,
     #[serde(default)]
     dns_credential_id: Option<Uuid>,
+    /// Override `acme.organization`/`acme.organizational_unit` for this
+    /// one cert -- falls back to the global config.toml default when
+    /// omitted. Whatever's actually used is persisted (not just the
+    /// override) so a later automatic renewal requests the exact same
+    /// Subject, even if the global default changes afterward.
+    #[serde(default)]
+    organization: Option<String>,
+    #[serde(default)]
+    organizational_unit: Option<String>,
 }
 
 async fn list_standalone_certs(State(state): State<AppState>) -> Result<Json<Vec<StandaloneCertSummary>>, ApiError> {
@@ -978,7 +989,14 @@ async fn list_standalone_certs(State(state): State<AppState>) -> Result<Json<Vec
     Ok(Json(
         certs
             .into_iter()
-            .map(|c| StandaloneCertSummary { id: c.id, domain: c.domain, dns_credential_id: c.dns_credential_id, created_at: c.created_at })
+            .map(|c| StandaloneCertSummary {
+                id: c.id,
+                domain: c.domain,
+                dns_credential_id: c.dns_credential_id,
+                created_at: c.created_at,
+                organization: c.organization,
+                organizational_unit: c.organizational_unit,
+            })
             .collect(),
     ))
 }
@@ -1007,16 +1025,31 @@ async fn create_standalone_cert(State(state): State<AppState>, Json(body): Json<
         }
     }
 
+    // Explicit per-cert override wins; otherwise fall back to the
+    // global config.toml default -- same "explicit wins, else a
+    // configured default" shape used throughout this API. Whatever's
+    // resolved here is what actually gets requested AND persisted, so a
+    // later automatic renewal repeats the same Subject.
+    let organization = body.organization.or_else(|| state.acme().organization.clone());
+    let organizational_unit = body.organizational_unit.or_else(|| state.acme().organizational_unit.clone());
+
     let http = reqwest::Client::new();
     let client = crate::acme::init_acme_client(&state).await.map_err(|e| ApiError::Internal(e.to_string()))?;
-    crate::acme::issue_standalone_dns01_certificate(&state, &client, &http, domain, body.dns_credential_id)
+    crate::acme::issue_standalone_dns01_certificate(&state, &client, &http, domain, body.dns_credential_id, organization.clone(), organizational_unit.clone())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let id = Uuid::new_v4();
     let created_at = chrono::Utc::now();
-    crate::db::create_standalone_cert(state.db(), id, domain, body.dns_credential_id, created_at).await?;
-    Ok(Json(StandaloneCertSummary { id, domain: domain.to_string(), dns_credential_id: body.dns_credential_id, created_at }))
+    crate::db::create_standalone_cert(state.db(), id, domain, body.dns_credential_id, created_at, organization.as_deref(), organizational_unit.as_deref()).await?;
+    Ok(Json(StandaloneCertSummary {
+        id,
+        domain: domain.to_string(),
+        dns_credential_id: body.dns_credential_id,
+        created_at,
+        organization,
+        organizational_unit,
+    }))
 }
 
 /// Only removes the tracking row (so `run_renewal_loop` stops trying to
@@ -1038,6 +1071,14 @@ async fn delete_standalone_cert(State(state): State<AppState>, Path(id): Path<Uu
 /// rule this mirrors, surfaced here as an immediate 400 instead of a
 /// renewal-time failure discovered hours later.
 async fn validate_dns_credential_choice(state: &AppState, host: &ProxyHost) -> Result<(), ApiError> {
+    // A host with ACME disabled never attempts issuance at all, so it
+    // has no use for a DNS credential regardless of what
+    // acme_challenge_type/resolve_challenge_type would otherwise
+    // resolve to -- checked first, before ever asking what challenge
+    // method would apply, since that question is moot here.
+    if !host.acme_enabled {
+        return Ok(());
+    }
     if crate::acme::resolve_challenge_type(host) != crate::acme::ChallengeMethod::Dns01 {
         return Ok(());
     }
@@ -1474,7 +1515,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
-                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000"}"#,
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}"#,
                     ))
                     .unwrap(),
             )
@@ -1541,6 +1582,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A host with ACME disabled never attempts issuance at all, so it
+    /// must never be forced to have a DNS credential configured just
+    /// because acme_challenge_type's default ("auto") would otherwise
+    /// resolve to dns-01 for it -- that question doesn't even apply
+    /// when ACME itself is off. test_state()'s DB never has a DNS
+    /// credential row (its acme.dns_api_token config field is only
+    /// ever seeded into the DB by bootstrap::build_app_state, which
+    /// this test fixture bypasses), so this genuinely exercises the
+    /// "no credential exists" case.
+    #[tokio::test]
+    async fn create_host_with_acme_disabled_and_no_dns_credential_configured_still_succeeds() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/hosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(
+                        r#"{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1881,7 +1953,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
-                        r#"{"domain":"old.example.com","bind_ip":"10.0.0.2","bind_port":443,
+                        r#"{"domain":"old.example.com","bind_ip":"10.0.0.2","bind_port":443,"acme_enabled":false,
                         "redirect":{"target":"https://new.example.com","preserve_path":true,"status":"permanent"}}"#,
                     ))
                     .unwrap(),
@@ -2012,7 +2084,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(
-                        r#"{"domain":"custom.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":true}"#,
+                        r#"{"domain":"custom.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":true,"acme_challenge_type":"http01"}"#,
                     ))
                     .unwrap(),
             )
@@ -2111,7 +2183,7 @@ mod tests {
             let router = router.clone();
             let cookie = cookie.clone();
             handles.push(tokio::spawn(async move {
-                let body = format!(r#"{{"domain":"host{i}.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000"}}"#);
+                let body = format!(r#"{{"domain":"host{i}.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false}}"#);
                 router
                     .oneshot(
                         Request::builder()
@@ -2553,7 +2625,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
                     .body(axum::body::Body::from(format!(
-                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acl_ids":["{acl_id}"]}}"#
+                        r#"{{"domain":"example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,"acl_ids":["{acl_id}"]}}"#
                     )))
                     .unwrap(),
             )
@@ -2608,7 +2680,7 @@ mod tests {
     #[tokio::test]
     async fn create_standalone_cert_with_a_domain_already_tracked_is_rejected() {
         let state = test_state().await;
-        crate::db::create_standalone_cert(state.db(), Uuid::new_v4(), "*.example.com", None, chrono::Utc::now()).await.unwrap();
+        crate::db::create_standalone_cert(state.db(), Uuid::new_v4(), "*.example.com", None, chrono::Utc::now(), None, None).await.unwrap();
         let router = build_router(state);
         let cookie = logged_in_cookie(&router).await;
 
@@ -2692,7 +2764,7 @@ mod tests {
     async fn list_and_delete_standalone_certs_round_trip() {
         let state = test_state().await;
         let id = Uuid::new_v4();
-        crate::db::create_standalone_cert(state.db(), id, "*.example.com", None, chrono::Utc::now()).await.unwrap();
+        crate::db::create_standalone_cert(state.db(), id, "*.example.com", None, chrono::Utc::now(), None, None).await.unwrap();
         let router = build_router(state);
         let cookie = logged_in_cookie(&router).await;
 

@@ -264,7 +264,12 @@
             <option value="">auto (only if exactly one exists)</option>
           </select>
         </label>
+        <label><span>Organization (optional)</span><input type="text" name="organization" placeholder="leave blank to use the config.toml default"></label>
+        <label><span>Organizational Unit (optional)</span><input type="text" name="organizational_unit" placeholder="leave blank to use the config.toml default"></label>
       </div>
+      <p class="hint">Organization/Organizational Unit are requested in the certificate's Subject
+        -- only ever a <em>request</em>, not a guarantee: Let's Encrypt and virtually every public
+        CA silently discard these for Domain Validated certs.</p>
       <div class="form-actions">
         <button type="submit" id="standalone-cert-submit">Issue certificate</button>
         <span class="error" id="standalone-cert-error"></span>
@@ -827,7 +832,14 @@ document.getElementById('standalone-cert-form').addEventListener('submit', async
   e.preventDefault();
   const fd = new FormData(e.target);
   const dnsCredentialId = fd.get('dns_credential_id');
-  const body = { domain: fd.get('domain'), dns_credential_id: dnsCredentialId ? dnsCredentialId : null };
+  const organization = fd.get('organization');
+  const organizationalUnit = fd.get('organizational_unit');
+  const body = {
+    domain: fd.get('domain'),
+    dns_credential_id: dnsCredentialId ? dnsCredentialId : null,
+    organization: organization ? organization : null,
+    organizational_unit: organizationalUnit ? organizationalUnit : null,
+  };
   const submitBtn = document.getElementById('standalone-cert-submit');
   const errorEl = document.getElementById('standalone-cert-error');
   submitBtn.disabled = true;

@@ -78,6 +78,30 @@ pub async fn forward_http(
     if !opts.preserve_host {
         let value = hyper::header::HeaderValue::from_str(opts.upstream_host_port)?;
         req.headers_mut().insert(hyper::header::HOST, value);
+    } else if req.headers().get(hyper::header::HOST).is_none() {
+        // A genuine HTTP/2 request (every modern browser) carries its
+        // target host as the `:authority` pseudo-header, not a literal
+        // `Host:` header -- hyper/h2 surfaces that via `req.uri()`, so
+        // `req.headers()` can be legitimately empty of it even though
+        // the request unambiguously declares one. That's fine for the
+        // client-facing side, but this connection to the upstream is
+        // always plain HTTP/1.1 (`hyper::client::conn::http1` below),
+        // which requires a literal `Host` header on the wire -- confirmed
+        // as a real bug via a real upstream that correctly rejected the
+        // resulting Host-less request with its own 400. `preserve_host`
+        // still means "forward what the client actually declared, don't
+        // rewrite it to the upstream's own address" -- this only ever
+        // synthesizes the header from the request's own declared
+        // authority, never substitutes anything else.
+        if let Some(host) = req.uri().host() {
+            let value = match req.uri().port_u16() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            };
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
+                req.headers_mut().insert(hyper::header::HOST, value);
+            }
+        }
     }
 
     let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
@@ -462,6 +486,75 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-seen-host").unwrap(), "backend.internal:9999", "the upstream must see its own host:port, not the client's original Host header");
+    }
+
+    /// Real production bug this guards against: a genuine HTTP/2 request
+    /// (every modern browser) carries its target host as the
+    /// `:authority` pseudo-header, never a literal `Host:` header --
+    /// confirmed live via a real upstream that correctly rejected the
+    /// resulting Host-less forwarded request with its own 400 "missing
+    /// required Host header". `preserve_host: true` must still result in
+    /// *some* `Host` header reaching the upstream (this connection is
+    /// always plain HTTP/1.1, which requires one on the wire), synthesized
+    /// from the request's own declared authority -- not the client's
+    /// literal header, since here there isn't one.
+    #[tokio::test]
+    async fn forward_http_synthesizes_a_host_header_from_an_h2_requests_authority_when_preserve_host_is_enabled() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(|req: Request<Incoming>| async move {
+                let seen_host = req.headers().get(hyper::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-seen-host", seen_host).body(body).unwrap())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        // The "proxy" hop here speaks h2 cleartext (prior-knowledge,
+        // no TLS/ALPN needed for a direct back-to-back test) so the
+        // incoming `Request<Incoming>` forward_http receives is a real
+        // h2 request with no literal Host header, exactly like a real
+        // browser's request would be.
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: false,
+                    tls_verify: true,
+                    upstream_host_port: "unused:0",
+                    preserve_host: true,
+                };
+                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+            });
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .unwrap();
+        });
+
+        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(tcp);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io).await.unwrap();
+        tokio::spawn(conn);
+
+        // Absolute-form URI, no Host header at all -- hyper's h2 client
+        // derives the :authority pseudo-header from the URI itself.
+        let req = Request::builder().uri("https://real.example.com/").body(Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("x-seen-host").unwrap(),
+            "real.example.com",
+            "the upstream must still receive a Host header, synthesized from the h2 request's own :authority"
+        );
     }
 
     fn self_signed_server_config(domain: &str) -> rustls::ServerConfig {

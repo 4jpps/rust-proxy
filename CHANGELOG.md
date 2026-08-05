@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+- **Fixed a real production bug: a genuine HTTP/2 request forwarded to
+  the upstream with no `Host` header at all.** Real HTTP/2 clients
+  (every modern browser) declare their target host via the `:authority`
+  pseudo-header, never a literal `Host:` header -- confirmed live via a
+  real upstream that correctly rejected the resulting Host-less
+  forwarded request with its own 400 "missing required Host header".
+  The connection to the upstream is always plain HTTP/1.1, which
+  requires a literal `Host` header on the wire; `preserve_host: true`
+  (the default) now synthesizes one from the request's own declared
+  authority when no literal header exists, instead of forwarding
+  nothing. `preserve_host: false` (rewrite to the upstream's own
+  host:port) is unaffected. New test drives a real h2 connection with
+  no Host header through a real upstream and confirms it receives one.
+  See `proxy::http::forward_http`.
+- **`acme_challenge_type: auto` now prefers dns-01 over http-01.**
+  http-01 depends on this daemon's own port 80 actually being publicly
+  reachable for the exact domain being issued -- NAT, a firewall, or
+  the domain's own DNS not routing here yet can all silently break it
+  in ways invisible from this end. Confirmed live: a real host's
+  http-01 authorization failed outright, fast, with nothing on this
+  side to explain why. dns-01 only depends on a working DNS provider
+  credential, already required for any wildcard host anyway. `auto`
+  previously picked http-01 whenever `force_https` was already on;
+  it's dns-01 unconditionally now. Explicit `http01` remains available
+  for anyone who genuinely wants the old behavior. Also fixed a related
+  gap this exposed: a host with ACME disabled was still being forced to
+  have a DNS credential configured, since the validation only checked
+  what challenge type `auto` would resolve to, not whether ACME was
+  even enabled -- previously masked because `auto` often resolved to
+  http-01, which needs no credential.
+- **Per-standalone-cert Organization/Organizational Unit**, overriding
+  the global `acme.organization`/`acme.organizational_unit` config.toml
+  default for one specific standalone DNS-01 cert (new optional fields
+  on `POST /api/dns01-certs` and the Certificates tab's issuance form).
+  Whatever's actually used is persisted (not just the override) so a
+  later automatic renewal requests the exact same Subject even if the
+  global default changes afterward.
 - **Fixed a real production routing bug: a request's own `Host` header
   now always wins over the TLS connection's SNI when they disagree.**
   `sni` is captured once per TLS connection at handshake time, but a
