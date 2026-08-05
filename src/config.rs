@@ -85,7 +85,16 @@ pub struct AdminConfig {
     /// `nftables::generator::write_admin_rule`.
     #[serde(default)]
     pub allowed_ips: Vec<IpNet>,
-    /// `true` (the default) mirrors today's behavior: `nftables::generator`
+    /// `None` (the default -- not set in config.toml) defers to the
+    /// DB-backed value the admin UI's settings section can set/change at
+    /// runtime (`state::AppState::expose_admin_port`/
+    /// `set_expose_admin_port`, same "config.toml wins if set, else a
+    /// DB-backed fallback" precedence `acme.contact_email` already
+    /// uses) -- itself defaulting to `true` if nothing has set it yet.
+    /// `Some(true)`/`Some(false)` here always wins over the DB, same as
+    /// every other config.toml-vs-DB precedence in this project.
+    ///
+    /// `true` mirrors the original, only-ever behavior: `nftables::generator`
     /// emits an accept rule for the admin port (open to any source, or
     /// scoped to `allowed_ips` if set). `false` emits no accept rule for
     /// it at all -- default-DROP then keeps the admin port unreachable
@@ -97,8 +106,8 @@ pub struct AdminConfig {
     /// binds per `bind_ip_v4`/`bind_ip_v6` either way; a `false` here
     /// with a non-loopback bind_ip relies entirely on the firewall (not
     /// the listener) to keep it unreachable.
-    #[serde(default = "default_true")]
-    pub expose_admin_port: bool,
+    #[serde(default)]
+    pub expose_admin_port: Option<bool>,
     /// HMAC key signing admin session tokens. `None` means "not set in
     /// config.toml" -- the resolved admin identity then falls back to
     /// whatever's in the `admin_identity` sqlite table (populated by the
@@ -448,6 +457,16 @@ pub struct PortRule {
     /// locally on that port (e.g. sshd).
     #[serde(default)]
     pub passthrough_target: Option<String>,
+    /// `IpAllow`-kind ACLs this rule's firewall entry is restricted to --
+    /// same union-of-selected-lists semantics as `ProxyHost.acl_ids`, but
+    /// enforced entirely at the firewall layer (`nftables::generator`),
+    /// not the application: a raw TCP/UDP passthrough rule has no HTTP
+    /// layer to show a login page on, so only `AclKind::IpAllow` lists
+    /// are meaningful here -- a `Login`-kind list selected on a port
+    /// rule is simply ignored (see `nftables::sync_once`). Empty (the
+    /// default) means unrestricted, same as `ProxyHost.acl_ids`.
+    #[serde(default)]
+    pub acl_ids: Vec<Uuid>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -1015,6 +1034,7 @@ dns_api_token = "token-placeholder"
             protocol: Protocol::Tcp,
             description: "rustdesk".into(),
             passthrough_target: None,
+            acl_ids: vec![],
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1032,6 +1052,7 @@ dns_api_token = "token-placeholder"
             protocol: Protocol::Udp,
             description: "bogus".into(),
             passthrough_target: None,
+            acl_ids: vec![],
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1049,6 +1070,7 @@ dns_api_token = "token-placeholder"
             protocol: Protocol::Tcp,
             description: "rustdesk tcp".into(),
             passthrough_target: None,
+            acl_ids: vec![],
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -1060,6 +1082,7 @@ dns_api_token = "token-placeholder"
             protocol: Protocol::Udp,
             description: "rustdesk udp".into(),
             passthrough_target: None,
+            acl_ids: vec![],
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -1153,6 +1176,7 @@ dns_api_token = "token-placeholder"
             protocol: Protocol::Tcp,
             description: "conflicting raw passthrough".into(),
             passthrough_target: Some("127.0.0.1:1".into()),
+            acl_ids: vec![],
             enabled: true,
         });
         assert!(cfg.validate().is_err());

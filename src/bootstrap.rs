@@ -78,8 +78,9 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
     seed_default_dns_credential_if_configured(&db_pool, &cfg).await?;
     let admin_identity = load_persisted_admin_identity(&db_pool).await?;
     let acme_contact_email = crate::db::load_acme_contact_email(&db_pool).await?;
+    let expose_admin_port = crate::db::load_expose_admin_port(&db_pool).await?;
 
-    let state = AppState::new(cfg, db_pool, hosts, port_rules, admin_identity, acme_contact_email);
+    let state = AppState::new(cfg, db_pool, hosts, port_rules, admin_identity, acme_contact_email, expose_admin_port);
     crate::acme::load_certs_from_disk(&state)?;
     Ok(state)
 }
@@ -98,7 +99,7 @@ mod tests {
                 bind_ip_v6: None,
                 bind_port: 8084,
                 allowed_ips: vec![],
-                expose_admin_port: true,
+                expose_admin_port: None,
                 session_secret: None,
                 admin_username: None,
                 admin_password_hash: None,

@@ -45,6 +45,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/dns01-certs", get(list_standalone_certs).post(create_standalone_cert))
         .route("/api/dns01-certs/:id", axum::routing::delete(delete_standalone_cert))
         .route("/api/acme-settings", get(get_acme_settings).put(update_acme_settings))
+        .route("/api/firewall-settings", get(get_firewall_settings).put(update_firewall_settings))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
@@ -335,6 +336,40 @@ async fn update_acme_settings(State(state): State<AppState>, Json(body): Json<Up
     state.set_acme_contact_email(email.to_string());
     Ok(Json(AcmeSettingsResponse {
         contact_email: Some(email.to_string()),
+        from_config: false,
+    }))
+}
+
+#[derive(Serialize)]
+struct FirewallSettingsResponse {
+    expose_admin_port: bool,
+    /// Same "read-only in the UI, edit config.toml instead" reasoning as
+    /// `AcmeSettingsResponse::from_config`.
+    from_config: bool,
+}
+
+async fn get_firewall_settings(State(state): State<AppState>) -> Json<FirewallSettingsResponse> {
+    Json(FirewallSettingsResponse {
+        expose_admin_port: state.expose_admin_port(),
+        from_config: state.admin().expose_admin_port.is_some(),
+    })
+}
+
+#[derive(Deserialize)]
+struct UpdateFirewallSettingsRequest {
+    expose_admin_port: bool,
+}
+
+/// Rejected outright when config.toml already supplies
+/// `admin.expose_admin_port` -- same reasoning as `update_acme_settings`.
+async fn update_firewall_settings(State(state): State<AppState>, Json(body): Json<UpdateFirewallSettingsRequest>) -> Result<Json<FirewallSettingsResponse>, ApiError> {
+    if state.admin().expose_admin_port.is_some() {
+        return Err(ApiError::Conflict("admin.expose_admin_port is set in config.toml, which always takes precedence -- edit it there instead".into()));
+    }
+    crate::db::set_expose_admin_port(state.db(), body.expose_admin_port).await?;
+    state.set_expose_admin_port(body.expose_admin_port);
+    Ok(Json(FirewallSettingsResponse {
+        expose_admin_port: body.expose_admin_port,
         from_config: false,
     }))
 }
@@ -837,6 +872,12 @@ struct PortRuleRequest {
     description: String,
     #[serde(default)]
     passthrough_target: Option<String>,
+    /// Only `AclKind::IpAllow` lists make sense to select here -- see
+    /// `config::PortRule::acl_ids`'s doc comment for why a `Login`-kind
+    /// list is accepted (still validated to *exist*, same as any other
+    /// acl_ids field) but silently contributes nothing.
+    #[serde(default)]
+    acl_ids: Vec<Uuid>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -855,6 +896,7 @@ fn validate_port_rule_request(state: &AppState, req: &PortRuleRequest) -> Result
 
 async fn create_port_rule(State(state): State<AppState>, Json(body): Json<PortRuleRequest>) -> Result<Json<PortRule>, ApiError> {
     validate_port_rule_request(&state, &body)?;
+    validate_acl_ids(&state, &body.acl_ids).await?;
     let rule = PortRule {
         id: Uuid::new_v4(),
         bind_ip_v4: body.bind_ip_v4,
@@ -864,6 +906,7 @@ async fn create_port_rule(State(state): State<AppState>, Json(body): Json<PortRu
         protocol: body.protocol,
         description: body.description,
         passthrough_target: body.passthrough_target,
+        acl_ids: body.acl_ids,
         enabled: body.enabled,
     };
     let to_insert = rule.clone();
@@ -881,6 +924,7 @@ async fn update_port_rule(
     Json(body): Json<PortRuleRequest>,
 ) -> Result<Json<PortRule>, ApiError> {
     validate_port_rule_request(&state, &body)?;
+    validate_acl_ids(&state, &body.acl_ids).await?;
     let updated = PortRule {
         id,
         bind_ip_v4: body.bind_ip_v4,
@@ -890,6 +934,7 @@ async fn update_port_rule(
         protocol: body.protocol,
         description: body.description,
         passthrough_target: body.passthrough_target,
+        acl_ids: body.acl_ids,
         enabled: body.enabled,
     };
     let to_store = updated.clone();
@@ -1306,7 +1351,7 @@ mod tests {
                 bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
-                expose_admin_port: true,
+                expose_admin_port: None,
                 session_secret: Some("test-secret-key".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
@@ -1327,7 +1372,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None, None)
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
     async fn unconfigured_test_state() -> AppState {
@@ -1340,7 +1385,7 @@ mod tests {
                 bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
-                expose_admin_port: true,
+                expose_admin_port: None,
                 session_secret: None,
                 admin_username: None,
                 admin_password_hash: None,
@@ -1362,7 +1407,7 @@ mod tests {
         };
         cfg.validate().expect("valid: all three identity fields omitted together");
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None, None)
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
     // test_state() sets a non-empty acme.contact_email, which would
@@ -1378,7 +1423,7 @@ mod tests {
                 bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
-                expose_admin_port: true,
+                expose_admin_port: None,
                 session_secret: Some("test-secret-key".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
@@ -1399,7 +1444,41 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None, None)
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
+    }
+
+    async fn test_state_with_configured_expose_admin_port() -> AppState {
+        let cfg = Config {
+            network: NetworkConfig {
+                bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
+            },
+            admin: AdminConfig {
+                bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
+                bind_port: 8080,
+                allowed_ips: vec![],
+                expose_admin_port: Some(true),
+                session_secret: Some("test-secret-key".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
+                db_path: PathBuf::from(":memory:"),
+            },
+            acme: AcmeConfig {
+                directory_url: "https://example.invalid/directory".into(),
+                contact_email: "admin@example.com".into(),
+                dns_provider: crate::config::DnsProviderKind::Cloudflare,
+                dns_api_token: "token".into(),
+                cert_dir: PathBuf::from("/tmp/certs"),
+                account_key_path: PathBuf::from("/tmp/account.key"),
+                renew_before_days: 30,
+                organization: None,
+                organizational_unit: None,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+        };
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -3371,6 +3450,73 @@ mod tests {
         let router = build_router(test_state().await);
 
         let resp = router.oneshot(Request::builder().uri("/api/acme-settings").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_firewall_settings_defaults_to_exposed_and_not_from_config() {
+        let router = build_router(test_state().await); // admin.expose_admin_port is None
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(Request::builder().uri("/api/firewall-settings").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json = body_json(resp).await;
+        assert_eq!(json["expose_admin_port"], true);
+        assert_eq!(json["from_config"], false);
+    }
+
+    #[tokio::test]
+    async fn update_firewall_settings_persists_and_takes_effect_immediately() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/firewall-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"expose_admin_port":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!state.expose_admin_port(), "must take effect immediately, no restart needed");
+
+        let reloaded = crate::db::load_expose_admin_port(state.db()).await.unwrap();
+        assert_eq!(reloaded, Some(false), "must actually persist to the DB, not just the in-memory ArcSwap");
+    }
+
+    #[tokio::test]
+    async fn update_firewall_settings_is_refused_when_config_toml_already_supplies_it() {
+        let router = build_router(test_state_with_configured_expose_admin_port().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/firewall-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"expose_admin_port":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn firewall_settings_endpoints_require_authentication() {
+        let router = build_router(test_state().await);
+
+        let resp = router.oneshot(Request::builder().uri("/api/firewall-settings").body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 

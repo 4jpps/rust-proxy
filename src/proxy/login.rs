@@ -116,7 +116,7 @@ fn hmac_sign(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn html_escape(s: &str) -> String {
+pub(super) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -221,6 +221,34 @@ pub fn render_login_page(domain: &str, return_to: &str, error: Option<&str>) -> 
     )
 }
 
+/// Shown for a host that has an IP-allow ACL and no login ACL to fall
+/// back to (see `proxy::mod::handle_https_request`'s "IP over login"
+/// combination) when the visitor's source IP doesn't match -- a real
+/// page explaining why, not a bare, unstyled 403 with no body.
+pub fn render_forbidden_page(domain: &str) -> String {
+    let domain_html = html_escape(domain);
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access denied -- {domain_html}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: system-ui, sans-serif; max-width: 320px; margin: 4rem auto; padding: 0 1rem; }}
+  h1 {{ font-size: 1.1rem; }}
+  p {{ opacity: 0.8; }}
+</style>
+</head>
+<body>
+  <h1>Access denied</h1>
+  <p>Your network is not allowed to reach {domain_html}.</p>
+</body>
+</html>"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +341,14 @@ mod tests {
         assert!(!html.contains("<script>evil</script>"));
         assert!(!html.contains("<img onerror"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn render_forbidden_page_mentions_the_domain_and_escapes_html_in_it() {
+        let html = render_forbidden_page("<script>evil</script>");
+        assert!(!html.contains("<script>evil</script>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("Access denied"));
     }
 
     #[test]

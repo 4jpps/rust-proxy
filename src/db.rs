@@ -159,7 +159,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             passthrough_target TEXT,
             enabled INTEGER NOT NULL,
             bind_ip_v4 TEXT,
-            bind_ip_v6 TEXT
+            bind_ip_v6 TEXT,
+            acl_ids TEXT NOT NULL DEFAULT ''
         )
         "#,
     )
@@ -168,6 +169,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
     let _ = sqlx::query("UPDATE port_rules SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
+    // Comma-joined ACL UUIDs -- same convention as hosts.acl_ids above.
+    // Only AclKind::IpAllow lists are meaningful here (see PortRule::acl_ids'
+    // own doc comment); a Login-kind list stored in here is simply
+    // ignored at read time (nftables::sync_once), not rejected -- there's
+    // no application layer on a raw port rule to reject it against.
+    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''").execute(pool).await;
 
     // Only `token_hash` is ever persisted -- the plaintext token is shown
     // to the caller exactly once, at creation, and never stored anywhere.
@@ -248,6 +255,22 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         CREATE TABLE IF NOT EXISTS acme_settings (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             contact_email TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Same single-row/settable-at-runtime pattern as acme_settings above,
+    // for `AdminConfig.expose_admin_port` -- only ever consulted by
+    // `state::AppState::expose_admin_port` when config.toml's own field
+    // is unset (`None`). No row yet means "nothing has overridden the
+    // built-in default of true" -- see `load_expose_admin_port`.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS firewall_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            expose_admin_port INTEGER NOT NULL
         )
         "#,
     )
@@ -765,11 +788,22 @@ pub async fn delete_acl_list(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::
 /// time -- the union of every selected `IpAllow` list's CIDRs, and the
 /// union of every selected `Login` list's credentials. Both empty means
 /// no restriction of that kind at all (matches the pre-ACL-system
-/// default of "empty access_allow_ips/no access_login").
+/// default of "empty access_allow_ips/no access_login"). `has_ip_allow_acl`/
+/// `has_login_acl` track whether a list of that *kind* was selected at
+/// all, independent of whether it currently has any entries -- needed
+/// because `proxy::mod::handle_https_request`'s IP-over-login combination
+/// (an IP-allow ACL that matches admits the request outright, one that
+/// doesn't match falls through to the login gate instead of a bare 403,
+/// same as it always has when only one kind of ACL is configured) has to
+/// tell "no IP-allow ACL was ever selected" apart from "one was selected
+/// but happens to have zero entries right now" -- `allow_ips.is_empty()`
+/// alone can't distinguish those two cases.
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedAcls {
     pub allow_ips: Vec<ipnet::IpNet>,
     pub credentials: Vec<HostAuth>,
+    pub has_ip_allow_acl: bool,
+    pub has_login_acl: bool,
 }
 
 pub async fn resolve_acl_ids(pool: &SqlitePool, acl_ids: &[Uuid]) -> Result<ResolvedAcls, sqlx::Error> {
@@ -785,10 +819,12 @@ pub async fn resolve_acl_ids(pool: &SqlitePool, acl_ids: &[Uuid]) -> Result<Reso
         };
         match acl_kind_from_str(&list_row.get::<String, _>("kind")) {
             AclKind::IpAllow => {
+                resolved.has_ip_allow_acl = true;
                 let rows = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?").bind(acl_id.to_string()).fetch_all(pool).await?;
                 resolved.allow_ips.extend(rows.into_iter().filter_map(|r| r.get::<String, _>("cidr").parse::<ipnet::IpNet>().ok()));
             }
             AclKind::Login => {
+                resolved.has_login_acl = true;
                 let rows = sqlx::query("SELECT username, password_hash FROM acl_credentials WHERE acl_list_id = ?")
                     .bind(acl_id.to_string())
                     .fetch_all(pool)
@@ -854,6 +890,22 @@ pub async fn load_acme_contact_email(pool: &SqlitePool) -> Result<Option<String>
 pub async fn set_acme_contact_email(pool: &SqlitePool, email: &str) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO acme_settings (id, contact_email) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET contact_email = excluded.contact_email")
         .bind(email)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `None` means nothing has ever overridden the built-in default (see
+/// `state::AppState::expose_admin_port`, which treats `None` here as `true`).
+pub async fn load_expose_admin_port(pool: &SqlitePool) -> Result<Option<bool>, sqlx::Error> {
+    let row = sqlx::query("SELECT expose_admin_port FROM firewall_settings WHERE id = 1").fetch_optional(pool).await?;
+    Ok(row.map(|r| r.get::<i64, _>("expose_admin_port") != 0))
+}
+
+/// Same upsert-a-single-row pattern as `set_acme_contact_email`.
+pub async fn set_expose_admin_port(pool: &SqlitePool, value: bool) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO firewall_settings (id, expose_admin_port) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET expose_admin_port = excluded.expose_admin_port")
+        .bind(value as i64)
         .execute(pool)
         .await?;
     Ok(())
@@ -1021,7 +1073,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
 }
 
 pub async fn load_port_rules(pool: &SqlitePool) -> Result<Vec<PortRule>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, enabled FROM port_rules")
+    let rows = sqlx::query("SELECT id, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, acl_ids, enabled FROM port_rules")
         .fetch_all(pool)
         .await?;
     rows.into_iter()
@@ -1030,6 +1082,12 @@ pub async fn load_port_rules(pool: &SqlitePool) -> Result<Vec<PortRule>, sqlx::E
                 "udp" => Protocol::Udp,
                 _ => Protocol::Tcp,
             };
+            let acl_ids = row
+                .get::<String, _>("acl_ids")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+                .collect();
             Ok(PortRule {
                 id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 bind_ip_v4: row.get::<Option<String>, _>("bind_ip_v4").and_then(|s| s.parse().ok()),
@@ -1039,6 +1097,7 @@ pub async fn load_port_rules(pool: &SqlitePool) -> Result<Vec<PortRule>, sqlx::E
                 protocol,
                 description: row.get("description"),
                 passthrough_target: row.get("passthrough_target"),
+                acl_ids,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1053,8 +1112,9 @@ pub async fn save_port_rules(pool: &SqlitePool, rules: &[PortRule]) -> Result<()
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp",
         };
+        let acl_ids = r.acl_ids.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>().join(",");
         sqlx::query(
-            "INSERT INTO port_rules (id, bind_ip, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO port_rules (id, bind_ip, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, acl_ids, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(r.id.to_string())
         .bind(r.bind_ip_v4.map(|ip| ip.to_string()).or_else(|| r.bind_ip_v6.map(|ip| ip.to_string())).unwrap_or_else(|| "0.0.0.0".to_string()))
@@ -1065,6 +1125,7 @@ pub async fn save_port_rules(pool: &SqlitePool, rules: &[PortRule]) -> Result<()
         .bind(protocol)
         .bind(&r.description)
         .bind(&r.passthrough_target)
+        .bind(acl_ids)
         .bind(r.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -1114,6 +1175,7 @@ mod tests {
             protocol: Protocol::Tcp,
             description: "rustdesk".into(),
             passthrough_target: Some("127.0.0.1:21115".into()),
+            acl_ids: vec![],
             enabled: true,
         }
     }
@@ -1547,5 +1609,17 @@ mod tests {
     async fn get_acl_list_returns_none_for_an_unknown_id() {
         let pool = memory_pool().await;
         assert!(get_acl_list(&pool, Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn expose_admin_port_defaults_to_none_and_round_trips_once_set() {
+        let pool = memory_pool().await;
+        assert_eq!(load_expose_admin_port(&pool).await.unwrap(), None);
+
+        set_expose_admin_port(&pool, false).await.unwrap();
+        assert_eq!(load_expose_admin_port(&pool).await.unwrap(), Some(false));
+
+        set_expose_admin_port(&pool, true).await.unwrap();
+        assert_eq!(load_expose_admin_port(&pool).await.unwrap(), Some(true), "a second call must update the existing row, not fail on the unique id");
     }
 }

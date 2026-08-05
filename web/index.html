@@ -205,9 +205,20 @@
   </section>
 
   <section class="tab-panel" id="tab-rules">
+    <h2>Admin port</h2>
+    <p class="hint">Whether the admin UI/API's own port gets a firewall accept rule at all. Off means
+      it's never reachable over the network -- only via loopback (e.g. an SSH tunnel) -- regardless of
+      any allowed_ips restriction.</p>
+    <form id="firewall-settings-form" class="inline">
+      <label class="chk"><input type="checkbox" name="expose_admin_port" id="expose-admin-port-toggle"> Expose the admin port via the firewall</label>
+      <button type="submit">Save</button>
+      <span class="hint" id="firewall-settings-note"></span>
+      <span class="error" id="firewall-settings-error"></span>
+    </form>
+
     <h2>Firewall / port rules</h2>
     <table id="rules-table"><thead><tr>
-      <th>Bind</th><th>Ports</th><th>Proto</th><th>Target</th><th>Description</th><th>Enabled</th><th></th>
+      <th>Bind</th><th>Ports</th><th>Proto</th><th>Target</th><th>Description</th><th>Access</th><th>Enabled</th><th></th>
     </tr></thead><tbody></tbody></table>
     <form id="rule-form">
       <div class="field-grid">
@@ -218,6 +229,10 @@
         <label><span>Protocol</span><select name="protocol"><option value="tcp">tcp</option><option value="udp">udp</option></select></label>
         <label><span>Passthrough target (optional)</span><input type="text" name="passthrough_target" placeholder="127.0.0.1:21115" title="Leave blank to just open the firewall for a service already listening locally."></label>
         <label class="wide"><span>Description</span><input type="text" name="description" placeholder="rustdesk tcp"></label>
+        <label class="wide"><span>IP-allow ACLs (optional) -- enforced directly at the firewall (a raw port
+          rule has no login page to fall back to), unlike a host's own ACLs. Only IP-allow lists are shown;
+          selecting none leaves this rule unrestricted.</span>
+          <select name="acl_ids" id="rule-acl-ids" multiple size="4"></select></label>
       </div>
       <div class="checks"><label class="chk"><input type="checkbox" name="enabled" checked> Enabled</label></div>
       <div class="form-actions">
@@ -545,7 +560,7 @@ async function refreshAll() {
   // refreshStandaloneCerts) -- both must resolve before anything that
   // reads them, not run concurrently with it.
   await Promise.all([refreshAcls(), refreshDnsCredentials(), populateBindIpSelects()]);
-  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts(), refreshAcmeSettings()]);
+  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts(), refreshAcmeSettings(), refreshFirewallSettings()]);
 }
 
 async function refreshDashboard() {
@@ -740,8 +755,10 @@ async function refreshRules() {
     const ports = r.port_start === r.port_end ? r.port_start : `${r.port_start}-${r.port_end}`;
     const tr = document.createElement('tr');
     const bindIps = [r.bind_ip_v4, r.bind_ip_v6].filter(Boolean).map(esc).join(' / ') || '—';
+    const access = (r.acl_ids || []).map((id) => (aclsById[id] ? esc(aclsById[id].name) : '(deleted)')).join(', ');
     tr.innerHTML = `<td>${bindIps}</td><td>${ports}</td><td>${esc(r.protocol)}</td>
       <td>${r.passthrough_target ? esc(r.passthrough_target) : '<em>firewall only</em>'}</td><td>${esc(r.description)}</td>
+      <td>${access}</td>
       <td>${r.enabled ? 'yes' : 'no'}</td><td><button class="danger" data-id="${r.id}">Delete</button></td>`;
     tr.querySelector('button').addEventListener('click', async () => {
       await api(`/api/port-rules/${r.id}`, { method: 'DELETE' });
@@ -755,11 +772,12 @@ document.getElementById('rule-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
   const target = fd.get('passthrough_target');
+  const aclIds = Array.from(document.getElementById('rule-acl-ids').selectedOptions).map((o) => o.value);
   const body = {
     bind_ip_v4: fd.get('bind_ip_v4') || null, bind_ip_v6: fd.get('bind_ip_v6') || null,
     port_start: Number(fd.get('port_start')), port_end: Number(fd.get('port_end')),
     protocol: fd.get('protocol'), description: fd.get('description') || '',
-    passthrough_target: target ? target : null, enabled: fd.get('enabled') === 'on',
+    passthrough_target: target ? target : null, acl_ids: aclIds, enabled: fd.get('enabled') === 'on',
   };
   const resp = await api('/api/port-rules', { method: 'POST', body: JSON.stringify(body) });
   if (resp.ok) { e.target.reset(); document.getElementById('rule-error').textContent = ''; refreshAll(); }
@@ -791,6 +809,34 @@ document.getElementById('acme-settings-form').addEventListener('submit', async (
     refreshAcmeSettings();
   } else {
     document.getElementById('acme-settings-error').textContent = (await resp.json()).error || 'failed';
+  }
+});
+
+async function refreshFirewallSettings() {
+  const settings = await (await api('/api/firewall-settings')).json();
+  const form = document.getElementById('firewall-settings-form');
+  const note = document.getElementById('firewall-settings-note');
+  form.expose_admin_port.checked = settings.expose_admin_port;
+  if (settings.from_config) {
+    form.expose_admin_port.disabled = true;
+    form.querySelector('button').disabled = true;
+    note.textContent = 'Set via config.toml\'s admin.expose_admin_port, which always takes precedence -- edit it there instead.';
+  } else {
+    form.expose_admin_port.disabled = false;
+    form.querySelector('button').disabled = false;
+    note.textContent = '';
+  }
+}
+
+document.getElementById('firewall-settings-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const resp = await api('/api/firewall-settings', { method: 'PUT', body: JSON.stringify({ expose_admin_port: fd.get('expose_admin_port') === 'on' }) });
+  if (resp.ok) {
+    document.getElementById('firewall-settings-error').textContent = '';
+    refreshFirewallSettings();
+  } else {
+    document.getElementById('firewall-settings-error').textContent = (await resp.json()).error || 'failed';
   }
 });
 
@@ -1025,6 +1071,15 @@ async function refreshAcls() {
   const selected = new Set(Array.from(select.selectedOptions).map((o) => o.value));
   select.innerHTML = acls.map((a) => `<option value="${esc(a.id)}">${esc(a.name)} (${a.kind === 'login' ? 'login' : 'IP allow'})</option>`).join('');
   for (const opt of select.options) opt.selected = selected.has(opt.value);
+
+  // Port rules only ever enforce IP-allow ACLs at the firewall layer --
+  // a Login-kind list has no application layer on a raw rule to show a
+  // login page, so it's left out of this picker entirely (unlike the
+  // host form's select above, which offers both kinds).
+  const ruleSelect = document.getElementById('rule-acl-ids');
+  const ruleSelected = new Set(Array.from(ruleSelect.selectedOptions).map((o) => o.value));
+  ruleSelect.innerHTML = acls.filter((a) => a.kind === 'ip_allow').map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
+  for (const opt of ruleSelect.options) opt.selected = ruleSelected.has(opt.value);
 }
 
 document.getElementById('acl-form').addEventListener('submit', async (e) => {

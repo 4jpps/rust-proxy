@@ -276,7 +276,7 @@ mod tests {
                 bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
-                expose_admin_port: true,
+                expose_admin_port: None,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
@@ -297,7 +297,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None, None)
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
     #[tokio::test]

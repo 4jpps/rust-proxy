@@ -15,16 +15,36 @@
 //! something a host/port-rule config omission should ever be able to
 //! close.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
+use uuid::Uuid;
 
 use crate::config::{host_bind_ips, port_rule_bind_ips, AdminConfig, PortRule, Protocol, ProxyHost};
 
 pub const TABLE_NAME: &str = "rust_proxy";
 
-pub fn generate_ruleset(hosts: &[ProxyHost], port_rules: &[PortRule], admin: &AdminConfig) -> String {
+/// `expose_admin_port` is the already-resolved effective value (config.toml's
+/// `AdminConfig.expose_admin_port` if set, else the DB-backed fallback --
+/// see `state::AppState::expose_admin_port`), passed in explicitly rather
+/// than read off `admin` directly since resolving that precedence needs
+/// `AppState`, which this module deliberately has no dependency on (pure
+/// generation, no I/O -- see this module's own doc comment).
+///
+/// `rule_allow_ips` maps a port rule's id to the CIDRs its firewall
+/// entry should be restricted to -- present only when that rule has an
+/// `AclKind::IpAllow` ACL selected (see `PortRule::acl_ids`, and
+/// `nftables::sync_once`, which resolves this from the DB before calling
+/// here). Hosts never appear in this map -- a `ProxyHost`'s own
+/// `acl_ids` is enforced entirely at the application layer (see
+/// `proxy::mod::handle_https_request`), which can show a login/block
+/// page; a raw TCP/UDP port rule has no such layer to fall back to, so
+/// its ACL is enforced directly at the firewall instead. A rule absent
+/// from this map gets no source restriction at all, same as before this
+/// map existed.
+pub fn generate_ruleset(hosts: &[ProxyHost], port_rules: &[PortRule], admin: &AdminConfig, expose_admin_port: bool, rule_allow_ips: &HashMap<Uuid, Vec<IpNet>>) -> String {
     let mut out = String::new();
 
     // `add table` is idempotent (a no-op if it already exists, creates
@@ -52,14 +72,14 @@ pub fn generate_ruleset(hosts: &[ProxyHost], port_rules: &[PortRule], admin: &Ad
     let _ = writeln!(out);
 
     write_always_open_rules(&mut out);
-    write_admin_rule(&mut out, admin);
+    write_admin_rule(&mut out, admin, expose_admin_port);
 
     for host in hosts.iter().filter(|h| h.enabled) {
         write_host_rules(&mut out, host);
     }
 
     for rule in port_rules.iter().filter(|r| r.enabled) {
-        write_port_rule(&mut out, rule);
+        write_port_rule(&mut out, rule, rule_allow_ips.get(&rule.id));
     }
 
     let _ = writeln!(out, "    }}");
@@ -135,8 +155,8 @@ fn admin_bind_ips(admin: &AdminConfig) -> Vec<IpAddr> {
     ips
 }
 
-fn write_admin_rule(out: &mut String, admin: &AdminConfig) {
-    if !admin.expose_admin_port {
+fn write_admin_rule(out: &mut String, admin: &AdminConfig, expose_admin_port: bool) {
+    if !expose_admin_port {
         // Deliberately no accept rule at all -- default-DROP then keeps
         // the admin port unreachable from the network entirely (only
         // `iif "lo" accept`, already unconditional above, can still
@@ -172,6 +192,14 @@ fn write_admin_rule(out: &mut String, admin: &AdminConfig) {
     let _ = writeln!(out);
 }
 
+/// `ProxyHost.acl_ids` is deliberately never consulted here -- a host's
+/// access control is enforced entirely at the application layer (see
+/// `proxy::mod::handle_https_request`), which can show a login/block
+/// page and combines IP-allow/login ACLs by OR ("IP over login").
+/// Restricting the firewall too would block the login fallback before a
+/// request ever reached the app. See `write_port_rule` for the one place
+/// an ACL *is* enforced at the firewall layer (a raw port rule has no
+/// application layer to fall back to).
 fn write_host_rules(out: &mut String, host: &ProxyHost) {
     let _ = writeln!(out, "        # host: {}", host.domain);
     for bind_ip in host_bind_ips(host) {
@@ -190,7 +218,7 @@ fn write_host_rules(out: &mut String, host: &ProxyHost) {
     let _ = writeln!(out);
 }
 
-fn write_port_rule(out: &mut String, rule: &PortRule) {
+fn write_port_rule(out: &mut String, rule: &PortRule, allow_ips: Option<&Vec<IpNet>>) {
     let proto = match rule.protocol {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",
@@ -205,7 +233,20 @@ fn write_port_rule(out: &mut String, rule: &PortRule) {
     }
     for bind_ip in port_rule_bind_ips(rule) {
         let daddr = daddr_clause(bind_ip);
-        let _ = writeln!(out, "        {proto} dport {port_expr} {daddr}accept");
+        match allow_ips {
+            Some(allow) => {
+                if let Some(saddr) = saddr_clause(bind_ip, allow) {
+                    let _ = writeln!(out, "        {proto} dport {port_expr} {daddr}{saddr}accept");
+                }
+                // else: this rule's IP-allow ACL has no entries of this
+                // bind's family -- deliberately no accept rule for it
+                // (default-DROP blocks it), same reasoning as the admin
+                // rule's identical case.
+            }
+            None => {
+                let _ = writeln!(out, "        {proto} dport {port_expr} {daddr}accept");
+            }
+        }
     }
     let _ = writeln!(out);
 }
@@ -221,7 +262,7 @@ mod tests {
             bind_ip_v6: None,
             bind_port: 8080,
             allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
-            expose_admin_port: true,
+            expose_admin_port: None,
             session_secret: Some("test".into()),
             admin_username: Some("admin".into()),
             admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
@@ -261,13 +302,14 @@ mod tests {
             protocol: proto,
             description: desc.into(),
             passthrough_target: None,
+            acl_ids: vec![],
             enabled: true,
         }
     }
 
     #[test]
     fn default_policy_is_drop() {
-        let out = generate_ruleset(&[], &[], &admin());
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("policy drop;"));
     }
 
@@ -278,7 +320,7 @@ mod tests {
         // fresh host (the table has never been created) would fail its
         // very first sync forever, since nft -f - aborts the rest of
         // the script on that first error.
-        let out = generate_ruleset(&[], &[], &admin());
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new());
         let add_pos = out.find(&format!("add table inet {TABLE_NAME}")).expect("must add the table");
         let flush_pos = out.find(&format!("flush table inet {TABLE_NAME}")).expect("must still flush it too");
         assert!(add_pos < flush_pos, "add table must come before flush table");
@@ -287,7 +329,7 @@ mod tests {
     #[test]
     fn single_port_rule_emits_bare_port_not_a_range() {
         let rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
-        let out = generate_ruleset(&[], &[rule], &admin());
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 22 ip daddr 10.0.0.3 accept"));
         assert!(!out.contains("22-22"));
     }
@@ -295,7 +337,7 @@ mod tests {
     #[test]
     fn port_range_rule_emits_dash_syntax() {
         let rule = port_rule("10.0.0.4", 21115, 21119, Protocol::Tcp, "rustdesk tcp");
-        let out = generate_ruleset(&[], &[rule], &admin());
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 21115-21119 ip daddr 10.0.0.4 accept"));
     }
 
@@ -303,7 +345,7 @@ mod tests {
     fn udp_and_tcp_rules_use_distinct_protocol_keywords() {
         let tcp_rule = port_rule("10.0.0.4", 21115, 21119, Protocol::Tcp, "rustdesk tcp");
         let udp_rule = port_rule("10.0.0.4", 21116, 21116, Protocol::Udp, "rustdesk udp");
-        let out = generate_ruleset(&[], &[tcp_rule, udp_rule], &admin());
+        let out = generate_ruleset(&[], &[tcp_rule, udp_rule], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 21115-21119 ip daddr 10.0.0.4 accept"));
         assert!(out.contains("udp dport 21116 ip daddr 10.0.0.4 accept"));
     }
@@ -312,7 +354,7 @@ mod tests {
     fn rule_targets_only_its_own_bind_ip() {
         let a = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
         let b = port_rule("10.0.0.4", 21116, 21116, Protocol::Udp, "rustdesk udp");
-        let out = generate_ruleset(&[], &[a, b], &admin());
+        let out = generate_ruleset(&[], &[a, b], &admin(), true, &HashMap::new());
         // 10.0.0.5 was never assigned anything -- must not appear at all.
         assert!(!out.contains("10.0.0.5"));
         assert!(out.contains("ip daddr 10.0.0.3"));
@@ -327,7 +369,7 @@ mod tests {
         // rule this disabled config would have produced is absent instead.
         let mut rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
         rule.enabled = false;
-        let out = generate_ruleset(&[], &[rule], &admin());
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new());
         assert!(!out.contains("dport 22 ip daddr 10.0.0.3"));
     }
 
@@ -335,7 +377,7 @@ mod tests {
     fn disabled_host_is_not_emitted() {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.enabled = false;
-        let out = generate_ruleset(&[h], &[], &admin());
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
         assert!(!out.contains("example.com"));
         assert!(!out.contains("10.0.0.2"));
     }
@@ -343,7 +385,7 @@ mod tests {
     #[test]
     fn host_with_force_https_also_opens_port_80() {
         let h = host("example.com", "10.0.0.2", 443, true);
-        let out = generate_ruleset(&[h], &[], &admin());
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
     }
@@ -351,7 +393,7 @@ mod tests {
     #[test]
     fn host_without_force_https_does_not_open_port_80() {
         let h = host("example.com", "10.0.0.2", 443, false);
-        let out = generate_ruleset(&[h], &[], &admin());
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(!out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
     }
@@ -360,13 +402,13 @@ mod tests {
     fn host_with_http01_challenge_type_opens_port_80_without_force_https() {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.acme_challenge_type = crate::config::AcmeChallengeType::Http01;
-        let out = generate_ruleset(&[h], &[], &admin());
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
     }
 
     #[test]
     fn admin_ui_restricted_to_allowed_source_ips() {
-        let out = generate_ruleset(&[], &[], &admin());
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 8080 ip daddr 10.0.0.1 ip saddr { 10.0.0.1/32 } accept"));
     }
 
@@ -379,7 +421,7 @@ mod tests {
         // admin port back down to loopback underneath it.
         let mut a = admin();
         a.allowed_ips = vec![];
-        let out = generate_ruleset(&[], &[], &a);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new());
         assert!(out.contains(&format!("tcp dport {} ip daddr {} accept", a.bind_port, a.bind_ip_v4.unwrap())));
     }
 
@@ -389,14 +431,14 @@ mod tests {
         a.bind_ip_v4 = Some(std::net::Ipv4Addr::UNSPECIFIED);
         a.bind_ip_v6 = None;
         a.allowed_ips = vec![];
-        let out = generate_ruleset(&[], &[], &a);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new());
         assert!(out.contains(&format!("tcp dport {} accept", a.bind_port)), "got: {out}");
         assert!(!out.contains("ip daddr 0.0.0.0"), "0.0.0.0 never appears as a real packet's destination -- this rule would never match anything");
     }
 
     #[test]
     fn ssh_http_and_https_are_always_accepted_unconditionally() {
-        let out = generate_ruleset(&[], &[], &admin());
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 22 accept"));
         assert!(out.contains("tcp dport 80 accept"));
         assert!(out.contains("tcp dport 443 accept"));
@@ -408,7 +450,7 @@ mod tests {
         // no conflicting config yet" -- it's unconditional even alongside
         // a real, unrelated rule that also targets port 22.
         let rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "some other ssh-like service");
-        let out = generate_ruleset(&[], &[rule], &admin());
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 22 accept"));
     }
 
@@ -416,7 +458,7 @@ mod tests {
     fn unassigned_ips_in_the_29_never_appear_in_output() {
         let h = host("example.com", "10.0.0.2", 443, false);
         let rule = port_rule("10.0.0.4", 21115, 21119, Protocol::Tcp, "rustdesk");
-        let out = generate_ruleset(&[h], &[rule], &admin());
+        let out = generate_ruleset(&[h], &[rule], &admin(), true, &HashMap::new());
         for unused in ["10.0.0.5", "10.0.0.6"] {
             assert!(!out.contains(unused), "unassigned ip {unused} leaked into ruleset");
         }
@@ -427,7 +469,7 @@ mod tests {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.bind_ip_v4 = None;
         h.bind_ip_v6 = Some("2001:db8::1".parse().unwrap());
-        let out = generate_ruleset(&[h], &[], &admin());
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 443 ip6 daddr 2001:db8::1 accept"));
         assert!(!out.contains("ip daddr 2001:db8::1"), "an IPv6 address must never be matched with the v4-only `ip daddr` keyword");
     }
@@ -436,7 +478,7 @@ mod tests {
     fn dual_stack_host_emits_a_rule_for_each_family() {
         let mut h = host("example.com", "10.0.0.2", 443, true);
         h.bind_ip_v6 = Some("2001:db8::1".parse().unwrap());
-        let out = generate_ruleset(&[h], &[], &admin());
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(out.contains("tcp dport 443 ip6 daddr 2001:db8::1 accept"));
         assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
@@ -448,7 +490,7 @@ mod tests {
         let mut rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
         rule.bind_ip_v4 = None;
         rule.bind_ip_v6 = Some("2001:db8::5".parse().unwrap());
-        let out = generate_ruleset(&[], &[rule], &admin());
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 22 ip6 daddr 2001:db8::5 accept"));
     }
 
@@ -459,7 +501,7 @@ mod tests {
         // matching entries -- default-DROP should keep it closed instead.
         let mut a = admin();
         a.bind_ip_v6 = Some(std::net::Ipv6Addr::UNSPECIFIED);
-        let out = generate_ruleset(&[], &[], &a);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new());
         assert!(out.contains("tcp dport 8080 ip daddr 10.0.0.1 ip saddr { 10.0.0.1/32 } accept"));
         assert!(!out.contains("ip6 daddr"), "no v6 accept rule should have been emitted since allowed_ips has no v6 entries");
     }
@@ -469,24 +511,66 @@ mod tests {
         let mut a = admin();
         a.bind_ip_v6 = Some(std::net::Ipv6Addr::UNSPECIFIED);
         a.allowed_ips.push("2001:db8::/32".parse().unwrap());
-        let out = generate_ruleset(&[], &[], &a);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new());
         assert!(out.contains("tcp dport 8080 ip6 saddr { 2001:db8::/32 } accept"));
     }
 
     #[test]
     fn expose_admin_port_false_emits_no_accept_rule_for_the_admin_port() {
-        let mut a = admin();
-        a.expose_admin_port = false;
-        let out = generate_ruleset(&[], &[], &a);
+        let a = admin();
+        let out = generate_ruleset(&[], &[], &a, false, &HashMap::new());
         assert!(!out.contains("dport 8080"), "no accept rule should mention the admin port at all when expose_admin_port is false");
     }
 
     #[test]
     fn expose_admin_port_false_does_not_affect_host_or_port_rule_firewall_entries() {
-        let mut a = admin();
-        a.expose_admin_port = false;
+        let a = admin();
         let h = host("example.com", "10.0.0.2", 443, false);
-        let out = generate_ruleset(&[h], &[], &a);
+        let out = generate_ruleset(&[h], &[], &a, false, &HashMap::new());
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
+    }
+
+    /// The new feature this whole map exists for: a port rule with an
+    /// IP-allow ACL selected gets its firewall entry source-restricted
+    /// directly, since a raw TCP/UDP passthrough rule has no application
+    /// layer to gate on the way a host does.
+    #[test]
+    fn port_rule_with_an_ip_allow_acl_gets_a_source_restricted_firewall_entry() {
+        let rule = port_rule("10.0.0.3", 21115, 21115, Protocol::Tcp, "rustdesk");
+        let mut rule_allow_ips = HashMap::new();
+        rule_allow_ips.insert(rule.id, vec!["192.168.1.0/24".parse().unwrap()]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &rule_allow_ips);
+        assert!(out.contains("tcp dport 21115 ip daddr 10.0.0.3 ip saddr { 192.168.1.0/24 } accept"));
+    }
+
+    /// A port rule absent from the map (no IP-allow ACL selected) is
+    /// unrestricted, exactly as before this feature existed.
+    #[test]
+    fn port_rule_without_an_acl_is_unrestricted() {
+        let rule = port_rule("10.0.0.3", 21115, 21115, Protocol::Tcp, "rustdesk");
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new());
+        assert!(out.contains("tcp dport 21115 ip daddr 10.0.0.3 accept"), "got: {out}");
+    }
+
+    /// An IP-allow ACL selected but with no entries of the rule's own
+    /// bind family emits no accept rule at all for it -- default-DROP
+    /// then blocks it, same as the admin rule's identical case.
+    #[test]
+    fn port_rule_with_an_acl_that_has_no_matching_family_entries_is_not_emitted() {
+        let rule = port_rule("10.0.0.3", 21115, 21115, Protocol::Tcp, "rustdesk");
+        let mut rule_allow_ips = HashMap::new();
+        rule_allow_ips.insert(rule.id, vec!["2001:db8::/32".parse().unwrap()]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &rule_allow_ips);
+        assert!(!out.contains("dport 21115"), "no accept rule should exist for a family the ACL has no entries for");
+    }
+
+    /// A host's own acl_ids must never influence the firewall -- it's
+    /// application-layer-only (see write_host_rules' doc comment).
+    #[test]
+    fn host_acl_ids_never_affect_the_firewall_rule() {
+        let mut h = host("example.com", "10.0.0.2", 443, false);
+        h.acl_ids = vec![Uuid::new_v4()]; // a real acl_id, deliberately not in any allow_ips map
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
+        assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"), "a host must never be source-restricted at the firewall layer regardless of its own acl_ids: got {out}");
     }
 }

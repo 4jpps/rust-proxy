@@ -278,17 +278,29 @@ async fn handle_https_request(
         }
     };
 
-    if !access::ip_allowed(&resolved_acls.allow_ips, peer_ip) {
-        return Ok(forbidden());
-    }
-
-    if !resolved_acls.credentials.is_empty() {
-        let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
-            .zip(state.admin_identity())
-            .map(|(token, identity)| login::verify_session(&identity.session_secret, &host.domain, &token))
-            .unwrap_or(false);
-        if !has_valid_session {
-            return Ok(handle_login_gate(&state, &host.domain, &resolved_acls.credentials, req).await);
+    // IP-allow and login gates combine by OR, not AND, when a host has
+    // both kinds of ACL selected -- passing either is sufficient, and
+    // "IP over login" means the IP check is tried first: a matching
+    // source IP admits the request outright, without ever touching the
+    // login gate, even if one is also configured. An IP-allow ACL that
+    // DOESN'T match falls through to the login gate instead of an
+    // immediate 403 (a real lockout this fixes: an operator whose source
+    // IP no longer matches a host's IP-allow list, but who still has
+    // valid login credentials for it, must still be able to sign in).
+    // Only a host with an IP-allow ACL and NO login ACL at all still
+    // 403s outright on a non-matching IP, same as it always has.
+    let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
+    if !(resolved_acls.has_ip_allow_acl && ip_allowed) {
+        if resolved_acls.has_login_acl {
+            let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
+                .zip(state.admin_identity())
+                .map(|(token, identity)| login::verify_session(&identity.session_secret, &host.domain, &token))
+                .unwrap_or(false);
+            if !has_valid_session {
+                return Ok(handle_login_gate(&state, &host.domain, &resolved_acls.credentials, req).await);
+            }
+        } else if resolved_acls.has_ip_allow_acl {
+            return Ok(forbidden_page(&host.domain));
         }
     }
 
@@ -487,11 +499,17 @@ fn bad_gateway() -> Response<BoxBody<Bytes, hyper::Error>> {
         .expect("static response is always valid")
 }
 
-fn forbidden() -> Response<BoxBody<Bytes, hyper::Error>> {
+/// A real "Access denied" page, not a bare unstyled 403 -- shown for a
+/// host with an IP-allow ACL and no login ACL to fall back to, whose
+/// visitor's source IP didn't match (see `handle_https_request`'s
+/// "IP over login" combination).
+fn forbidden_page(domain: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let html = login::render_forbidden_page(domain);
     Response::builder()
         .status(hyper::StatusCode::FORBIDDEN)
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
-        .expect("static response is always valid")
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(http_body_util::Full::new(Bytes::from(html)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .expect("static forbidden page response is always valid")
 }
 
 fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -521,6 +539,7 @@ mod tests {
             protocol: proto,
             description: "test".into(),
             passthrough_target: target.map(|t| t.to_string()),
+            acl_ids: vec![],
             enabled: true,
         }
     }
@@ -558,7 +577,7 @@ mod tests {
                 bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
-                expose_admin_port: true,
+                expose_admin_port: None,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
@@ -579,7 +598,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let state = AppState::new(cfg, pool, vec![], vec![], None, None);
+        let state = AppState::new(cfg, pool, vec![], vec![], None, None, None);
         state.upsert_cert(domain.to_string(), tls::self_signed_entry(domain));
         state
     }
@@ -866,6 +885,9 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "text/html; charset=utf-8");
+        let body = response_text(resp).await;
+        assert!(body.contains("Access denied"), "an IP-only-denied host must get a real page, not a bare empty 403");
     }
 
     #[tokio::test]
@@ -883,6 +905,35 @@ mod tests {
         // Upstream is unreachable (127.0.0.1:1) so this proves access
         // control let the request through, not that it fully succeeded.
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    /// Regression test for a real lockout: a host with both an IP-allow
+    /// ACL and a login ACL selected used to require BOTH to pass (IP
+    /// checked first, 403 immediately on a mismatch, login never even
+    /// consulted) -- an operator whose source IP stopped matching the
+    /// allow list could no longer sign in at all, even with valid
+    /// credentials. The two now combine by OR: a matching IP admits the
+    /// request outright, without ever touching the login gate.
+    #[tokio::test]
+    async fn matching_ip_admits_the_request_without_requiring_login_even_when_a_login_acl_is_also_configured() {
+        let state = test_state_with_access("example.com", vec!["10.0.0.0/24".parse().unwrap()], Some(viewer_auth())).await;
+        let resp = send_test_request(state, "10.0.0.42".parse().unwrap(), "GET", "/", None, None).await;
+        // Upstream is unreachable (127.0.0.1:1) so BAD_GATEWAY (not the
+        // login page) proves the IP match alone was enough to admit it.
+        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    /// The other half of the same fix: a non-matching IP must fall
+    /// through to the login gate (so valid credentials still work)
+    /// instead of 403ing immediately, whenever a login ACL is also
+    /// configured on the host.
+    #[tokio::test]
+    async fn non_matching_ip_falls_through_to_the_login_gate_instead_of_403() {
+        let state = test_state_with_access("example.com", vec!["192.168.1.0/24".parse().unwrap()], Some(viewer_auth())).await;
+        let resp = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/", None, None).await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        let body = response_text(resp).await;
+        assert!(body.contains("Sign in to example.com"), "a non-matching IP with a login ACL also configured must get the login page, not a 403");
     }
 
     fn viewer_auth() -> crate::config::HostAuth {

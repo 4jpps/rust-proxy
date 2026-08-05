@@ -78,6 +78,13 @@ struct Inner {
     /// `set_acme_contact_email`, same as the setup wizard does for the
     /// admin identity.
     acme_contact_email_db: ArcSwap<Option<String>>,
+    /// Same "config.toml wins if set, else this DB-backed fallback"
+    /// precedence as `acme_contact_email_db` -- `admin.expose_admin_port`
+    /// used to be config.toml-only; the admin UI's settings section can
+    /// now set/change it at runtime. Defaults to `true` (mirrors the
+    /// original, only-ever behavior) when neither config.toml nor the DB
+    /// has ever set it.
+    expose_admin_port_db: ArcSwap<bool>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
     /// and `proxy::run`'s listener supervisor can both re-sync immediately
     /// instead of polling on a timer. `notify_waiters` (not `notify_one`)
@@ -107,6 +114,7 @@ impl AppState {
         port_rules: Vec<PortRule>,
         initial_admin_identity: Option<AdminIdentity>,
         initial_acme_contact_email: Option<String>,
+        initial_expose_admin_port: Option<bool>,
     ) -> Self {
         Self(Arc::new(Inner {
             network: cfg.network,
@@ -118,6 +126,7 @@ impl AppState {
             http01_challenges: ArcSwap::from_pointee(HashMap::new()),
             admin_identity_db: ArcSwap::from_pointee(initial_admin_identity),
             acme_contact_email_db: ArcSwap::from_pointee(initial_acme_contact_email),
+            expose_admin_port_db: ArcSwap::from_pointee(initial_expose_admin_port.unwrap_or(true)),
             config_dirty: Notify::new(),
             db,
             hosts_write_lock: Mutex::new(()),
@@ -209,6 +218,26 @@ impl AppState {
         self.0.acme_contact_email_db.store(Arc::new(Some(email)));
     }
 
+    /// Effective "expose the admin port via the firewall" setting --
+    /// config.toml's `admin.expose_admin_port` if set, else the
+    /// DB-backed value (defaulting to `true` until an operator changes
+    /// it from the admin UI's settings section). Consulted by
+    /// `nftables::run_sync_loop` on every sync, so a change here takes
+    /// effect on the next resync, no restart needed -- unlike
+    /// `acme_contact_email`, this has no "already in flight" state to
+    /// worry about.
+    pub fn expose_admin_port(&self) -> bool {
+        self.0.admin.expose_admin_port.unwrap_or_else(|| *self.0.expose_admin_port_db.load_full())
+    }
+
+    /// Publishes a newly-set DB-backed value, visible to the next
+    /// `expose_admin_port()` call immediately. Has no effect when
+    /// config.toml already supplies `admin.expose_admin_port` (checked
+    /// first, always, same precedence as `acme_contact_email`).
+    pub fn set_expose_admin_port(&self, value: bool) {
+        self.0.expose_admin_port_db.store(Arc::new(value));
+    }
+
     pub fn hosts(&self) -> Arc<Vec<ProxyHost>> {
         self.0.hosts.load_full()
     }
@@ -294,7 +323,7 @@ mod tests {
                 bind_ip_v6: None,
                 bind_port: 8080,
                 allowed_ips: vec![],
-                expose_admin_port: true,
+                expose_admin_port: None,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
@@ -318,7 +347,7 @@ mod tests {
 
     async fn test_state() -> AppState {
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(test_config(), pool, vec![], vec![], None, None)
+        AppState::new(test_config(), pool, vec![], vec![], None, None, None)
     }
 
     #[tokio::test]
@@ -362,6 +391,7 @@ mod tests {
             protocol: Protocol::Tcp,
             description: "rustdesk".into(),
             passthrough_target: None,
+            acl_ids: vec![],
             enabled: true,
         }]);
         assert_eq!(state.port_rules().len(), 1);
@@ -452,7 +482,7 @@ mod tests {
         cfg.admin.admin_username = None;
         cfg.admin.admin_password_hash = None;
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let state = AppState::new(cfg, pool, vec![], vec![], None, None);
+        let state = AppState::new(cfg, pool, vec![], vec![], None, None, None);
 
         assert!(state.admin_identity().is_none());
     }
@@ -464,7 +494,7 @@ mod tests {
         cfg.admin.admin_username = None;
         cfg.admin.admin_password_hash = None;
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let state = AppState::new(cfg, pool, vec![], vec![], None, None);
+        let state = AppState::new(cfg, pool, vec![], vec![], None, None, None);
 
         state.set_admin_identity(AdminIdentity {
             username: "wizard-admin".into(),
@@ -497,7 +527,7 @@ mod tests {
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
         let mut cfg = test_config();
         cfg.acme.contact_email = String::new();
-        AppState::new(cfg, pool, vec![], vec![], None, None)
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
     #[tokio::test]

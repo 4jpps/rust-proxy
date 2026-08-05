@@ -68,7 +68,24 @@ pub async fn run_sync_loop(state: AppState) -> anyhow::Result<()> {
 async fn sync_once(state: &AppState) -> anyhow::Result<()> {
     let hosts = state.hosts();
     let port_rules = state.port_rules();
-    let ruleset = generator::generate_ruleset(&hosts, &port_rules, state.admin());
+
+    // Hosts are handled entirely at the application layer (see
+    // proxy::mod::handle_https_request's IP-over-login combination) --
+    // it can show a login/block page, so their firewall rule never needs
+    // a source restriction of its own. A raw TCP/UDP port rule has no
+    // such application layer to fall back to, so an IP-allow ACL
+    // selected on one *is* enforced here, directly at the firewall.
+    // Only AclKind::IpAllow contributes; a Login-kind list selected on a
+    // port rule is silently ignored (see PortRule::acl_ids' doc comment).
+    let mut rule_allow_ips = std::collections::HashMap::new();
+    for rule in port_rules.iter().filter(|r| r.enabled && !r.acl_ids.is_empty()) {
+        let resolved = crate::db::resolve_acl_ids(state.db(), &rule.acl_ids).await?;
+        if resolved.has_ip_allow_acl {
+            rule_allow_ips.insert(rule.id, resolved.allow_ips);
+        }
+    }
+
+    let ruleset = generator::generate_ruleset(&hosts, &port_rules, state.admin(), state.expose_admin_port(), &rule_allow_ips);
     apply(&ruleset).await
 }
 
