@@ -202,30 +202,45 @@ async fn handle_https_request(
     sni: Option<String>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    // Real HTTP/2 clients (every modern browser) send the target host
+    // as the `:authority` pseudo-header, not a literal `Host:` header --
+    // hyper/h2 surfaces that in `req.uri()`'s authority component, not
+    // `req.headers()`. `req.headers().get(HOST)` alone is therefore
+    // `None` for the overwhelming majority of real h2 traffic (confirmed
+    // live: a real h2 request logged `host_header="<none>"` despite
+    // definitely carrying a target host), silently falling through to
+    // `sni` below -- which defeats the whole point of preferring the
+    // per-request host over the per-connection SNI, since exactly the h2
+    // clients capable of connection coalescing are the ones this never
+    // engaged for. `req.uri().host()` covers h2 (and any h1 client using
+    // absolute-form request targets, e.g. through another proxy); the
+    // header remains the fallback for ordinary h1 origin-form requests,
+    // where `req.uri()` is just the path with no authority at all.
+    let uri_host = req.uri().host().map(|s| s.to_string());
     let host_header = req
         .headers()
         .get(hyper::header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    // The `Host`/`:authority` header must win over `sni` when both are
-    // present -- `sni` is captured once per TLS connection at handshake
-    // time, but a single connection can carry requests for more than
-    // one domain: HTTP/2 connection coalescing (RFC 7540 §9.1.1) lets a
-    // browser reuse an existing connection for a *different* origin
-    // whenever the connection's cert also covers it (exactly what a
-    // wildcard/SAN cert does), and each request on that connection
-    // still carries its own real `:authority`. Routing by `sni` first
-    // sent every request after the first to whichever host the
-    // connection originally happened to be for -- confirmed as a real
-    // production bug: visiting store.jpps.us after proxy.jpps.us (both
-    // under the *.jpps.us wildcard cert, same bind_ip:port) served
+    // Either form of "the request's own declared host" must win over
+    // `sni` when they disagree -- `sni` is captured once per TLS
+    // connection at handshake time, but a single connection can carry
+    // requests for more than one domain: HTTP/2 connection coalescing
+    // (RFC 7540 §9.1.1) lets a browser reuse an existing connection for
+    // a *different* origin whenever the connection's cert also covers
+    // it (exactly what a wildcard/SAN cert does), and each request on
+    // that connection still carries its own real target host. Routing
+    // by `sni` first sent every request after the first to whichever
+    // host the connection originally happened to be for -- confirmed as
+    // a real production bug: visiting store.jpps.us after proxy.jpps.us
+    // (both under the *.jpps.us wildcard cert, same bind_ip:port) served
     // proxy.jpps.us's admin login page instead. `sni` is still what
-    // `proxy::tls::CertResolver` uses to pick the TLS certificate
-    // itself (that part's connection-scoped by nature); this is purely
-    // about which *host* a given request routes to. `sni` remains the
-    // fallback for the rare case a request genuinely has no `Host`
-    // header at all (HTTP/1.0).
-    let lookup_name = host_header.clone().or_else(|| sni.clone());
+    // `proxy::tls::CertResolver` uses to pick the TLS certificate itself
+    // (that part's connection-scoped by nature); this is purely about
+    // which *host* a given request routes to. `sni` remains the
+    // fallback for the rare case a request genuinely declares no host
+    // at all.
+    let lookup_name = uri_host.clone().or_else(|| host_header.clone()).or_else(|| sni.clone());
 
     let hosts = state.hosts();
     let matched = lookup_name
@@ -235,15 +250,17 @@ async fn handle_https_request(
     // The daemon's only per-request routing-decision log -- exactly
     // what's needed to diagnose "request for X got routed to Y" without
     // reasoning about it in the abstract: sni is the TLS connection's
-    // own (possibly stale, see above), host_header is what this
-    // specific request actually asked for, and matched_domain is what
-    // it was actually routed to. debug-level, so it only lands in
+    // own (possibly stale, see above), uri_host/host_header are what
+    // this specific request actually declared (uri_host is what real h2
+    // traffic actually carries -- see above), and matched_domain is
+    // what it was actually routed to. debug-level, so it only lands in
     // proxy.log (see logging.rs), not stdout/journald.
     tracing::debug!(
         %bind_ip,
         bind_port,
         %peer_ip,
         sni = sni.as_deref().unwrap_or("<none>"),
+        uri_host = uri_host.as_deref().unwrap_or("<none>"),
         host_header = host_header.as_deref().unwrap_or("<none>"),
         matched_domain = matched.map(|h| h.domain.as_str()).unwrap_or("<no match>"),
         "routing decision"
@@ -752,6 +769,91 @@ mod tests {
 
         let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
         assert_eq!(location, "https://b.example.com", "the request's real Host header must win over the connection's stale SNI");
+    }
+
+    /// Real production gap the first fix (preferring the `Host` header
+    /// over `sni`) missed: genuine HTTP/2 clients -- every modern
+    /// browser -- send the target host as the `:authority`
+    /// pseudo-header, which hyper/h2 surfaces via `req.uri()`, never as
+    /// a literal `Host:` header in `req.headers()`. A real h2 request
+    /// carrying no `Host` header at all (confirmed live: production
+    /// logs showed `host_header="<none>"` on real h2 traffic) must
+    /// still route by its own declared host, not fall through to the
+    /// connection's possibly-stale `sni` -- the exact scenario
+    /// connection coalescing creates.
+    #[tokio::test]
+    async fn an_h2_requests_authority_wins_over_a_stale_connection_level_sni_with_no_host_header_at_all() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let target_first = crate::config::RedirectTarget {
+            target: "https://a.example.com".into(),
+            preserve_path: false,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let target_second = crate::config::RedirectTarget {
+            target: "https://b.example.com".into(),
+            preserve_path: false,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let host_first = redirect_host("first.example.com", target_first);
+        let host_second = redirect_host("second.example.com", target_second);
+        let state = test_state_with_cert("first.example.com").await;
+        state.set_hosts(vec![host_first, host_second]);
+
+        let acceptor = TlsAcceptor::from(Arc::new(build_https_server_config(state.clone())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bind_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let bind_port = 443;
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls_stream = acceptor.accept(stream).await.unwrap();
+            // Real connection-level SNI, exactly as the production
+            // listener captures it -- "first.example.com", the domain
+            // this same TLS connection was originally established for.
+            let sni = tls_stream.get_ref().1.server_name().map(|s| s.to_string());
+            let io = TokioIo::new(tls_stream);
+            let state = state.clone();
+            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let state = state.clone();
+                let sni = sni.clone();
+                async move { handle_https_request(state, bind_ip, bind_port, "203.0.113.7".parse().unwrap(), sni, req).await }
+            });
+            hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .unwrap();
+        });
+
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = RustlsServerName::try_from("first.example.com").unwrap();
+        let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+        assert_eq!(tls_stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]), "must actually be h2 -- that's the whole point of this test");
+
+        let io = TokioIo::new(tls_stream);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await.unwrap();
+        tokio::spawn(conn);
+
+        // Absolute-form URI, no Host header at all -- hyper's h2 client
+        // derives the :authority pseudo-header from the URI itself,
+        // same as a real browser reusing a coalesced connection for a
+        // different origin than the one it originally connected to.
+        let req = Request::builder().uri("https://second.example.com/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(
+            location, "https://b.example.com",
+            "an h2 request's :authority (no Host header at all) must win over the connection's stale SNI"
+        );
     }
 
     #[tokio::test]
