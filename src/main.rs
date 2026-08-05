@@ -3,6 +3,7 @@ mod api;
 mod bootstrap;
 mod config;
 mod db;
+mod logging;
 mod nftables;
 mod proxy;
 mod state;
@@ -40,15 +41,18 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("rust_proxy=info".parse().unwrap()),
-        )
-        .init();
+    let cfg = config::Config::load(&args.config)?;
+
+    // Split into proxy.log/access.log/server.log under the same
+    // directory as the sqlite DB (already read-write for this daemon,
+    // no new config surface or packaging change needed) -- see
+    // logging.rs's own doc comment for the split's rationale. `_guards`
+    // must stay alive for the whole process; dropping it early would
+    // silently stop these files from being written to.
+    let log_dir = cfg.admin.db_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _log_guards = logging::init(&log_dir)?;
 
     tracing::info!(config = %args.config.display(), "starting rust-proxy");
-
-    let cfg = config::Config::load(&args.config)?;
     // Everything needed before the long-running service tasks can
     // start (DB connect, seed/load hosts+port_rules+the default DNS
     // credential, resolve the admin identity, load certs from disk) --

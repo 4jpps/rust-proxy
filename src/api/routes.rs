@@ -40,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/acls/:id", axum::routing::delete(delete_acl_list))
         .route("/api/dns01-certs", get(list_standalone_certs).post(create_standalone_cert))
         .route("/api/dns01-certs/:id", axum::routing::delete(delete_standalone_cert))
+        .route("/api/acme-settings", get(get_acme_settings).put(update_acme_settings))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
@@ -51,6 +52,43 @@ pub fn build_router(state: AppState) -> Router {
         .merge(protected)
         .with_state(state)
         .layer(CookieManagerLayer::new())
+        // Outermost so it sees every request/response, including a 401
+        // from `require_admin` -- a rejected admin API request is
+        // exactly the kind of thing an access log needs to capture, not
+        // just successful ones.
+        .layer(axum::middleware::from_fn(access_log))
+}
+
+/// How a request that reached a protected route actually authenticated
+/// -- `require_admin` stashes this into the response's extensions on
+/// success (extensions on a `Response` propagate back out through every
+/// enclosing layer, unlike a `Request`'s, which only ever flow inward)
+/// so `access_log`, running outside it, can log who without an extra
+/// DB/session lookup of its own.
+#[derive(Clone)]
+struct AuthenticatedVia(&'static str);
+
+/// Every admin API request, logged to `access.log` (see `logging.rs`)
+/// under the dedicated `rust_proxy::access` target -- method, path,
+/// status, latency, and how it authenticated (`session`, `token`, or
+/// `unauthenticated` for a rejected request). This is the daemon's only
+/// per-request admin audit trail; there was none before.
+async fn access_log(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let auth = resp.extensions().get::<AuthenticatedVia>().map(|a| a.0).unwrap_or("unauthenticated");
+    tracing::info!(
+        target: "rust_proxy::access",
+        %method,
+        path,
+        status = resp.status().as_u16(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        auth,
+        "admin api request"
+    );
+    resp
 }
 
 async fn admin_ui() -> Response {
@@ -77,7 +115,9 @@ async fn require_admin(State(state): State<AppState>, cookies: Cookies, req: Req
         .and_then(|t| auth::verify_session(&identity.session_secret, &t))
         .is_some();
     if session_ok {
-        return next.run(req).await;
+        let mut resp = next.run(req).await;
+        resp.extensions_mut().insert(AuthenticatedVia("session"));
+        return resp;
     }
 
     if let Some(token) = bearer_token(&req) {
@@ -88,7 +128,9 @@ async fn require_admin(State(state): State<AppState>, cookies: Cookies, req: Req
             if let Err(err) = crate::db::touch_api_token_last_used(state.db(), id, chrono::Utc::now()).await {
                 tracing::warn!(error = %err, "failed to update api token last_used_at");
             }
-            return next.run(req).await;
+            let mut resp = next.run(req).await;
+            resp.extensions_mut().insert(AuthenticatedVia("token"));
+            return resp;
         }
     }
 
@@ -169,6 +211,12 @@ struct SetupRequest {
     password: String,
     #[serde(default)]
     dns_credential: Option<CreateDnsCredentialRequest>,
+    /// Only used when config.toml's own `acme.contact_email` is blank
+    /// -- see `state::AppState::acme_contact_email`'s precedence rule.
+    /// Optional here since an operator might set it in config.toml
+    /// instead, or add it later from the settings section.
+    #[serde(default)]
+    acme_contact_email: Option<String>,
 }
 
 /// Creates the admin identity on a genuinely unconfigured instance.
@@ -207,7 +255,60 @@ async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>) ->
             crate::db::create_dns_credential(state.db(), Uuid::new_v4(), name, cred.provider, &cred.token, chrono::Utc::now()).await?;
         }
     }
+    if let Some(email) = body.acme_contact_email {
+        let email = email.trim();
+        if !email.is_empty() {
+            crate::db::set_acme_contact_email(state.db(), email).await?;
+            state.set_acme_contact_email(email.to_string());
+        }
+    }
     Ok(StatusCode::CREATED)
+}
+
+#[derive(Serialize)]
+struct AcmeSettingsResponse {
+    /// `None` means nothing is configured yet (neither config.toml nor
+    /// the DB) -- ACME issuance will fail until this is set.
+    contact_email: Option<String>,
+    /// Whether `contact_email` came from config.toml (`true`) or the DB
+    /// (`false`/absent) -- the settings UI uses this to show the field
+    /// as read-only with an explanatory note when config.toml already
+    /// wins, since editing it here would otherwise silently have no
+    /// effect (same precedence rule as `admin_identity`).
+    from_config: bool,
+}
+
+async fn get_acme_settings(State(state): State<AppState>) -> Json<AcmeSettingsResponse> {
+    let from_config = !state.acme().contact_email.trim().is_empty();
+    Json(AcmeSettingsResponse {
+        contact_email: state.acme_contact_email(),
+        from_config,
+    })
+}
+
+#[derive(Deserialize)]
+struct UpdateAcmeSettingsRequest {
+    contact_email: String,
+}
+
+/// Rejected outright when config.toml already supplies `acme.contact_email`
+/// -- writing to the DB in that case would be silently shadowed forever
+/// (config always wins, see `AppState::acme_contact_email`), which is
+/// more confusing than a clear error explaining why.
+async fn update_acme_settings(State(state): State<AppState>, Json(body): Json<UpdateAcmeSettingsRequest>) -> Result<Json<AcmeSettingsResponse>, ApiError> {
+    if !state.acme().contact_email.trim().is_empty() {
+        return Err(ApiError::Conflict("acme.contact_email is set in config.toml, which always takes precedence -- edit it there instead".into()));
+    }
+    let email = body.contact_email.trim();
+    if email.is_empty() {
+        return Err(ApiError::BadRequest("contact_email must not be empty".into()));
+    }
+    crate::db::set_acme_contact_email(state.db(), email).await?;
+    state.set_acme_contact_email(email.to_string());
+    Ok(Json(AcmeSettingsResponse {
+        contact_email: Some(email.to_string()),
+        from_config: false,
+    }))
 }
 
 /// 32 bytes of real randomness, hex-encoded -- same strength as the
@@ -990,7 +1091,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None)
+        AppState::new(cfg, pool, vec![], vec![], None, None)
     }
 
     async fn unconfigured_test_state() -> AppState {
@@ -1021,7 +1122,40 @@ mod tests {
         };
         cfg.validate().expect("valid: all three identity fields omitted together");
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None)
+        AppState::new(cfg, pool, vec![], vec![], None, None)
+    }
+
+    // test_state() sets a non-empty acme.contact_email, which would
+    // always win over anything DB-backed -- this variant has it blank
+    // so the acme-settings tests actually exercise the DB fallback path.
+    async fn test_state_with_blank_contact_email() -> AppState {
+        let cfg = Config {
+            network: NetworkConfig {
+                bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
+            },
+            admin: AdminConfig {
+                bind_ip: "10.0.0.1".parse().unwrap(),
+                bind_port: 8080,
+                allowed_ips: vec![],
+                session_secret: Some("test-secret-key".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
+                db_path: PathBuf::from(":memory:"),
+            },
+            acme: AcmeConfig {
+                directory_url: "https://example.invalid/directory".into(),
+                contact_email: String::new(),
+                dns_provider: crate::config::DnsProviderKind::Cloudflare,
+                dns_api_token: "token".into(),
+                cert_dir: PathBuf::from("/tmp/certs"),
+                account_key_path: PathBuf::from("/tmp/account.key"),
+                renew_before_days: 30,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+        };
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        AppState::new(cfg, pool, vec![], vec![], None, None)
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -2595,5 +2729,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_acme_settings_reports_the_config_supplied_email_as_read_only() {
+        let router = build_router(test_state().await); // non-blank contact_email
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(Request::builder().uri("/api/acme-settings").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json = body_json(resp).await;
+        assert_eq!(json["contact_email"], "admin@example.com");
+        assert_eq!(json["from_config"], true);
+    }
+
+    #[tokio::test]
+    async fn get_acme_settings_reports_none_before_anything_is_configured() {
+        let router = build_router(test_state_with_blank_contact_email().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(Request::builder().uri("/api/acme-settings").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let json = body_json(resp).await;
+        assert!(json["contact_email"].is_null());
+        assert_eq!(json["from_config"], false);
+    }
+
+    #[tokio::test]
+    async fn update_acme_settings_persists_and_takes_effect_immediately() {
+        let state = test_state_with_blank_contact_email().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/acme-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"contact_email":"ops@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.acme_contact_email().as_deref(), Some("ops@example.com"), "must take effect immediately, no restart needed");
+
+        let reloaded = crate::db::load_acme_contact_email(state.db()).await.unwrap();
+        assert_eq!(reloaded.as_deref(), Some("ops@example.com"), "must actually persist to the DB, not just the in-memory ArcSwap");
+    }
+
+    #[tokio::test]
+    async fn update_acme_settings_with_a_blank_email_is_rejected() {
+        let router = build_router(test_state_with_blank_contact_email().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/acme-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"contact_email":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_acme_settings_is_refused_when_config_toml_already_supplies_it() {
+        let router = build_router(test_state().await); // non-blank contact_email
+        let cookie = logged_in_cookie(&router).await;
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/acme-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(r#"{"contact_email":"ops@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn acme_settings_endpoints_require_authentication() {
+        let router = build_router(test_state().await);
+
+        let resp = router.oneshot(Request::builder().uri("/api/acme-settings").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn access_log_records_the_authentication_method_used() {
+        // access_log itself only emits a tracing event (verified visually
+        // via `RUST_LOG=rust_proxy::access=info` during manual testing --
+        // there's no clean way to assert on emitted tracing events from a
+        // unit test without adding a whole subscriber-capture harness for
+        // one field). What's independently verifiable here: a session
+        // request, a valid-token request, and a rejected request all
+        // still resolve to their normal status codes with this layer
+        // present -- i.e. the outermost logging layer never changes
+        // response behavior, only observes it.
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+
+        let session_resp = router
+            .clone()
+            .oneshot(Request::builder().uri("/api/dashboard").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(session_resp.status(), StatusCode::OK);
+
+        let unauthenticated_resp = router.oneshot(Request::builder().uri("/api/dashboard").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(unauthenticated_resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+- **Split logging into `proxy.log`/`access.log`/`server.log`, plus a
+  real per-request admin audit trail.** Everything used to go to one
+  interleaved stdout/journald stream. `logging::init` now additionally
+  writes three purpose-scoped files (daily-rotated, non-blocking) next
+  to the sqlite DB (no new config field or packaging change --
+  `/var/lib/rust-proxy` is already read-write for this daemon): `proxy.log`
+  (the data plane -- listeners, TLS, forwarding, WebSocket/passthrough,
+  plus ACME issuance/renewal) accepts `debug`-level events too, since
+  real `tracing::debug!` calls already exist on the connection-handling
+  hot paths and that's exactly the detail "especially for debugging"
+  wants -- without changing stdout/journald's own default verbosity;
+  `access.log` (new) is a dedicated admin API audit trail -- every
+  request through method, path, status, latency, and how it
+  authenticated (`session`/`token`/`unauthenticated`), which didn't
+  exist in any form before; `server.log` catches everything else
+  (startup/bootstrap, nftables sync, config loading). stdout/journald
+  keeps behaving exactly as before, unified and `info`-level by
+  default, still overridable via `RUST_LOG` -- these files are
+  additive. See `logging.rs` and `api::routes::access_log`.
+- **ACME contact email is now settable from the admin UI, not just
+  config.toml.** Same "config.toml wins if set, else DB-backed and
+  mutable via the API" precedence as the admin identity/setup wizard --
+  set it in the setup wizard's new optional field, or later from the
+  Certificates tab's new "ACME settings" section (`GET`/`PUT
+  /api/acme-settings`), disabled with an explanatory note when
+  config.toml already supplies it. A changed value takes effect the
+  next time an `AcmeClient` is built (a restart, or the next init retry
+  after an earlier failure) -- there's no RFC 8555 account-contact-update
+  call here, so an already-running client keeps using whatever email it
+  registered with until then; the UI's hint text says so. See
+  `state::AppState::acme_contact_email`/`set_acme_contact_email` and
+  `db::{load,set}_acme_contact_email`.
 - **Standalone DNS-01 certificates, decoupled from any host.** Built
   for wildcards -- issuing `*.example.com` used to require creating a
   throwaway `ProxyHost` just to get ACME to issue against that domain.

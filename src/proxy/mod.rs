@@ -518,7 +518,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let state = AppState::new(cfg, pool, vec![], vec![], None);
+        let state = AppState::new(cfg, pool, vec![], vec![], None, None);
         state.upsert_cert(domain.to_string(), {
             let entry = tls::self_signed_entry(domain);
             entry

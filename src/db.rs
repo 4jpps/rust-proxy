@@ -204,6 +204,24 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Single-row table (id is always 1) holding the DB-backed ACME
+    // contact email -- only ever consulted by
+    // `state::AppState::acme_contact_email` when config.toml's own
+    // `acme.contact_email` is blank, same precedence as admin_identity
+    // below. Settable at runtime from the admin UI's settings section
+    // or the setup wizard, unlike config.toml's own field which needs a
+    // restart to change.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS acme_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            contact_email TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Single-row table (id is always 1, enforced by the CHECK constraint
     // -- `create_admin_identity_if_absent` relies on it as the atomic
     // arbiter for "has this instance been set up yet"). Holds the admin
@@ -643,6 +661,24 @@ pub async fn create_admin_identity_if_absent(pool: &SqlitePool, username: &str, 
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+pub async fn load_acme_contact_email(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query("SELECT contact_email FROM acme_settings WHERE id = 1").fetch_optional(pool).await?;
+    Ok(row.map(|r| r.get("contact_email")))
+}
+
+/// Upserts the single settings row -- unlike `create_admin_identity_if_absent`
+/// this is meant to be changeable after first set (an operator revising
+/// a typo'd or outdated contact email), so a plain `INSERT ... ON
+/// CONFLICT(id) DO UPDATE` replaces it every call rather than only ever
+/// writing once.
+pub async fn set_acme_contact_email(pool: &SqlitePool, email: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO acme_settings (id, contact_email) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET contact_email = excluded.contact_email")
+        .bind(email)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// One-time upgrade path: any host with pre-ACL-system inline

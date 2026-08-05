@@ -477,7 +477,8 @@ async fn renew_standalone_certs_if_needed(state: &AppState, client: &AcmeClient,
 pub async fn init_acme_client(state: &AppState) -> Result<AcmeClient, IssuanceError> {
     let account_key = AccountKey::load_or_generate(&state.acme().account_key_path)?;
     let client = AcmeClient::new(&state.acme().directory_url, account_key).await?;
-    client.new_account(&state.acme().contact_email).await?;
+    let contact_email = state.acme_contact_email().unwrap_or_default();
+    client.new_account(&contact_email).await?;
     Ok(client)
 }
 
@@ -644,7 +645,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None)
+        AppState::new(cfg, pool, vec![], vec![], None, None)
     }
 
     // The bug this guards against: a blank/invalid `acme.contact_email`

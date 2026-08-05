@@ -69,6 +69,9 @@
       <input type="password" name="password" placeholder="admin password" required>
       <input type="password" name="password_confirm" placeholder="confirm password" required>
     </div>
+    <div class="inline">
+      <input type="email" name="acme_contact_email" placeholder="ACME contact email (e.g. admin@yourdomain.com)" title="Sent to Let's Encrypt when registering the ACME account -- required before any certificate (http-01 or dns-01) can be issued. Can be set/changed later from the Certificates tab's ACME settings section, unless acme.contact_email is set in config.toml.">
+    </div>
     <label class="chk"><input type="checkbox" id="setup-add-dns" name="add_dns"> Add a DNS-01 credential now</label>
     <div id="setup-dns-fields" style="display:none;flex-direction:column;align-items:flex-start;gap:0.6rem;width:100%">
       <div class="inline">
@@ -207,6 +210,19 @@
   </section>
 
   <section class="tab-panel" id="tab-certs">
+    <h2>ACME settings</h2>
+    <p class="hint">The contact email registered with Let's Encrypt for this instance's ACME
+      account -- required before any certificate (http-01 or dns-01) can be issued. Changing it
+      takes effect the next time the daemon (re)registers the account (a restart, or the next
+      retry after an earlier setup failure); it does not update an already-registered account's
+      contact immediately.</p>
+    <form id="acme-settings-form" class="inline">
+      <input type="email" name="contact_email" placeholder="admin@yourdomain.com" required>
+      <button type="submit">Save</button>
+      <span class="hint" id="acme-settings-note"></span>
+      <span class="error" id="acme-settings-error"></span>
+    </form>
+
     <h2>Certificates</h2>
     <table id="certs-table"><thead><tr><th>Domain</th><th>Expires</th><th>Days left</th><th></th></tr></thead><tbody></tbody></table>
     <p class="hint">ACME-issued certs appear here automatically. Upload a custom one (an
@@ -447,6 +463,9 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
     return;
   }
   const body = { username: fd.get('username'), password };
+  if (fd.get('acme_contact_email')) {
+    body.acme_contact_email = fd.get('acme_contact_email');
+  }
   if (fd.get('add_dns') === 'on' && fd.get('dns_name')) {
     const provider = fd.get('dns_provider');
     const token = packDnsCredentialToken(document.getElementById('setup-dns-cred-fields'), provider);
@@ -483,7 +502,7 @@ async function refreshAll() {
   // refreshStandaloneCerts) -- both must resolve before anything that
   // reads them, not run concurrently with it.
   await Promise.all([refreshAcls(), refreshDnsCredentials()]);
-  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts()]);
+  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts(), refreshAcmeSettings()]);
 }
 
 async function refreshDashboard() {
@@ -617,6 +636,34 @@ document.getElementById('rule-form').addEventListener('submit', async (e) => {
   const resp = await api('/api/port-rules', { method: 'POST', body: JSON.stringify(body) });
   if (resp.ok) { e.target.reset(); document.getElementById('rule-error').textContent = ''; refreshAll(); }
   else { document.getElementById('rule-error').textContent = (await resp.json()).error || 'failed'; }
+});
+
+async function refreshAcmeSettings() {
+  const settings = await (await api('/api/acme-settings')).json();
+  const form = document.getElementById('acme-settings-form');
+  const note = document.getElementById('acme-settings-note');
+  form.contact_email.value = settings.contact_email || '';
+  if (settings.from_config) {
+    form.contact_email.disabled = true;
+    form.querySelector('button').disabled = true;
+    note.textContent = 'Set via config.toml\'s acme.contact_email, which always takes precedence -- edit it there instead.';
+  } else {
+    form.contact_email.disabled = false;
+    form.querySelector('button').disabled = false;
+    note.textContent = '';
+  }
+}
+
+document.getElementById('acme-settings-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const resp = await api('/api/acme-settings', { method: 'PUT', body: JSON.stringify({ contact_email: fd.get('contact_email') }) });
+  if (resp.ok) {
+    document.getElementById('acme-settings-error').textContent = '';
+    refreshAcmeSettings();
+  } else {
+    document.getElementById('acme-settings-error').textContent = (await resp.json()).error || 'failed';
+  }
 });
 
 async function refreshCerts() {

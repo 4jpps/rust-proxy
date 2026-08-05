@@ -71,6 +71,13 @@ struct Inner {
     /// lock-free-read/copy-on-write pattern as `hosts`/`port_rules`/
     /// `certs` above.
     admin_identity_db: ArcSwap<Option<AdminIdentity>>,
+    /// Same "config.toml wins if set, else this DB-backed fallback"
+    /// precedence and `ArcSwap` reasoning as `admin_identity_db` --
+    /// `acme.contact_email` used to be config.toml-only; the admin UI's
+    /// settings section can now set/change it at runtime via
+    /// `set_acme_contact_email`, same as the setup wizard does for the
+    /// admin identity.
+    acme_contact_email_db: ArcSwap<Option<String>>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
     /// and `proxy::run`'s listener supervisor can both re-sync immediately
     /// instead of polling on a timer. `notify_waiters` (not `notify_one`)
@@ -93,7 +100,14 @@ impl AppState {
     /// `db` is expected to already hold whichever `hosts`/`port_rules`
     /// should be live at startup -- see `main.rs`'s "load from sqlite,
     /// seeding from config.toml only if the DB was empty" bootstrap.
-    pub fn new(cfg: Config, db: SqlitePool, hosts: Vec<ProxyHost>, port_rules: Vec<PortRule>, initial_admin_identity: Option<AdminIdentity>) -> Self {
+    pub fn new(
+        cfg: Config,
+        db: SqlitePool,
+        hosts: Vec<ProxyHost>,
+        port_rules: Vec<PortRule>,
+        initial_admin_identity: Option<AdminIdentity>,
+        initial_acme_contact_email: Option<String>,
+    ) -> Self {
         Self(Arc::new(Inner {
             network: cfg.network,
             admin: cfg.admin,
@@ -103,6 +117,7 @@ impl AppState {
             certs: ArcSwap::from_pointee(HashMap::new()),
             http01_challenges: ArcSwap::from_pointee(HashMap::new()),
             admin_identity_db: ArcSwap::from_pointee(initial_admin_identity),
+            acme_contact_email_db: ArcSwap::from_pointee(initial_acme_contact_email),
             config_dirty: Notify::new(),
             db,
             hosts_write_lock: Mutex::new(()),
@@ -161,6 +176,37 @@ impl AppState {
 
     pub fn acme(&self) -> &AcmeConfig {
         &self.0.acme
+    }
+
+    /// Resolves the contact email `acme::init_acme_client` registers the
+    /// ACME account under: config.toml's `acme.contact_email` wins
+    /// outright whenever it's non-empty (checked fresh on every call,
+    /// same precedence rule `admin_identity` uses), otherwise whatever's
+    /// currently in the DB-backed `ArcSwap` (`None` until an operator
+    /// sets one via the admin UI's settings section or the setup
+    /// wizard). A changed value only takes effect the next time an
+    /// `AcmeClient` is built (daemon startup, or the next time
+    /// `run_renewal_loop`'s init retry loop runs after an earlier
+    /// failure) -- this daemon has no RFC 8555 account-contact-update
+    /// call, so an already-registered, already-running client keeps
+    /// using whatever email it registered with until then.
+    pub fn acme_contact_email(&self) -> Option<String> {
+        let configured = self.0.acme.contact_email.trim();
+        if !configured.is_empty() {
+            return Some(configured.to_string());
+        }
+        (*self.0.acme_contact_email_db.load_full()).clone()
+    }
+
+    /// Publishes a newly-set (or changed) DB-backed ACME contact email,
+    /// visible to every subsequent `acme_contact_email()` call
+    /// immediately -- used by the admin UI's settings section and the
+    /// setup wizard's optional step. Has no effect on what
+    /// `acme_contact_email()` returns whenever config.toml supplies its
+    /// own non-empty `contact_email` (that branch is checked first,
+    /// always).
+    pub fn set_acme_contact_email(&self, email: String) {
+        self.0.acme_contact_email_db.store(Arc::new(Some(email)));
     }
 
     pub fn hosts(&self) -> Arc<Vec<ProxyHost>> {
@@ -268,7 +314,7 @@ mod tests {
 
     async fn test_state() -> AppState {
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(test_config(), pool, vec![], vec![], None)
+        AppState::new(test_config(), pool, vec![], vec![], None, None)
     }
 
     #[tokio::test]
@@ -393,7 +439,7 @@ mod tests {
         cfg.admin.admin_username = None;
         cfg.admin.admin_password_hash = None;
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let state = AppState::new(cfg, pool, vec![], vec![], None);
+        let state = AppState::new(cfg, pool, vec![], vec![], None, None);
 
         assert!(state.admin_identity().is_none());
     }
@@ -405,7 +451,7 @@ mod tests {
         cfg.admin.admin_username = None;
         cfg.admin.admin_password_hash = None;
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let state = AppState::new(cfg, pool, vec![], vec![], None);
+        let state = AppState::new(cfg, pool, vec![], vec![], None, None);
 
         state.set_admin_identity(AdminIdentity {
             username: "wizard-admin".into(),
@@ -432,5 +478,38 @@ mod tests {
 
         let identity = state.admin_identity().unwrap();
         assert_eq!(identity.username, "admin", "config.toml's identity must still win");
+    }
+
+    async fn test_state_with_blank_contact_email() -> AppState {
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let mut cfg = test_config();
+        cfg.acme.contact_email = String::new();
+        AppState::new(cfg, pool, vec![], vec![], None, None)
+    }
+
+    #[tokio::test]
+    async fn acme_contact_email_comes_from_config_when_set() {
+        let state = test_state().await; // test_config() sets a non-empty contact_email
+        assert_eq!(state.acme_contact_email().as_deref(), Some("admin@example.com"));
+    }
+
+    #[tokio::test]
+    async fn acme_contact_email_is_none_when_config_is_blank_and_the_db_has_nothing_yet() {
+        let state = test_state_with_blank_contact_email().await;
+        assert!(state.acme_contact_email().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_acme_contact_email_is_visible_immediately_when_config_is_blank() {
+        let state = test_state_with_blank_contact_email().await;
+        state.set_acme_contact_email("ops@example.com".into());
+        assert_eq!(state.acme_contact_email().as_deref(), Some("ops@example.com"));
+    }
+
+    #[tokio::test]
+    async fn config_supplied_contact_email_always_wins_even_after_set_acme_contact_email_is_called() {
+        let state = test_state().await; // config's contact_email is non-empty
+        state.set_acme_contact_email("db-email@example.com".into());
+        assert_eq!(state.acme_contact_email().as_deref(), Some("admin@example.com"), "config.toml's contact_email must still win");
     }
 }

@@ -175,6 +175,26 @@ would otherwise silently overwrite it. Every cert (ACME-issued or
 uploaded) is written to `acme.cert_dir` and reloaded from there on
 startup, so a restart never re-issues or "forgets" one.
 
+### Logging
+
+stdout (journald under `systemd`) behaves exactly as always -- unified,
+`info`-level by default, overridable via `RUST_LOG`. In addition,
+`logging::init` writes three purpose-scoped, daily-rotated files
+alongside the sqlite DB (`admin.db_path`'s directory -- already
+read-write for this daemon, no separate config field or packaging
+change needed):
+
+- **`proxy.log`** -- the data plane (listeners, TLS, forwarding,
+  WebSocket/passthrough) plus ACME issuance/renewal. Also accepts
+  `debug`-level events (real connection-handling `tracing::debug!`
+  calls already exist), without touching stdout/journald's own default
+  verbosity.
+- **`access.log`** -- every admin API request: method, path, status,
+  latency, and how it authenticated (`session`/`token`/`unauthenticated`).
+  The daemon's only per-request admin audit trail.
+- **`server.log`** -- everything else: startup/bootstrap, nftables
+  sync, config loading.
+
 ## API
 
 Every route under `/api/*` except `/api/login`/`/api/logout` requires
@@ -244,6 +264,8 @@ response shapes match the `HostRequest`/`PortRuleRequest` fields in
 | GET    | `/api/dns01-certs`      | -- (`{id, domain, dns_credential_id, created_at}` per tracked standalone cert)             |
 | POST   | `/api/dns01-certs`      | `{"domain","dns_credential_id"}` -- issues synchronously (can take up to a minute); only persists on success |
 | DELETE | `/api/dns01-certs/:id`  | -- stops renewal tracking only; the already-issued cert keeps working                     |
+| GET    | `/api/acme-settings`    | -- (`{contact_email, from_config}`; `from_config: true` means config.toml wins, edits here are refused) |
+| PUT    | `/api/acme-settings`    | `{"contact_email"}` -- 409 if config.toml already supplies `acme.contact_email`            |
 
 ```sh
 curl -X POST https://proxy.example.com/api/hosts \

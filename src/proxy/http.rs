@@ -224,7 +224,7 @@ mod tests {
             port_rules: vec![],
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        AppState::new(cfg, pool, vec![], vec![], None)
+        AppState::new(cfg, pool, vec![], vec![], None, None)
     }
 
     #[tokio::test]

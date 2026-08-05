@@ -67,17 +67,19 @@ pub async fn load_persisted_admin_identity(db_pool: &SqlitePool) -> Result<Optio
 }
 
 /// Full startup sequence: connect the DB, load/seed hosts + port_rules
-/// + the default DNS credential, resolve the persisted admin identity,
-/// build `AppState`, and load certs from disk. Everything `main()`
-/// needs before it can spawn the long-running service tasks.
+/// + the default DNS credential, resolve the persisted admin identity
+/// and ACME contact email, build `AppState`, and load certs from disk.
+/// Everything `main()` needs before it can spawn the long-running
+/// service tasks.
 pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
     let db_pool = crate::db::connect(&cfg.admin.db_path).await?;
 
     let (hosts, port_rules) = load_or_seed_hosts_and_port_rules(&db_pool, &cfg).await?;
     seed_default_dns_credential_if_configured(&db_pool, &cfg).await?;
     let admin_identity = load_persisted_admin_identity(&db_pool).await?;
+    let acme_contact_email = crate::db::load_acme_contact_email(&db_pool).await?;
 
-    let state = AppState::new(cfg, db_pool, hosts, port_rules, admin_identity);
+    let state = AppState::new(cfg, db_pool, hosts, port_rules, admin_identity, acme_contact_email);
     crate::acme::load_certs_from_disk(&state)?;
     Ok(state)
 }
