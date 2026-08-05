@@ -225,12 +225,29 @@ async fn handle_https_request(
     // about which *host* a given request routes to. `sni` remains the
     // fallback for the rare case a request genuinely has no `Host`
     // header at all (HTTP/1.0).
-    let lookup_name = host_header.or(sni);
+    let lookup_name = host_header.clone().or_else(|| sni.clone());
 
     let hosts = state.hosts();
     let matched = lookup_name
         .as_deref()
         .and_then(|name| router::match_host(&hosts, bind_ip, bind_port, name));
+
+    // The daemon's only per-request routing-decision log -- exactly
+    // what's needed to diagnose "request for X got routed to Y" without
+    // reasoning about it in the abstract: sni is the TLS connection's
+    // own (possibly stale, see above), host_header is what this
+    // specific request actually asked for, and matched_domain is what
+    // it was actually routed to. debug-level, so it only lands in
+    // proxy.log (see logging.rs), not stdout/journald.
+    tracing::debug!(
+        %bind_ip,
+        bind_port,
+        %peer_ip,
+        sni = sni.as_deref().unwrap_or("<none>"),
+        host_header = host_header.as_deref().unwrap_or("<none>"),
+        matched_domain = matched.map(|h| h.domain.as_str()).unwrap_or("<no match>"),
+        "routing decision"
+    );
 
     let Some(host) = matched else {
         return Ok(not_found());
