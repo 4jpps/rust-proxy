@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **`main.rs` startup sequencing pulled into a new `bootstrap` module.**
+  DB connect + seed/load hosts+port_rules+the default DNS credential +
+  resolve the admin identity + load certs from disk used to all be
+  inlined in `main()`; each step is now its own small, independently
+  named, independently unit-tested function
+  (`bootstrap::load_or_seed_hosts_and_port_rules`,
+  `seed_default_dns_credential_if_configured`,
+  `load_persisted_admin_identity`, `build_app_state`), so reviewing "did
+  startup seed/load things correctly" means reading one focused
+  function instead of tracing mutable state through `main()`'s whole
+  body. `main()` itself is now purely: parse args, init logging, load
+  config, call `bootstrap::build_app_state`, validate nftables, spawn
+  the service tasks. Every DNS-01 provider was already its own module
+  (`src/acme/dns01/{cloudflare,digitalocean,hetzner,duckdns,godaddy,namecheap,route53}.rs`)
+  from earlier work this cycle -- confirmed, not something this change
+  needed to add.
 - **Per-provider DNS credential fields, not a hand-packed token
   string.** The DNS Credentials form (and the setup wizard's optional
   DNS step) used to have one generic "token" text box, with Namecheap

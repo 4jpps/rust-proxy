@@ -1,5 +1,6 @@
 mod acme;
 mod api;
+mod bootstrap;
 mod config;
 mod db;
 mod nftables;
@@ -48,39 +49,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(config = %args.config.display(), "starting rust-proxy");
 
     let cfg = config::Config::load(&args.config)?;
-    let db_pool = db::connect(&cfg.admin.db_path).await?;
-
-    // sqlite is the source of truth for hosts/port_rules after first boot;
-    // config.toml's inline entries (if any) only ever seed an empty DB so
-    // day-one deployments don't have to start from a blank admin UI.
-    let mut hosts = db::load_hosts(&db_pool).await?;
-    let mut port_rules = db::load_port_rules(&db_pool).await?;
-    if hosts.is_empty() && !cfg.hosts.is_empty() {
-        db::save_hosts(&db_pool, &cfg.hosts).await?;
-        hosts = cfg.hosts.clone();
-    }
-    if port_rules.is_empty() && !cfg.port_rules.is_empty() {
-        db::save_port_rules(&db_pool, &cfg.port_rules).await?;
-        port_rules = cfg.port_rules.clone();
-    }
-
-    // config.toml's dns_provider/dns_api_token (if set) seed a "default"
-    // dns_credentials row, idempotently -- zero config.toml changes
-    // needed for an existing single-provider deployment. Omitted/blank
-    // dns_api_token means no implicit row; credentials must then come
-    // from the DB (admin UI or setup wizard) instead.
-    if !cfg.acme.dns_api_token.trim().is_empty() {
-        db::seed_default_dns_credential(&db_pool, cfg.acme.dns_provider, &cfg.acme.dns_api_token).await?;
-    }
-
-    let db_admin_identity = db::load_admin_identity(&db_pool).await?.map(|row| state::AdminIdentity {
-        username: row.username,
-        password_hash: row.password_hash,
-        session_secret: row.session_secret,
-    });
-
-    let state = state::AppState::new(cfg, db_pool, hosts, port_rules, db_admin_identity);
-    acme::load_certs_from_disk(&state)?;
+    // Everything needed before the long-running service tasks can
+    // start (DB connect, seed/load hosts+port_rules+the default DNS
+    // credential, resolve the admin identity, load certs from disk) --
+    // see bootstrap.rs, which exists specifically so each of those
+    // steps is independently named, reviewed, and unit-tested rather
+    // than inlined here.
+    let state = bootstrap::build_app_state(cfg).await?;
 
     // One clear, loud message right at boot if nftables isn't usable,
     // instead of that only surfacing buried in `nftables sync failed`
