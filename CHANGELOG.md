@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+- **Fixed a real production bug: HTTP/2-split `Cookie` headers were
+  forwarded to the upstream as multiple separate `Cookie:` lines
+  instead of being merged into one.** RFC 7540 §8.1.2.5 permits an
+  HTTP/2 client to split its `Cookie` header into several HTTP/2
+  header fields for better HPACK compression -- real Chromium and
+  Firefox both do this; curl, httpx, and Node's `fetch` do not, which
+  is why this went undetected by every scripted test. Rack/Rails (and
+  most HTTP/1.1 server frameworks) only read the first `Cookie:` line
+  off the wire, silently discarding the rest. Confirmed as a real
+  production bug against a GitLab instance behind this proxy: every
+  real browser hit a 100%-reproducible 422 `InvalidAuthenticityToken`
+  on login, because the session cookie (which happened to land second
+  of four split fields) was completely invisible to GitLab -- it saw
+  no session at all and rejected the CSRF token issued for it. A raw
+  TCP byte capture of this proxy's own forwarded request confirmed the
+  four separate `cookie:` lines on the wire; bypassing this proxy with
+  a minimal from-scratch HTTP/2 proxy that merges cookies correctly
+  fixed the same request instantly. `forward_http` now merges all
+  `cookie` header values into one `Cookie: a; b; c` line, per spec,
+  before forwarding to any HTTP/1.1 upstream. See
+  `proxy::http::merge_split_cookie_headers`.
+- **Added a per-host `rewrite_samesite_none_cookies` option**,
+  downgrading `SameSite=None` to `SameSite=Lax` on every `Set-Cookie`
+  response header for hosts that opt in. Real incident this exists
+  for: an upstream application set `SameSite=None` unconditionally on
+  its session cookie (an obsolete Chrome-v80-era compatibility
+  workaround baked into that application, not anything this proxy
+  controls), which modern browsers can silently drop even in ordinary
+  first-party use -- confirmed via server-side logging showing a valid
+  session cookie in the response but completely absent from the
+  client's next request. Deliberately a generic proxy-level feature
+  rather than a patch to the specific upstream application, so any
+  operator hitting the same issue with a different backend can use it
+  too. See `config::ProxyHost::rewrite_samesite_none_cookies` and
+  `proxy::http::rewrite_samesite_none_to_lax`.
+- **The real client IP is now forwarded to every upstream** via
+  `X-Forwarded-For` (appended to, never replacing, any existing chain,
+  since this proxy's own hop is the only one it can vouch for),
+  `X-Forwarded-Proto: https`, and `X-Forwarded-Host` (the client's
+  original declared host, captured before any `preserve_host: false`
+  rewriting). Previously upstream applications saw every request as
+  coming from the proxy's own address, which broke per-client IP
+  logging, rate limiting, and access control at the application layer.
+  See `proxy::http::forward_http` and `UpstreamOptions::client_ip`.
+- **Fixed a real production bug: an HTTP/2 request's absolute-form URI
+  was forwarded verbatim to an HTTP/1.1 upstream.** A real HTTP/2
+  client's request target is absolute-form (scheme + authority +
+  path); forwarding that unchanged produces an HTTP/1.1 request line
+  meant for a forward proxy, not an origin server. Confirmed as a real
+  bug via a Proxmox upstream (`pveproxy`) correctly rejecting it with
+  "invalid proxy uri", while nginx (a different upstream) silently
+  tolerated the malformed request line -- meaning this had been
+  quietly working by accident for every nginx-backed host and only
+  surfaced once a stricter upstream was added. `forward_http` now
+  downgrades any absolute-form request URI to origin-form (path +
+  query only) before forwarding. New test drives a real h2 connection
+  through a raw-TCP-listening mock upstream and confirms the exact
+  wire-level request line.
+
 - **Fixed a real production bug: a genuine HTTP/2 request forwarded to
   the upstream with no `Host` header at all.** Real HTTP/2 clients
   (every modern browser) declare their target host via the `:authority`
