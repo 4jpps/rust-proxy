@@ -82,6 +82,62 @@ pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
     has_upgrade_header && has_connection_upgrade
 }
 
+/// Merges any split `cookie` request headers into a single header line
+/// before the request is forwarded to an HTTP/1.1 upstream.
+///
+/// RFC 7540 §8.1.2.5 explicitly permits an HTTP/2 client to split the
+/// `Cookie` header into multiple separate HTTP/2 header fields (it
+/// improves HPACK compression), and REQUIRES an intermediary that
+/// translates the request to HTTP/1.1 -- exactly what this proxy does,
+/// since it always speaks HTTP/1.1 upstream regardless of what the
+/// client used -- to reconstitute a single `Cookie` header by joining
+/// the field values with `"; "` before forwarding. Real Chromium and
+/// Firefox both split cookies this way over h2; curl, httpx, and
+/// Node's `fetch` do not, which is exactly why this went undetected by
+/// every scripted reproduction attempt and only ever failed for real
+/// browser users.
+///
+/// Real production incident this exists for: GitLab logins behind this
+/// proxy failed with a 422 `InvalidAuthenticityToken` for every real
+/// browser, 100% reproducibly, while the identical token+cookie pair
+/// replayed via httpx always succeeded. A raw TCP byte capture of what
+/// this proxy actually forwarded showed the client's real session
+/// cookie arriving as the *second* of four separate `cookie:` header
+/// lines on the wire; Rack (GitLab's HTTP layer, like most HTTP/1.1
+/// server frameworks) only reads the first `Cookie:` line, so the
+/// session cookie was completely invisible to GitLab -- it saw no
+/// session at all, and rejected the CSRF token that had been issued
+/// for a session it could no longer see. Bypassing this proxy entirely
+/// with a minimal from-scratch HTTP/2 proxy that correctly merges
+/// cookies fixed the same request instantly, confirming this proxy was
+/// the faulty component.
+///
+/// A no-op when the request had zero or one `cookie` header to begin
+/// with (the common case for HTTP/1.1 clients, and any h2 client that
+/// didn't choose to split its cookies).
+fn merge_split_cookie_headers(req: &mut Request<Incoming>) {
+    let mut values = req.headers().get_all(hyper::header::COOKIE).iter();
+    let Some(first) = values.next() else { return };
+    let Some(second) = values.next() else { return };
+
+    let mut merged = Vec::new();
+    if let Ok(s) = first.to_str() {
+        merged.push(s.to_string());
+    }
+    if let Ok(s) = second.to_str() {
+        merged.push(s.to_string());
+    }
+    for value in values {
+        if let Ok(s) = value.to_str() {
+            merged.push(s.to_string());
+        }
+    }
+
+    let Ok(value) = hyper::header::HeaderValue::from_str(&merged.join("; ")) else { return };
+    req.headers_mut().remove(hyper::header::COOKIE);
+    req.headers_mut().insert(hyper::header::COOKIE, value);
+}
+
 /// Downgrades `SameSite=None` to `SameSite=Lax` on every `Set-Cookie`
 /// response header -- see `config::ProxyHost::rewrite_samesite_none_cookies`'s
 /// doc comment for why an operator would opt a host into this. Every
@@ -153,6 +209,8 @@ pub async fn forward_http(
     upstream: SocketAddr,
     opts: UpstreamOptions<'_>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, BoxError> {
+    merge_split_cookie_headers(&mut req);
+
     // Captured before any Host-header rewriting below so `X-Forwarded-Host`
     // always reflects what the client actually declared, even when
     // `preserve_host` is false and the literal `Host` header sent
@@ -1283,6 +1341,79 @@ mod tests {
         let resp = sender.send_request(req).await.unwrap();
 
         assert_eq!(resp.status(), 200, "upstream only returns 200 if it saw an origin-form request line -- see the mock's own check");
+    }
+
+    #[tokio::test]
+    async fn forward_http_merges_an_h2_requests_split_cookie_headers_into_one_http1_cookie_line() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request_text = String::from_utf8_lossy(&buf[..n]);
+            let cookie_lines: Vec<&str> = request_text
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+                .collect();
+            let response = if cookie_lines.len() == 1
+                && cookie_lines[0] == "cookie: preferred_language=en; _gitlab_session=abc123; other=xyz"
+            {
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+            } else {
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n"
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: false,
+                    tls_verify: true,
+                    upstream_host_port: "unused:0",
+                    preserve_host: true,
+                    client_ip: "127.0.0.1".parse().unwrap(),
+                    rewrite_samesite_none_cookies: false,
+                };
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+                .unwrap();
+        });
+
+        let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(tcp);
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+
+        // Real HTTP/2 clients (RFC 7540 §8.1.2.5) may split Cookie into
+        // several header fields for better HPACK compression -- hyper's
+        // h2 client lets us build a request with multiple `cookie`
+        // header values the same way.
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://gitlab.jpps.us/users/sign_in")
+            .header(hyper::header::COOKIE, "preferred_language=en")
+            .header(hyper::header::COOKIE, "_gitlab_session=abc123")
+            .header(hyper::header::COOKIE, "other=xyz")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        assert_eq!(resp.status(), 200, "upstream only returns 200 if it saw a single merged Cookie header -- see the mock's own check");
     }
 
     fn self_signed_server_config(domain: &str) -> rustls::ServerConfig {
