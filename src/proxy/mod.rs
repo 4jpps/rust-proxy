@@ -327,6 +327,7 @@ async fn handle_https_request(
         tls_verify: host.upstream_tls_verify,
         upstream_host_port: &host.upstream,
         preserve_host: host.upstream_preserve_host,
+        client_ip: peer_ip,
     };
     match http::forward_http(req, upstream, opts).await {
         Ok(resp) => Ok(resp),

@@ -48,6 +48,15 @@ pub struct UpstreamOptions<'a> {
     /// (the existing, unchanged behavior). `false` rewrites it to
     /// `upstream_host_port` instead -- `config::ProxyHost::upstream_preserve_host`.
     pub preserve_host: bool,
+    /// The real client's connecting IP (`peer_ip` in `handle_https_request`)
+    /// -- appended to `X-Forwarded-For` and used to synthesize
+    /// `X-Forwarded-Proto`/`X-Forwarded-Host` so upstream applications can
+    /// see who actually made the request instead of every request
+    /// appearing to originate from this proxy's own IP. Every host this
+    /// proxy forwards to sits behind it -- there's no config knob to
+    /// disable this, unlike `preserve_host` (which controls the `Host`
+    /// header's own semantics for routing, a separate concern).
+    pub client_ip: std::net::IpAddr,
 }
 
 pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
@@ -76,6 +85,20 @@ pub async fn forward_http(
     upstream: SocketAddr,
     opts: UpstreamOptions<'_>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, BoxError> {
+    // Captured before any Host-header rewriting below so `X-Forwarded-Host`
+    // always reflects what the client actually declared, even when
+    // `preserve_host` is false and the literal `Host` header sent
+    // upstream gets rewritten to the upstream's own address instead.
+    let original_host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().host().map(|h| match req.uri().port_u16() {
+            Some(port) => format!("{h}:{port}"),
+            None => h.to_string(),
+        }));
+
     if !opts.preserve_host {
         let value = hyper::header::HeaderValue::from_str(opts.upstream_host_port)?;
         req.headers_mut().insert(hyper::header::HOST, value);
@@ -102,6 +125,34 @@ pub async fn forward_http(
             if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
                 req.headers_mut().insert(hyper::header::HOST, value);
             }
+        }
+    }
+
+    // Every proxied host sits behind this proxy from the upstream's point
+    // of view, so without this every request would appear to originate
+    // from this proxy's own IP -- breaking any upstream feature that
+    // reasons about the real client (audit logs, IP-based rate limiting,
+    // abuse detection). `X-Forwarded-For` is appended to (not replacing)
+    // any value the client already sent, matching standard proxy
+    // convention -- a well-behaved upstream configured with this proxy's
+    // IP as a trusted proxy hop reads the right-most/newest entry as the
+    // real client, so an earlier hop's genuine chain is preserved and a
+    // client-spoofed value can't be passed off as this proxy's own
+    // trusted observation. `handle_https_request` (this function's only
+    // caller) only ever runs for genuine HTTPS client connections --
+    // the plain-HTTP listener is redirect-only (`https_redirect_response`)
+    // and never reaches here -- so `X-Forwarded-Proto` is always `https`.
+    let xff_value = match req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        Some(existing) if !existing.is_empty() => format!("{existing}, {}", opts.client_ip),
+        _ => opts.client_ip.to_string(),
+    };
+    if let Ok(value) = hyper::header::HeaderValue::from_str(&xff_value) {
+        req.headers_mut().insert("x-forwarded-for", value);
+    }
+    req.headers_mut().insert("x-forwarded-proto", hyper::header::HeaderValue::from_static("https"));
+    if let Some(host) = original_host {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&host) {
+            req.headers_mut().insert("x-forwarded-host", value);
         }
     }
 
@@ -552,6 +603,7 @@ mod tests {
                     tls_verify: true,
                     upstream_host_port: &upstream_host_port,
                     preserve_host: true,
+                    client_ip: "127.0.0.1".parse().unwrap(),
                 };
                 forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
             });
@@ -603,6 +655,7 @@ mod tests {
                     tls_verify: true,
                     upstream_host_port: "backend.internal:9999",
                     preserve_host: false,
+                    client_ip: "127.0.0.1".parse().unwrap(),
                 };
                 forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
             });
@@ -662,6 +715,7 @@ mod tests {
                     tls_verify: true,
                     upstream_host_port: "unused:0",
                     preserve_host: true,
+                    client_ip: "127.0.0.1".parse().unwrap(),
                 };
                 forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
             });
@@ -709,6 +763,72 @@ mod tests {
     /// upstream socket (not `Request::uri()` as re-parsed by a hyper
     /// H1 *server*, which could silently normalize the very thing under
     /// test) to prove the request line is origin-form on the wire.
+    /// Every proxied host's upstream must see who really made the
+    /// request -- without this, every request looks like it came from
+    /// this proxy's own IP, breaking any upstream feature that reasons
+    /// about the real client (audit logs, IP-based rate limiting, abuse
+    /// detection). Also verifies `X-Forwarded-For` is appended to (not
+    /// clobbering) a value the client already sent, and that
+    /// `X-Forwarded-Proto`/`X-Forwarded-Host` are set correctly.
+    #[tokio::test]
+    async fn forward_http_sets_x_forwarded_headers_for_the_real_client() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(|req: Request<Incoming>| async move {
+                let xff = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let xfp = req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let xfh = req.headers().get("x-forwarded-host").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder().status(200).header("x-seen-xff", xff).header("x-seen-xfp", xfp).header("x-seen-xfh", xfh).body(body).unwrap(),
+                )
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: false,
+                    tls_verify: true,
+                    upstream_host_port: "unused:0",
+                    preserve_host: true,
+                    client_ip: "203.0.113.42".parse().unwrap(),
+                };
+                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        });
+
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+
+        // The client already declares an (untrusted) X-Forwarded-For --
+        // this proxy's own observed IP must be appended, not substituted.
+        let req = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "public.example.com")
+            .header("x-forwarded-for", "198.51.100.7")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("x-seen-xff").unwrap(), "198.51.100.7, 203.0.113.42", "must append the real peer IP, not replace an existing chain");
+        assert_eq!(resp.headers().get("x-seen-xfp").unwrap(), "https");
+        assert_eq!(resp.headers().get("x-seen-xfh").unwrap(), "public.example.com");
+    }
+
     #[tokio::test]
     async fn forward_http_downgrades_an_h2_requests_absolute_form_uri_to_origin_form_for_the_http1_upstream() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -733,7 +853,7 @@ mod tests {
             let (stream, _) = proxy_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             let service = service_fn(move |req: Request<Incoming>| async move {
-                let opts = UpstreamOptions { websockets_enabled: false, https: false, tls_verify: true, upstream_host_port: "unused:0", preserve_host: true };
+                let opts = UpstreamOptions { websockets_enabled: false, https: false, tls_verify: true, upstream_host_port: "unused:0", preserve_host: true, client_ip: "127.0.0.1".parse().unwrap() };
                 forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
             });
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -803,6 +923,7 @@ mod tests {
                     tls_verify,
                     upstream_host_port: "upstream.internal:0",
                     preserve_host: true,
+                    client_ip: "127.0.0.1".parse().unwrap(),
                 };
                 forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
             });
