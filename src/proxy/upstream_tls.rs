@@ -19,7 +19,11 @@ pub fn verified_client_config() -> Arc<ClientConfig> {
         .get_or_init(|| {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
         })
         .clone()
 }
@@ -32,7 +36,14 @@ pub fn verified_client_config() -> Arc<ClientConfig> {
 pub fn insecure_client_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     CONFIG
-        .get_or_init(|| Arc::new(ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoServerCertVerification)).with_no_client_auth()))
+        .get_or_init(|| {
+            Arc::new(
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoServerCertVerification))
+                    .with_no_client_auth(),
+            )
+        })
         .clone()
 }
 
@@ -51,11 +62,21 @@ impl ServerCertVerifier for NoServerCertVerification {
         Ok(ServerCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(&self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
         Ok(HandshakeSignatureValid::assertion())
     }
 
-    fn verify_tls13_signature(&self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
         Ok(HandshakeSignatureValid::assertion())
     }
 

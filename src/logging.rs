@@ -54,26 +54,43 @@ pub fn init(log_dir: &Path) -> anyhow::Result<LogGuards> {
     std::fs::create_dir_all(log_dir)?;
 
     let stdout_layer = tracing_subscriber::fmt::layer().with_filter(
-        EnvFilter::from_default_env().add_directive("rust_proxy=info".parse().expect("valid built-in directive")),
+        EnvFilter::from_default_env()
+            .add_directive("rust_proxy=info".parse().expect("valid built-in directive")),
     );
 
-    let (proxy_writer, proxy_guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "proxy.log"));
-    let proxy_layer = tracing_subscriber::fmt::layer().with_writer(proxy_writer).with_ansi(false).with_filter(FilterFn::new(|meta| {
-        is_proxy_target(meta.target()) && *meta.level() <= tracing::Level::DEBUG
-    }));
+    let (proxy_writer, proxy_guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "proxy.log"));
+    let proxy_layer = tracing_subscriber::fmt::layer()
+        .with_writer(proxy_writer)
+        .with_ansi(false)
+        .with_filter(FilterFn::new(|meta| {
+            is_proxy_target(meta.target()) && *meta.level() <= tracing::Level::DEBUG
+        }));
 
-    let (access_writer, access_guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "access.log"));
+    let (access_writer, access_guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "access.log"));
     let access_layer = tracing_subscriber::fmt::layer()
         .with_writer(access_writer)
         .with_ansi(false)
         .with_filter(FilterFn::new(|meta| is_access_target(meta.target())));
 
-    let (server_writer, server_guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "server.log"));
-    let server_layer = tracing_subscriber::fmt::layer().with_writer(server_writer).with_ansi(false).with_filter(FilterFn::new(|meta| {
-        !is_proxy_target(meta.target()) && !is_access_target(meta.target()) && *meta.level() <= tracing::Level::INFO
-    }));
+    let (server_writer, server_guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily(log_dir, "server.log"));
+    let server_layer = tracing_subscriber::fmt::layer()
+        .with_writer(server_writer)
+        .with_ansi(false)
+        .with_filter(FilterFn::new(|meta| {
+            !is_proxy_target(meta.target())
+                && !is_access_target(meta.target())
+                && *meta.level() <= tracing::Level::INFO
+        }));
 
-    tracing_subscriber::registry().with(stdout_layer).with(proxy_layer).with(access_layer).with(server_layer).init();
+    tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(proxy_layer)
+        .with(access_layer)
+        .with(server_layer)
+        .init();
 
     Ok(LogGuards {
         _proxy: proxy_guard,
@@ -102,9 +119,21 @@ mod tests {
 
     #[test]
     fn unrelated_targets_are_neither_proxy_nor_access() {
-        for target in ["rust_proxy::nftables", "rust_proxy::db", "rust_proxy::api::routes", "rust_proxy::bootstrap", "rust_proxy"] {
-            assert!(!is_proxy_target(target), "{target} should not be a proxy target");
-            assert!(!is_access_target(target), "{target} should not be an access target");
+        for target in [
+            "rust_proxy::nftables",
+            "rust_proxy::db",
+            "rust_proxy::api::routes",
+            "rust_proxy::bootstrap",
+            "rust_proxy",
+        ] {
+            assert!(
+                !is_proxy_target(target),
+                "{target} should not be a proxy target"
+            );
+            assert!(
+                !is_access_target(target),
+                "{target} should not be an access target"
+            );
         }
     }
 }

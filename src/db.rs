@@ -16,7 +16,10 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::config::{AcmeChallengeType, AclKind, AclList, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost, RedirectStatus, RedirectTarget};
+use crate::config::{
+    AclKind, AclList, AcmeChallengeType, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost,
+    RedirectStatus, RedirectTarget,
+};
 
 pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let url = if db_path.as_os_str() == ":memory:" {
@@ -28,7 +31,10 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         format!("sqlite://{}", db_path.display())
     };
     let options = SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
-    let pool = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await?;
     run_migrations(&pool).await?;
     Ok(pool)
 }
@@ -47,7 +53,9 @@ pub async fn backup_to(pool: &SqlitePool, destination: &Path) -> Result<(), sqlx
     // embedded single quotes, the same escaping SQL string literals
     // always use) and interpolated directly.
     let escaped = destination.to_string_lossy().replace('\'', "''");
-    sqlx::query(&format!("VACUUM INTO '{escaped}'")).execute(pool).await?;
+    sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -96,17 +104,48 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // Ignore the error when a column's already there (sqlite has no
     // `ADD COLUMN IF NOT EXISTS`); the defaults above only apply to
     // genuinely new tables, so this also backfills existing rows.
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acme_challenge_type TEXT NOT NULL DEFAULT 'auto'").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_target TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_preserve_path INTEGER NOT NULL DEFAULT 1").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_status TEXT NOT NULL DEFAULT 'permanent'").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN dns_credential_id TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_https INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_tls_verify INTEGER NOT NULL DEFAULT 1").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_preserve_host INTEGER NOT NULL DEFAULT 1").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
+    let _ = sqlx::query(
+        "ALTER TABLE hosts ADD COLUMN acme_challenge_type TEXT NOT NULL DEFAULT 'auto'",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN redirect_target TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query(
+        "ALTER TABLE hosts ADD COLUMN redirect_preserve_path INTEGER NOT NULL DEFAULT 1",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "ALTER TABLE hosts ADD COLUMN redirect_status TEXT NOT NULL DEFAULT 'permanent'",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN dns_credential_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_https INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    let _ =
+        sqlx::query("ALTER TABLE hosts ADD COLUMN upstream_tls_verify INTEGER NOT NULL DEFAULT 1")
+            .execute(pool)
+            .await;
+    let _ = sqlx::query(
+        "ALTER TABLE hosts ADD COLUMN upstream_preserve_host INTEGER NOT NULL DEFAULT 1",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v4 TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN bind_ip_v6 TEXT")
+        .execute(pool)
+        .await;
     // Copy any pre-existing single-family `bind_ip` value (a real
     // column only on a table created before this cleanup -- a fresh
     // install's CREATE TABLE above no longer has it) into `bind_ip_v4`
@@ -114,12 +153,25 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // original bind is preserved as its v4 half instead of lost. Errors
     // harmlessly on a fresh table (no such column), same as everything
     // else here.
-    let _ = sqlx::query("UPDATE hosts SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
+    let _ = sqlx::query(
+        "UPDATE hosts SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL",
+    )
+    .execute(pool)
+    .await;
     // Both NULL means no rewrite (ProxyHost.path_rewrite is None); both
     // set together (the API layer never persists just one) means it is.
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_pattern TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_replacement TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN static_root TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_pattern TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN path_rewrite_replacement TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN static_root TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN rewrite_samesite_none_cookies INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
     // copied above) and `access_allow_ips`/`access_login_username`/
     // `access_login_password_hash` (superseded by the acl_lists/
@@ -132,10 +184,18 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // first place, so DROP COLUMN harmlessly errors (ignored, same
     // pattern as every ADD COLUMN above) rather than needing its own
     // "does this column exist" branch.
-    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN bind_ip").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_allow_ips").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_login_username").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_login_password_hash").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN bind_ip")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_allow_ips")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_login_username")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts DROP COLUMN access_login_password_hash")
+        .execute(pool)
+        .await;
 
     // Metadata only -- kind is 'ip_allow' or 'login'; entries live in
     // the two tables below, keyed by acl_list_id. name is UNIQUE so an
@@ -168,7 +228,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // Pre-existing table from before `description` existed -- see the
     // `hosts` table's identical comment above for why CREATE TABLE IF NOT
     // EXISTS alone can't backfill an upgrade.
-    let _ = sqlx::query("ALTER TABLE acl_ip_entries ADD COLUMN description TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE acl_ip_entries ADD COLUMN description TEXT")
+        .execute(pool)
+        .await;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS acl_credentials (
@@ -182,7 +244,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query("ALTER TABLE acl_credentials ADD COLUMN description TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE acl_credentials ADD COLUMN description TEXT")
+        .execute(pool)
+        .await;
 
     sqlx::query(
         r#"
@@ -202,8 +266,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v4 TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v6 TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v4 TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN bind_ip_v6 TEXT")
+        .execute(pool)
+        .await;
     // See the identical `hosts.bind_ip` comment above -- same
     // copy-then-drop, errors harmlessly on a fresh table.
     let _ = sqlx::query("UPDATE port_rules SET bind_ip_v4 = bind_ip WHERE bind_ip_v4 IS NULL AND bind_ip IS NOT NULL").execute(pool).await;
@@ -212,8 +280,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // own doc comment); a Login-kind list stored in here is simply
     // ignored at read time (nftables::sync_once), not rejected -- there's
     // no application layer on a raw port rule to reject it against.
-    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE port_rules DROP COLUMN bind_ip").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE port_rules ADD COLUMN acl_ids TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE port_rules DROP COLUMN bind_ip")
+        .execute(pool)
+        .await;
 
     // Only `token_hash` is ever persisted -- the plaintext token is shown
     // to the caller exactly once, at creation, and never stored anywhere.
@@ -279,8 +351,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query("ALTER TABLE standalone_certs ADD COLUMN organization TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE standalone_certs ADD COLUMN organizational_unit TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE standalone_certs ADD COLUMN organization TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE standalone_certs ADD COLUMN organizational_unit TEXT")
+        .execute(pool)
+        .await;
 
     // Single-row table (id is always 1) holding the DB-backed ACME
     // contact email -- only ever consulted by
@@ -349,7 +425,13 @@ pub struct ApiTokenMeta {
     pub last_used_at: Option<DateTime<Utc>>,
 }
 
-pub async fn create_api_token(pool: &SqlitePool, id: Uuid, name: &str, token_hash: &str, created_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+pub async fn create_api_token(
+    pool: &SqlitePool,
+    id: Uuid,
+    name: &str,
+    token_hash: &str,
+    created_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO api_tokens (id, name, token_hash, created_at, last_used_at) VALUES (?, ?, ?, ?, NULL)")
         .bind(id.to_string())
         .bind(name)
@@ -361,16 +443,21 @@ pub async fn create_api_token(pool: &SqlitePool, id: Uuid, name: &str, token_has
 }
 
 pub async fn list_api_tokens(pool: &SqlitePool) -> Result<Vec<ApiTokenMeta>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, name, created_at, last_used_at FROM api_tokens ORDER BY created_at ASC")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT id, name, created_at, last_used_at FROM api_tokens ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
     rows.into_iter()
         .map(|row| {
             Ok(ApiTokenMeta {
-                id: Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4()),
+                id: Uuid::parse_str(row.get::<String, _>("id").as_str())
+                    .unwrap_or_else(|_| Uuid::new_v4()),
                 name: row.get("name"),
                 created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
-                last_used_at: row.get::<Option<String>, _>("last_used_at").map(|s| parse_rfc3339(&s)),
+                last_used_at: row
+                    .get::<Option<String>, _>("last_used_at")
+                    .map(|s| parse_rfc3339(&s)),
             })
         })
         .collect()
@@ -378,18 +465,27 @@ pub async fn list_api_tokens(pool: &SqlitePool) -> Result<Vec<ApiTokenMeta>, sql
 
 /// Looks up a token by the hash of its plaintext (never by plaintext
 /// itself -- callers hash first, see `api::auth::hash_api_token`).
-pub async fn find_api_token_id_by_hash(pool: &SqlitePool, token_hash: &str) -> Result<Option<Uuid>, sqlx::Error> {
+pub async fn find_api_token_id_by_hash(
+    pool: &SqlitePool,
+    token_hash: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
     let row = sqlx::query("SELECT id FROM api_tokens WHERE token_hash = ?")
         .bind(token_hash)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|r| Uuid::parse_str(r.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4())))
+    Ok(row.map(|r| {
+        Uuid::parse_str(r.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4())
+    }))
 }
 
 /// Best-effort last-used tracking, called on every successful token auth
 /// -- a failure here should never fail the request it's just bookkeeping
 /// for, so callers log-and-ignore rather than propagate the error.
-pub async fn touch_api_token_last_used(pool: &SqlitePool, id: Uuid, when: DateTime<Utc>) -> Result<(), sqlx::Error> {
+pub async fn touch_api_token_last_used(
+    pool: &SqlitePool,
+    id: Uuid,
+    when: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
         .bind(when.to_rfc3339())
         .bind(id.to_string())
@@ -399,12 +495,17 @@ pub async fn touch_api_token_last_used(pool: &SqlitePool, id: Uuid, when: DateTi
 }
 
 pub async fn delete_api_token(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM api_tokens WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    let result = sqlx::query("DELETE FROM api_tokens WHERE id = ?")
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
 fn parse_rfc3339(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
 }
 
 #[derive(Debug)]
@@ -495,7 +596,11 @@ pub async fn create_dns_credential(
 /// across restarts, and -- deliberately -- never overwrites a row that
 /// already exists (an admin may have renamed or edited it since; the DB
 /// is the source of truth once a row exists at all).
-pub async fn seed_default_dns_credential(pool: &SqlitePool, provider: DnsProviderKind, token: &str) -> Result<(), sqlx::Error> {
+pub async fn seed_default_dns_credential(
+    pool: &SqlitePool,
+    provider: DnsProviderKind,
+    token: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT OR IGNORE INTO dns_credentials (id, name, provider, token, created_at) VALUES (?, 'default', ?, ?, ?)")
         .bind(Uuid::new_v4().to_string())
         .bind(dns_provider_to_str(provider))
@@ -506,14 +611,19 @@ pub async fn seed_default_dns_credential(pool: &SqlitePool, provider: DnsProvide
     Ok(())
 }
 
-pub async fn list_dns_credentials(pool: &SqlitePool) -> Result<Vec<DnsCredentialMeta>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, name, provider, created_at FROM dns_credentials ORDER BY created_at ASC")
-        .fetch_all(pool)
-        .await?;
+pub async fn list_dns_credentials(
+    pool: &SqlitePool,
+) -> Result<Vec<DnsCredentialMeta>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, name, provider, created_at FROM dns_credentials ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
     rows.into_iter()
         .map(|row| {
             Ok(DnsCredentialMeta {
-                id: Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4()),
+                id: Uuid::parse_str(row.get::<String, _>("id").as_str())
+                    .unwrap_or_else(|_| Uuid::new_v4()),
                 name: row.get("name"),
                 provider: dns_provider_from_str(&row.get::<String, _>("provider")),
                 created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
@@ -522,11 +632,16 @@ pub async fn list_dns_credentials(pool: &SqlitePool) -> Result<Vec<DnsCredential
         .collect()
 }
 
-pub async fn get_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<Option<DnsCredential>, sqlx::Error> {
-    let row = sqlx::query("SELECT id, name, provider, token, created_at FROM dns_credentials WHERE id = ?")
-        .bind(id.to_string())
-        .fetch_optional(pool)
-        .await?;
+pub async fn get_dns_credential(
+    pool: &SqlitePool,
+    id: Uuid,
+) -> Result<Option<DnsCredential>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, name, provider, token, created_at FROM dns_credentials WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|row| DnsCredential {
         id,
         name: row.get("name"),
@@ -536,13 +651,22 @@ pub async fn get_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<Option<Dn
     }))
 }
 
-pub async fn dns_credential_name_exists(pool: &SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query("SELECT 1 FROM dns_credentials WHERE name = ?").bind(name).fetch_optional(pool).await?;
+pub async fn dns_credential_name_exists(
+    pool: &SqlitePool,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query("SELECT 1 FROM dns_credentials WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.is_some())
 }
 
 pub async fn delete_dns_credential(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM dns_credentials WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    let result = sqlx::query("DELETE FROM dns_credentials WHERE id = ?")
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -591,7 +715,9 @@ pub async fn list_standalone_certs(pool: &SqlitePool) -> Result<Vec<StandaloneCe
             Ok(StandaloneCert {
                 id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
                 domain: row.get("domain"),
-                dns_credential_id: row.get::<Option<String>, _>("dns_credential_id").and_then(|s| Uuid::parse_str(&s).ok()),
+                dns_credential_id: row
+                    .get::<Option<String>, _>("dns_credential_id")
+                    .and_then(|s| Uuid::parse_str(&s).ok()),
                 created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
                 organization: row.get("organization"),
                 organizational_unit: row.get("organizational_unit"),
@@ -600,13 +726,22 @@ pub async fn list_standalone_certs(pool: &SqlitePool) -> Result<Vec<StandaloneCe
         .collect()
 }
 
-pub async fn standalone_cert_domain_exists(pool: &SqlitePool, domain: &str) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query("SELECT 1 FROM standalone_certs WHERE domain = ?").bind(domain).fetch_optional(pool).await?;
+pub async fn standalone_cert_domain_exists(
+    pool: &SqlitePool,
+    domain: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query("SELECT 1 FROM standalone_certs WHERE domain = ?")
+        .bind(domain)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.is_some())
 }
 
 pub async fn delete_standalone_cert(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM standalone_certs WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    let result = sqlx::query("DELETE FROM standalone_certs WHERE id = ?")
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -624,7 +759,13 @@ fn acl_kind_from_str(s: &str) -> AclKind {
     }
 }
 
-pub async fn create_acl_list(pool: &SqlitePool, id: Uuid, name: &str, kind: AclKind, created_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+pub async fn create_acl_list(
+    pool: &SqlitePool,
+    id: Uuid,
+    name: &str,
+    kind: AclKind,
+    created_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO acl_lists (id, name, kind, created_at) VALUES (?, ?, ?, ?)")
         .bind(id.to_string())
         .bind(name)
@@ -635,7 +776,11 @@ pub async fn create_acl_list(pool: &SqlitePool, id: Uuid, name: &str, kind: AclK
     Ok(())
 }
 
-pub async fn add_acl_ip_entries(pool: &SqlitePool, acl_list_id: Uuid, cidrs: &[String]) -> Result<(), sqlx::Error> {
+pub async fn add_acl_ip_entries(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+    cidrs: &[String],
+) -> Result<(), sqlx::Error> {
     for cidr in cidrs {
         sqlx::query("INSERT INTO acl_ip_entries (id, acl_list_id, cidr) VALUES (?, ?, ?)")
             .bind(Uuid::new_v4().to_string())
@@ -651,7 +796,11 @@ pub async fn add_acl_ip_entries(pool: &SqlitePool, acl_list_id: Uuid, cidrs: &[S
 /// happens at the API layer, same as every other credential this
 /// project stores (admin identity, host logins before this replaced
 /// them).
-pub async fn add_acl_credentials(pool: &SqlitePool, acl_list_id: Uuid, credentials: &[(String, String)]) -> Result<(), sqlx::Error> {
+pub async fn add_acl_credentials(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+    credentials: &[(String, String)],
+) -> Result<(), sqlx::Error> {
     for (username, password_hash) in credentials {
         sqlx::query("INSERT INTO acl_credentials (id, acl_list_id, username, password_hash) VALUES (?, ?, ?, ?)")
             .bind(Uuid::new_v4().to_string())
@@ -685,41 +834,69 @@ pub struct AclCredentialSummary {
 }
 
 pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>, sqlx::Error> {
-    let row = sqlx::query("SELECT id, name, kind, created_at FROM acl_lists WHERE id = ?").bind(id.to_string()).fetch_optional(pool).await?;
+    let row = sqlx::query("SELECT id, name, kind, created_at FROM acl_lists WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|row| AclList {
         id,
         name: row.get("name"),
         kind: acl_kind_from_str(&row.get::<String, _>("kind")),
-        created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at")).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+        created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
     }))
 }
 
-pub async fn list_acl_ip_entries(pool: &SqlitePool, acl_list_id: Uuid) -> Result<Vec<AclIpEntry>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, cidr, description FROM acl_ip_entries WHERE acl_list_id = ? ORDER BY rowid ASC")
-        .bind(acl_list_id.to_string())
-        .fetch_all(pool)
-        .await?;
+pub async fn list_acl_ip_entries(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+) -> Result<Vec<AclIpEntry>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, cidr, description FROM acl_ip_entries WHERE acl_list_id = ? ORDER BY rowid ASC",
+    )
+    .bind(acl_list_id.to_string())
+    .fetch_all(pool)
+    .await?;
     rows.into_iter()
-        .map(|row| Ok(AclIpEntry { id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()), cidr: row.get("cidr"), description: row.get("description") }))
+        .map(|row| {
+            Ok(AclIpEntry {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
+                cidr: row.get("cidr"),
+                description: row.get("description"),
+            })
+        })
         .collect()
 }
 
 /// Returns the new entry's id -- the API layer echoes it straight back so
 /// the just-added row can be targeted by a follow-up edit/delete without a
 /// round trip through `list_acl_ip_entries`.
-pub async fn add_acl_ip_entry(pool: &SqlitePool, acl_list_id: Uuid, cidr: &str, description: Option<&str>) -> Result<Uuid, sqlx::Error> {
+pub async fn add_acl_ip_entry(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+    cidr: &str,
+    description: Option<&str>,
+) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO acl_ip_entries (id, acl_list_id, cidr, description) VALUES (?, ?, ?, ?)")
-        .bind(id.to_string())
-        .bind(acl_list_id.to_string())
-        .bind(cidr)
-        .bind(description)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO acl_ip_entries (id, acl_list_id, cidr, description) VALUES (?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(acl_list_id.to_string())
+    .bind(cidr)
+    .bind(description)
+    .execute(pool)
+    .await?;
     Ok(id)
 }
 
-pub async fn update_acl_ip_entry(pool: &SqlitePool, entry_id: Uuid, cidr: &str, description: Option<&str>) -> Result<bool, sqlx::Error> {
+pub async fn update_acl_ip_entry(
+    pool: &SqlitePool,
+    entry_id: Uuid,
+    cidr: &str,
+    description: Option<&str>,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("UPDATE acl_ip_entries SET cidr = ?, description = ? WHERE id = ?")
         .bind(cidr)
         .bind(description)
@@ -730,21 +907,39 @@ pub async fn update_acl_ip_entry(pool: &SqlitePool, entry_id: Uuid, cidr: &str, 
 }
 
 pub async fn delete_acl_ip_entry(pool: &SqlitePool, entry_id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM acl_ip_entries WHERE id = ?").bind(entry_id.to_string()).execute(pool).await?;
+    let result = sqlx::query("DELETE FROM acl_ip_entries WHERE id = ?")
+        .bind(entry_id.to_string())
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn list_acl_credentials(pool: &SqlitePool, acl_list_id: Uuid) -> Result<Vec<AclCredentialSummary>, sqlx::Error> {
+pub async fn list_acl_credentials(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+) -> Result<Vec<AclCredentialSummary>, sqlx::Error> {
     let rows = sqlx::query("SELECT id, username, description FROM acl_credentials WHERE acl_list_id = ? ORDER BY rowid ASC")
         .bind(acl_list_id.to_string())
         .fetch_all(pool)
         .await?;
     rows.into_iter()
-        .map(|row| Ok(AclCredentialSummary { id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()), username: row.get("username"), description: row.get("description") }))
+        .map(|row| {
+            Ok(AclCredentialSummary {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
+                username: row.get("username"),
+                description: row.get("description"),
+            })
+        })
         .collect()
 }
 
-pub async fn add_acl_credential(pool: &SqlitePool, acl_list_id: Uuid, username: &str, password_hash: &str, description: Option<&str>) -> Result<Uuid, sqlx::Error> {
+pub async fn add_acl_credential(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+    username: &str,
+    password_hash: &str,
+    description: Option<&str>,
+) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO acl_credentials (id, acl_list_id, username, password_hash, description) VALUES (?, ?, ?, ?, ?)")
         .bind(id.to_string())
@@ -761,7 +956,13 @@ pub async fn add_acl_credential(pool: &SqlitePool, acl_list_id: Uuid, username: 
 /// operator rename a credential's username or change its description
 /// without being forced to retype (and re-hash) a password that isn't
 /// changing.
-pub async fn update_acl_credential(pool: &SqlitePool, credential_id: Uuid, username: &str, password_hash: Option<&str>, description: Option<&str>) -> Result<bool, sqlx::Error> {
+pub async fn update_acl_credential(
+    pool: &SqlitePool,
+    credential_id: Uuid,
+    username: &str,
+    password_hash: Option<&str>,
+    description: Option<&str>,
+) -> Result<bool, sqlx::Error> {
     let result = match password_hash {
         Some(hash) => {
             sqlx::query("UPDATE acl_credentials SET username = ?, password_hash = ?, description = ? WHERE id = ?")
@@ -784,27 +985,41 @@ pub async fn update_acl_credential(pool: &SqlitePool, credential_id: Uuid, usern
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn delete_acl_credential(pool: &SqlitePool, credential_id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM acl_credentials WHERE id = ?").bind(credential_id.to_string()).execute(pool).await?;
+pub async fn delete_acl_credential(
+    pool: &SqlitePool,
+    credential_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM acl_credentials WHERE id = ?")
+        .bind(credential_id.to_string())
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
 pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, name, kind, created_at FROM acl_lists ORDER BY created_at ASC").fetch_all(pool).await?;
+    let rows =
+        sqlx::query("SELECT id, name, kind, created_at FROM acl_lists ORDER BY created_at ASC")
+            .fetch_all(pool)
+            .await?;
     rows.into_iter()
         .map(|row| {
             Ok(AclList {
                 id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
                 name: row.get("name"),
                 kind: acl_kind_from_str(&row.get::<String, _>("kind")),
-                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at")).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
+                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
             })
         })
         .collect()
 }
 
 pub async fn acl_list_name_exists(pool: &SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query("SELECT 1 FROM acl_lists WHERE name = ?").bind(name).fetch_optional(pool).await?;
+    let row = sqlx::query("SELECT 1 FROM acl_lists WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.is_some())
 }
 
@@ -814,11 +1029,20 @@ pub async fn acl_list_name_exists(pool: &SqlitePool, name: &str) -> Result<bool,
 /// `acl_ids` still contains it, the same guard already used for DNS
 /// credentials.
 pub async fn delete_acl_list(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM acl_lists WHERE id = ?").bind(id.to_string()).execute(pool).await?;
+    let result = sqlx::query("DELETE FROM acl_lists WHERE id = ?")
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
     let deleted = result.rows_affected() > 0;
     if deleted {
-        sqlx::query("DELETE FROM acl_ip_entries WHERE acl_list_id = ?").bind(id.to_string()).execute(pool).await?;
-        sqlx::query("DELETE FROM acl_credentials WHERE acl_list_id = ?").bind(id.to_string()).execute(pool).await?;
+        sqlx::query("DELETE FROM acl_ip_entries WHERE acl_list_id = ?")
+            .bind(id.to_string())
+            .execute(pool)
+            .await?;
+        sqlx::query("DELETE FROM acl_credentials WHERE acl_list_id = ?")
+            .bind(id.to_string())
+            .execute(pool)
+            .await?;
     }
     Ok(deleted)
 }
@@ -845,10 +1069,17 @@ pub struct ResolvedAcls {
     pub has_login_acl: bool,
 }
 
-pub async fn resolve_acl_ids(pool: &SqlitePool, acl_ids: &[Uuid]) -> Result<ResolvedAcls, sqlx::Error> {
+pub async fn resolve_acl_ids(
+    pool: &SqlitePool,
+    acl_ids: &[Uuid],
+) -> Result<ResolvedAcls, sqlx::Error> {
     let mut resolved = ResolvedAcls::default();
     for &acl_id in acl_ids {
-        let Some(list_row) = sqlx::query("SELECT kind FROM acl_lists WHERE id = ?").bind(acl_id.to_string()).fetch_optional(pool).await? else {
+        let Some(list_row) = sqlx::query("SELECT kind FROM acl_lists WHERE id = ?")
+            .bind(acl_id.to_string())
+            .fetch_optional(pool)
+            .await?
+        else {
             // Referenced by a host but the list itself was deleted out
             // from under it (shouldn't normally happen -- delete_acl_list
             // is guarded at the API layer -- but a dangling id must never
@@ -859,19 +1090,29 @@ pub async fn resolve_acl_ids(pool: &SqlitePool, acl_ids: &[Uuid]) -> Result<Reso
         match acl_kind_from_str(&list_row.get::<String, _>("kind")) {
             AclKind::IpAllow => {
                 resolved.has_ip_allow_acl = true;
-                let rows = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?").bind(acl_id.to_string()).fetch_all(pool).await?;
-                resolved.allow_ips.extend(rows.into_iter().filter_map(|r| r.get::<String, _>("cidr").parse::<ipnet::IpNet>().ok()));
-            }
-            AclKind::Login => {
-                resolved.has_login_acl = true;
-                let rows = sqlx::query("SELECT username, password_hash FROM acl_credentials WHERE acl_list_id = ?")
+                let rows = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?")
                     .bind(acl_id.to_string())
                     .fetch_all(pool)
                     .await?;
-                resolved.credentials.extend(rows.into_iter().map(|r| HostAuth {
-                    username: r.get("username"),
-                    password_hash: r.get("password_hash"),
-                }));
+                resolved.allow_ips.extend(
+                    rows.into_iter()
+                        .filter_map(|r| r.get::<String, _>("cidr").parse::<ipnet::IpNet>().ok()),
+                );
+            }
+            AclKind::Login => {
+                resolved.has_login_acl = true;
+                let rows = sqlx::query(
+                    "SELECT username, password_hash FROM acl_credentials WHERE acl_list_id = ?",
+                )
+                .bind(acl_id.to_string())
+                .fetch_all(pool)
+                .await?;
+                resolved
+                    .credentials
+                    .extend(rows.into_iter().map(|r| HostAuth {
+                        username: r.get("username"),
+                        password_hash: r.get("password_hash"),
+                    }));
             }
         }
     }
@@ -884,10 +1125,14 @@ pub struct AdminIdentityRow {
     pub session_secret: String,
 }
 
-pub async fn load_admin_identity(pool: &SqlitePool) -> Result<Option<AdminIdentityRow>, sqlx::Error> {
-    let row = sqlx::query("SELECT username, password_hash, session_secret FROM admin_identity WHERE id = 1")
-        .fetch_optional(pool)
-        .await?;
+pub async fn load_admin_identity(
+    pool: &SqlitePool,
+) -> Result<Option<AdminIdentityRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT username, password_hash, session_secret FROM admin_identity WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|r| AdminIdentityRow {
         username: r.get("username"),
         password_hash: r.get("password_hash"),
@@ -903,7 +1148,12 @@ pub async fn load_admin_identity(pool: &SqlitePool) -> Result<Option<AdminIdenti
 /// Returns whether this call actually created the row: the DB's own
 /// uniqueness (the `CHECK (id = 1)` single-row constraint) is the race-free
 /// arbiter, not the caller's earlier `admin_identity()` read.
-pub async fn create_admin_identity_if_absent(pool: &SqlitePool, username: &str, password_hash: &str, session_secret: &str) -> Result<bool, sqlx::Error> {
+pub async fn create_admin_identity_if_absent(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+    session_secret: &str,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO admin_identity (id, username, password_hash, session_secret) VALUES (1, ?, ?, ?) \
          ON CONFLICT(id) DO NOTHING",
@@ -917,7 +1167,9 @@ pub async fn create_admin_identity_if_absent(pool: &SqlitePool, username: &str, 
 }
 
 pub async fn load_acme_contact_email(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query("SELECT contact_email FROM acme_settings WHERE id = 1").fetch_optional(pool).await?;
+    let row = sqlx::query("SELECT contact_email FROM acme_settings WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.get("contact_email")))
 }
 
@@ -937,7 +1189,9 @@ pub async fn set_acme_contact_email(pool: &SqlitePool, email: &str) -> Result<()
 /// `None` means nothing has ever overridden the built-in default (see
 /// `state::AppState::expose_admin_port`, which treats `None` here as `true`).
 pub async fn load_expose_admin_port(pool: &SqlitePool) -> Result<Option<bool>, sqlx::Error> {
-    let row = sqlx::query("SELECT expose_admin_port FROM firewall_settings WHERE id = 1").fetch_optional(pool).await?;
+    let row = sqlx::query("SELECT expose_admin_port FROM firewall_settings WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.get::<i64, _>("expose_admin_port") != 0))
 }
 
@@ -953,7 +1207,7 @@ pub async fn set_expose_admin_port(pool: &SqlitePool, value: bool) -> Result<(),
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -970,24 +1224,39 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 .filter(|s| !s.is_empty())
                 .filter_map(|s| Uuid::parse_str(s).ok())
                 .collect();
-            let redirect = row.get::<Option<String>, _>("redirect_target").map(|target| RedirectTarget {
-                target,
-                preserve_path: row.get::<i64, _>("redirect_preserve_path") != 0,
-                status: match row.get::<String, _>("redirect_status").as_str() {
-                    "temporary" => RedirectStatus::Temporary,
-                    _ => RedirectStatus::Permanent,
-                },
-            });
-            let dns_credential_id = row.get::<Option<String>, _>("dns_credential_id").and_then(|s| Uuid::parse_str(&s).ok());
-            let path_rewrite = match (row.get::<Option<String>, _>("path_rewrite_pattern"), row.get::<Option<String>, _>("path_rewrite_replacement")) {
-                (Some(pattern), Some(replacement)) => Some(crate::config::PathRewrite { pattern, replacement }),
+            let redirect = row
+                .get::<Option<String>, _>("redirect_target")
+                .map(|target| RedirectTarget {
+                    target,
+                    preserve_path: row.get::<i64, _>("redirect_preserve_path") != 0,
+                    status: match row.get::<String, _>("redirect_status").as_str() {
+                        "temporary" => RedirectStatus::Temporary,
+                        _ => RedirectStatus::Permanent,
+                    },
+                });
+            let dns_credential_id = row
+                .get::<Option<String>, _>("dns_credential_id")
+                .and_then(|s| Uuid::parse_str(&s).ok());
+            let path_rewrite = match (
+                row.get::<Option<String>, _>("path_rewrite_pattern"),
+                row.get::<Option<String>, _>("path_rewrite_replacement"),
+            ) {
+                (Some(pattern), Some(replacement)) => Some(crate::config::PathRewrite {
+                    pattern,
+                    replacement,
+                }),
                 _ => None,
             };
             Ok(ProxyHost {
-                id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str())
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 domain: row.get("domain"),
-                bind_ip_v4: row.get::<Option<String>, _>("bind_ip_v4").and_then(|s| s.parse().ok()),
-                bind_ip_v6: row.get::<Option<String>, _>("bind_ip_v6").and_then(|s| s.parse().ok()),
+                bind_ip_v4: row
+                    .get::<Option<String>, _>("bind_ip_v4")
+                    .and_then(|s| s.parse().ok()),
+                bind_ip_v6: row
+                    .get::<Option<String>, _>("bind_ip_v6")
+                    .and_then(|s| s.parse().ok()),
                 bind_port: row.get::<i64, _>("bind_port") as u16,
                 upstream: row.get("upstream"),
                 upstream_https: row.get::<i64, _>("upstream_https") != 0,
@@ -1001,7 +1270,10 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 dns_credential_id,
                 redirect,
                 path_rewrite,
-                static_root: row.get::<Option<String>, _>("static_root").map(std::path::PathBuf::from),
+                static_root: row
+                    .get::<Option<String>, _>("static_root")
+                    .map(std::path::PathBuf::from),
+                rewrite_samesite_none_cookies: row.get::<i64, _>("rewrite_samesite_none_cookies") != 0,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1017,7 +1289,12 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
             AcmeChallengeType::Http01 => "http01",
             AcmeChallengeType::Dns01 => "dns01",
         };
-        let acl_ids = h.acl_ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
+        let acl_ids = h
+            .acl_ids
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let (redirect_target, redirect_preserve_path, redirect_status) = match &h.redirect {
             Some(redirect) => (
                 Some(redirect.target.as_str()),
@@ -1035,8 +1312,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -1059,6 +1336,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(path_rewrite_pattern)
         .bind(path_rewrite_replacement)
         .bind(h.static_root.as_ref().map(|p| p.to_string_lossy().to_string()))
+        .bind(h.rewrite_samesite_none_cookies as i64)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -1083,9 +1361,14 @@ pub async fn load_port_rules(pool: &SqlitePool) -> Result<Vec<PortRule>, sqlx::E
                 .filter_map(|s| uuid::Uuid::parse_str(s).ok())
                 .collect();
             Ok(PortRule {
-                id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| uuid::Uuid::new_v4()),
-                bind_ip_v4: row.get::<Option<String>, _>("bind_ip_v4").and_then(|s| s.parse().ok()),
-                bind_ip_v6: row.get::<Option<String>, _>("bind_ip_v6").and_then(|s| s.parse().ok()),
+                id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str())
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                bind_ip_v4: row
+                    .get::<Option<String>, _>("bind_ip_v4")
+                    .and_then(|s| s.parse().ok()),
+                bind_ip_v6: row
+                    .get::<Option<String>, _>("bind_ip_v6")
+                    .and_then(|s| s.parse().ok()),
                 port_start: row.get::<i64, _>("port_start") as u16,
                 port_end: row.get::<i64, _>("port_end") as u16,
                 protocol,
@@ -1100,13 +1383,20 @@ pub async fn load_port_rules(pool: &SqlitePool) -> Result<Vec<PortRule>, sqlx::E
 
 pub async fn save_port_rules(pool: &SqlitePool, rules: &[PortRule]) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM port_rules").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM port_rules")
+        .execute(&mut *tx)
+        .await?;
     for r in rules {
         let protocol = match r.protocol {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp",
         };
-        let acl_ids = r.acl_ids.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>().join(",");
+        let acl_ids = r
+            .acl_ids
+            .iter()
+            .map(uuid::Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         sqlx::query(
             "INSERT INTO port_rules (id, bind_ip_v4, bind_ip_v6, port_start, port_end, protocol, description, passthrough_target, acl_ids, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -1156,6 +1446,7 @@ mod tests {
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         }
     }
@@ -1179,23 +1470,43 @@ mod tests {
     async fn hosts_round_trip_through_sqlite() {
         let pool = memory_pool().await;
         let host = sample_host();
-        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+        save_hosts(&pool, std::slice::from_ref(&host))
+            .await
+            .unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].domain, "example.com");
         assert_eq!(loaded[0].id, host.id);
         assert!(loaded[0].websockets);
+        assert!(!loaded[0].rewrite_samesite_none_cookies, "sample_host()'s default (false) must round-trip too, not just true");
+    }
+
+    #[tokio::test]
+    async fn rewrite_samesite_none_cookies_round_trips_when_enabled() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.rewrite_samesite_none_cookies = true;
+        save_hosts(&pool, std::slice::from_ref(&host))
+            .await
+            .unwrap();
+
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert!(loaded[0].rewrite_samesite_none_cookies);
     }
 
     #[tokio::test]
     async fn acl_ids_round_trip_through_sqlite() {
         let pool = memory_pool().await;
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "test acl", AclKind::IpAllow, Utc::now()).await.unwrap();
+        create_acl_list(&pool, acl_id, "test acl", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
         let mut host = sample_host();
         host.acl_ids = vec![acl_id];
-        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+        save_hosts(&pool, std::slice::from_ref(&host))
+            .await
+            .unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert_eq!(loaded[0].acl_ids, host.acl_ids);
@@ -1204,7 +1515,9 @@ mod tests {
     #[tokio::test]
     async fn acl_ids_default_to_unrestricted_when_absent() {
         let pool = memory_pool().await;
-        save_hosts(&pool, std::slice::from_ref(&sample_host())).await.unwrap();
+        save_hosts(&pool, std::slice::from_ref(&sample_host()))
+            .await
+            .unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert!(loaded[0].acl_ids.is_empty());
@@ -1220,7 +1533,9 @@ mod tests {
             preserve_path: false,
             status: RedirectStatus::Temporary,
         });
-        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+        save_hosts(&pool, std::slice::from_ref(&host))
+            .await
+            .unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert_eq!(loaded[0].redirect, host.redirect);
@@ -1231,7 +1546,9 @@ mod tests {
         let pool = memory_pool().await;
         let mut host = sample_host();
         host.dns_credential_id = Some(Uuid::new_v4());
-        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+        save_hosts(&pool, std::slice::from_ref(&host))
+            .await
+            .unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert_eq!(loaded[0].dns_credential_id, host.dns_credential_id);
@@ -1240,7 +1557,9 @@ mod tests {
     #[tokio::test]
     async fn dns_credential_id_defaults_to_none_when_absent() {
         let pool = memory_pool().await;
-        save_hosts(&pool, std::slice::from_ref(&sample_host())).await.unwrap();
+        save_hosts(&pool, std::slice::from_ref(&sample_host()))
+            .await
+            .unwrap();
 
         let loaded = load_hosts(&pool).await.unwrap();
         assert!(loaded[0].dns_credential_id.is_none());
@@ -1258,12 +1577,17 @@ mod tests {
     async fn port_rules_round_trip_including_protocol_and_passthrough_target() {
         let pool = memory_pool().await;
         let rule = sample_rule();
-        save_port_rules(&pool, std::slice::from_ref(&rule)).await.unwrap();
+        save_port_rules(&pool, std::slice::from_ref(&rule))
+            .await
+            .unwrap();
 
         let loaded = load_port_rules(&pool).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].protocol, Protocol::Tcp);
-        assert_eq!(loaded[0].passthrough_target.as_deref(), Some("127.0.0.1:21115"));
+        assert_eq!(
+            loaded[0].passthrough_target.as_deref(),
+            Some("127.0.0.1:21115")
+        );
         assert_eq!(loaded[0].port_start, 21115);
         assert_eq!(loaded[0].port_end, 21119);
     }
@@ -1283,7 +1607,9 @@ mod tests {
     async fn created_api_token_appears_in_the_list_with_no_last_used_at() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+            .await
+            .unwrap();
 
         let tokens = list_api_tokens(&pool).await.unwrap();
         assert_eq!(tokens.len(), 1);
@@ -1296,17 +1622,31 @@ mod tests {
     async fn api_token_is_found_by_its_hash_and_not_by_a_wrong_one() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+            .await
+            .unwrap();
 
-        assert_eq!(find_api_token_id_by_hash(&pool, "hash-of-token").await.unwrap(), Some(id));
-        assert_eq!(find_api_token_id_by_hash(&pool, "wrong-hash").await.unwrap(), None);
+        assert_eq!(
+            find_api_token_id_by_hash(&pool, "hash-of-token")
+                .await
+                .unwrap(),
+            Some(id)
+        );
+        assert_eq!(
+            find_api_token_id_by_hash(&pool, "wrong-hash")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
     async fn touching_an_api_token_updates_its_last_used_at() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+            .await
+            .unwrap();
 
         let now = Utc::now();
         touch_api_token_last_used(&pool, id, now).await.unwrap();
@@ -1320,26 +1660,41 @@ mod tests {
     async fn deleting_an_api_token_removes_it_and_reports_whether_it_existed() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now()).await.unwrap();
+        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+            .await
+            .unwrap();
 
         assert!(delete_api_token(&pool, id).await.unwrap());
         assert!(list_api_tokens(&pool).await.unwrap().is_empty());
-        assert!(!delete_api_token(&pool, id).await.unwrap(), "deleting again should report nothing was found");
+        assert!(
+            !delete_api_token(&pool, id).await.unwrap(),
+            "deleting again should report nothing was found"
+        );
     }
 
     #[tokio::test]
     async fn dns_credentials_round_trip_through_sqlite() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_dns_credential(&pool, id, "prod-cloudflare", crate::config::DnsProviderKind::Cloudflare, "cf-token-value", Utc::now())
-            .await
-            .unwrap();
+        create_dns_credential(
+            &pool,
+            id,
+            "prod-cloudflare",
+            crate::config::DnsProviderKind::Cloudflare,
+            "cf-token-value",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         let metas = list_dns_credentials(&pool).await.unwrap();
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].id, id);
         assert_eq!(metas[0].name, "prod-cloudflare");
-        assert_eq!(metas[0].provider, crate::config::DnsProviderKind::Cloudflare);
+        assert_eq!(
+            metas[0].provider,
+            crate::config::DnsProviderKind::Cloudflare
+        );
 
         let full = get_dns_credential(&pool, id).await.unwrap().unwrap();
         assert_eq!(full.token, "cf-token-value");
@@ -1348,16 +1703,26 @@ mod tests {
     #[tokio::test]
     async fn dns_credential_not_found_returns_none() {
         let pool = memory_pool().await;
-        assert!(get_dns_credential(&pool, Uuid::new_v4()).await.unwrap().is_none());
+        assert!(get_dns_credential(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn deleting_a_dns_credential_removes_it_and_reports_whether_it_existed() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_dns_credential(&pool, id, "prod-cloudflare", crate::config::DnsProviderKind::Cloudflare, "cf-token", Utc::now())
-            .await
-            .unwrap();
+        create_dns_credential(
+            &pool,
+            id,
+            "prod-cloudflare",
+            crate::config::DnsProviderKind::Cloudflare,
+            "cf-token",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         assert!(delete_dns_credential(&pool, id).await.unwrap());
         assert!(list_dns_credentials(&pool).await.unwrap().is_empty());
@@ -1367,35 +1732,78 @@ mod tests {
     #[tokio::test]
     async fn dns_credential_name_exists_reflects_current_rows() {
         let pool = memory_pool().await;
-        assert!(!dns_credential_name_exists(&pool, "prod-cloudflare").await.unwrap());
-        create_dns_credential(&pool, Uuid::new_v4(), "prod-cloudflare", crate::config::DnsProviderKind::Cloudflare, "tok", Utc::now())
+        assert!(!dns_credential_name_exists(&pool, "prod-cloudflare")
             .await
-            .unwrap();
-        assert!(dns_credential_name_exists(&pool, "prod-cloudflare").await.unwrap());
+            .unwrap());
+        create_dns_credential(
+            &pool,
+            Uuid::new_v4(),
+            "prod-cloudflare",
+            crate::config::DnsProviderKind::Cloudflare,
+            "tok",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert!(dns_credential_name_exists(&pool, "prod-cloudflare")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn seed_default_dns_credential_is_idempotent_across_restarts() {
         let pool = memory_pool().await;
-        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "hetzner-token").await.unwrap();
-        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "hetzner-token").await.unwrap();
+        seed_default_dns_credential(
+            &pool,
+            crate::config::DnsProviderKind::Hetzner,
+            "hetzner-token",
+        )
+        .await
+        .unwrap();
+        seed_default_dns_credential(
+            &pool,
+            crate::config::DnsProviderKind::Hetzner,
+            "hetzner-token",
+        )
+        .await
+        .unwrap();
 
         let metas = list_dns_credentials(&pool).await.unwrap();
-        assert_eq!(metas.len(), 1, "seeding twice (e.g. two restarts) must not create a duplicate 'default' row");
+        assert_eq!(
+            metas.len(),
+            1,
+            "seeding twice (e.g. two restarts) must not create a duplicate 'default' row"
+        );
         assert_eq!(metas[0].name, "default");
     }
 
     #[tokio::test]
     async fn seed_default_dns_credential_does_not_overwrite_a_user_renamed_or_edited_default() {
         let pool = memory_pool().await;
-        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "original-token").await.unwrap();
-        seed_default_dns_credential(&pool, crate::config::DnsProviderKind::Hetzner, "a-different-token-from-a-later-config-edit")
-            .await
-            .unwrap();
+        seed_default_dns_credential(
+            &pool,
+            crate::config::DnsProviderKind::Hetzner,
+            "original-token",
+        )
+        .await
+        .unwrap();
+        seed_default_dns_credential(
+            &pool,
+            crate::config::DnsProviderKind::Hetzner,
+            "a-different-token-from-a-later-config-edit",
+        )
+        .await
+        .unwrap();
 
         let metas = list_dns_credentials(&pool).await.unwrap();
-        let full = get_dns_credential(&pool, metas[0].id).await.unwrap().unwrap();
-        assert_eq!(full.token, "original-token", "seeding is INSERT OR IGNORE -- the DB row, once created, is the source of truth");
+        let full = get_dns_credential(&pool, metas[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            full.token, "original-token",
+            "seeding is INSERT OR IGNORE -- the DB row, once created, is the source of truth"
+        );
     }
 
     #[tokio::test]
@@ -1403,7 +1811,9 @@ mod tests {
         let pool = memory_pool().await;
         assert!(load_admin_identity(&pool).await.unwrap().is_none());
 
-        create_admin_identity_if_absent(&pool, "admin", "hashed-password", "session-secret").await.unwrap();
+        create_admin_identity_if_absent(&pool, "admin", "hashed-password", "session-secret")
+            .await
+            .unwrap();
         let row = load_admin_identity(&pool).await.unwrap().unwrap();
         assert_eq!(row.username, "admin");
         assert_eq!(row.password_hash, "hashed-password");
@@ -1413,11 +1823,22 @@ mod tests {
     #[tokio::test]
     async fn create_admin_identity_if_absent_only_ever_creates_the_first_one() {
         let pool = memory_pool().await;
-        assert!(create_admin_identity_if_absent(&pool, "admin", "hash-1", "secret-1").await.unwrap());
-        assert!(!create_admin_identity_if_absent(&pool, "attacker", "hash-2", "secret-2").await.unwrap());
+        assert!(
+            create_admin_identity_if_absent(&pool, "admin", "hash-1", "secret-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !create_admin_identity_if_absent(&pool, "attacker", "hash-2", "secret-2")
+                .await
+                .unwrap()
+        );
 
         let row = load_admin_identity(&pool).await.unwrap().unwrap();
-        assert_eq!(row.username, "admin", "the second call must not have overwritten the first");
+        assert_eq!(
+            row.username, "admin",
+            "the second call must not have overwritten the first"
+        );
         assert_eq!(row.password_hash, "hash-1");
     }
 
@@ -1434,7 +1855,11 @@ mod tests {
     /// through.
     #[tokio::test]
     async fn run_migrations_adds_organization_columns_to_a_pre_existing_standalone_certs_table() {
-        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE standalone_certs (id TEXT PRIMARY KEY, domain TEXT NOT NULL UNIQUE, dns_credential_id TEXT, created_at TEXT NOT NULL)")
             .execute(&pool)
             .await
@@ -1445,7 +1870,17 @@ mod tests {
         // Would fail with "no such column" before the fix -- confirmed
         // against the exact same error a real upgraded production
         // instance hit.
-        create_standalone_cert(&pool, Uuid::new_v4(), "*.example.com", None, Utc::now(), Some("Acme Corp"), None).await.unwrap();
+        create_standalone_cert(
+            &pool,
+            Uuid::new_v4(),
+            "*.example.com",
+            None,
+            Utc::now(),
+            Some("Acme Corp"),
+            None,
+        )
+        .await
+        .unwrap();
         let certs = list_standalone_certs(&pool).await.unwrap();
         assert_eq!(certs[0].organization.as_deref(), Some("Acme Corp"));
     }
@@ -1454,18 +1889,41 @@ mod tests {
     async fn standalone_cert_organization_and_organizational_unit_round_trip() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_standalone_cert(&pool, id, "*.example.com", None, Utc::now(), Some("Acme Corp"), Some("Platform Engineering")).await.unwrap();
+        create_standalone_cert(
+            &pool,
+            id,
+            "*.example.com",
+            None,
+            Utc::now(),
+            Some("Acme Corp"),
+            Some("Platform Engineering"),
+        )
+        .await
+        .unwrap();
 
         let certs = list_standalone_certs(&pool).await.unwrap();
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].organization.as_deref(), Some("Acme Corp"));
-        assert_eq!(certs[0].organizational_unit.as_deref(), Some("Platform Engineering"));
+        assert_eq!(
+            certs[0].organizational_unit.as_deref(),
+            Some("Platform Engineering")
+        );
     }
 
     #[tokio::test]
     async fn standalone_cert_organization_and_organizational_unit_default_to_none() {
         let pool = memory_pool().await;
-        create_standalone_cert(&pool, Uuid::new_v4(), "*.example.com", None, Utc::now(), None, None).await.unwrap();
+        create_standalone_cert(
+            &pool,
+            Uuid::new_v4(),
+            "*.example.com",
+            None,
+            Utc::now(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let certs = list_standalone_certs(&pool).await.unwrap();
         assert!(certs[0].organization.is_none());
@@ -1481,7 +1939,11 @@ mod tests {
     /// `CREATE TABLE IF NOT EXISTS` starting fresh.
     #[tokio::test]
     async fn run_migrations_adds_description_columns_to_pre_existing_acl_tables() {
-        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE acl_lists (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, created_at TEXT NOT NULL)").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE acl_ip_entries (id TEXT PRIMARY KEY, acl_list_id TEXT NOT NULL, cidr TEXT NOT NULL)").execute(&pool).await.unwrap();
         sqlx::query("CREATE TABLE acl_credentials (id TEXT PRIMARY KEY, acl_list_id TEXT NOT NULL, username TEXT NOT NULL, password_hash TEXT NOT NULL)").execute(&pool).await.unwrap();
@@ -1489,8 +1951,12 @@ mod tests {
         run_migrations(&pool).await.unwrap();
 
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now()).await.unwrap();
-        add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", Some("HQ subnet")).await.unwrap();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
+        add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", Some("HQ subnet"))
+            .await
+            .unwrap();
         let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
         assert_eq!(entries[0].description.as_deref(), Some("HQ subnet"));
     }
@@ -1506,8 +1972,13 @@ mod tests {
     /// before that column was dropped out from under it -- exactly the
     /// two ways this migration could have silently lost data.
     #[tokio::test]
-    async fn run_migrations_drops_legacy_columns_from_a_pre_existing_hosts_table_without_losing_data() {
-        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+    async fn run_migrations_drops_legacy_columns_from_a_pre_existing_hosts_table_without_losing_data(
+    ) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE TABLE hosts (
                 id TEXT PRIMARY KEY,
@@ -1546,13 +2017,26 @@ mod tests {
         run_migrations(&pool).await.unwrap();
 
         // The dropped columns must genuinely be gone, not just unused.
-        for column in ["bind_ip", "access_allow_ips", "access_login_username", "access_login_password_hash"] {
-            let result = sqlx::query(&format!("SELECT {column} FROM hosts")).fetch_optional(&pool).await;
-            assert!(result.is_err(), "column {column} should have been dropped but a query against it still succeeded");
+        for column in [
+            "bind_ip",
+            "access_allow_ips",
+            "access_login_username",
+            "access_login_password_hash",
+        ] {
+            let result = sqlx::query(&format!("SELECT {column} FROM hosts"))
+                .fetch_optional(&pool)
+                .await;
+            assert!(
+                result.is_err(),
+                "column {column} should have been dropped but a query against it still succeeded"
+            );
         }
 
         let hosts = load_hosts(&pool).await.unwrap();
-        let host = hosts.iter().find(|h| h.id == host_id).expect("the pre-existing row must survive the migration");
+        let host = hosts
+            .iter()
+            .find(|h| h.id == host_id)
+            .expect("the pre-existing row must survive the migration");
         assert_eq!(host.bind_ip_v4, Some("10.0.0.9".parse().unwrap()), "the old bind_ip value must have been copied into bind_ip_v4 before bind_ip was dropped");
         assert_eq!(host.domain, "legacy.example.com");
     }
@@ -1560,8 +2044,13 @@ mod tests {
     /// Same regression coverage as the `hosts` test above, for
     /// `port_rules.bind_ip`.
     #[tokio::test]
-    async fn run_migrations_drops_legacy_bind_ip_from_a_pre_existing_port_rules_table_without_losing_data() {
-        let pool = SqlitePoolOptions::new().max_connections(5).connect("sqlite::memory:").await.unwrap();
+    async fn run_migrations_drops_legacy_bind_ip_from_a_pre_existing_port_rules_table_without_losing_data(
+    ) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE TABLE port_rules (
                 id TEXT PRIMARY KEY,
@@ -1591,11 +2080,19 @@ mod tests {
 
         run_migrations(&pool).await.unwrap();
 
-        let result = sqlx::query("SELECT bind_ip FROM port_rules").fetch_optional(&pool).await;
-        assert!(result.is_err(), "bind_ip should have been dropped but a query against it still succeeded");
+        let result = sqlx::query("SELECT bind_ip FROM port_rules")
+            .fetch_optional(&pool)
+            .await;
+        assert!(
+            result.is_err(),
+            "bind_ip should have been dropped but a query against it still succeeded"
+        );
 
         let rules = load_port_rules(&pool).await.unwrap();
-        let rule = rules.iter().find(|r| r.id == rule_id).expect("the pre-existing row must survive the migration");
+        let rule = rules
+            .iter()
+            .find(|r| r.id == rule_id)
+            .expect("the pre-existing row must survive the migration");
         assert_eq!(rule.bind_ip_v4, Some("10.0.0.9".parse().unwrap()), "the old bind_ip value must have been copied into bind_ip_v4 before bind_ip was dropped");
     }
 
@@ -1603,10 +2100,16 @@ mod tests {
     async fn acl_ip_entries_can_be_added_individually_and_listed() {
         let pool = memory_pool().await;
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now()).await.unwrap();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
 
-        let id1 = add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", Some("HQ")).await.unwrap();
-        let id2 = add_acl_ip_entry(&pool, acl_id, "192.168.1.0/24", None).await.unwrap();
+        let id1 = add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", Some("HQ"))
+            .await
+            .unwrap();
+        let id2 = add_acl_ip_entry(&pool, acl_id, "192.168.1.0/24", None)
+            .await
+            .unwrap();
 
         let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
         assert_eq!(entries.len(), 2);
@@ -1621,9 +2124,15 @@ mod tests {
     async fn acl_ip_entries_support_ipv6_cidrs_end_to_end() {
         let pool = memory_pool().await;
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "v6 office", AclKind::IpAllow, Utc::now()).await.unwrap();
-        add_acl_ip_entry(&pool, acl_id, "2001:db8::/32", Some("v6 HQ")).await.unwrap();
-        add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", None).await.unwrap();
+        create_acl_list(&pool, acl_id, "v6 office", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
+        add_acl_ip_entry(&pool, acl_id, "2001:db8::/32", Some("v6 HQ"))
+            .await
+            .unwrap();
+        add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", None)
+            .await
+            .unwrap();
 
         let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
         assert_eq!(entries.len(), 2);
@@ -1631,23 +2140,48 @@ mod tests {
 
         let resolved = resolve_acl_ids(&pool, &[acl_id]).await.unwrap();
         assert_eq!(resolved.allow_ips.len(), 2);
-        assert!(resolved.allow_ips.iter().any(|net| matches!(net, ipnet::IpNet::V6(_)) && net.to_string() == "2001:db8::/32"));
-        assert!(resolved.allow_ips.iter().any(|net| matches!(net, ipnet::IpNet::V4(_))));
+        assert!(resolved
+            .allow_ips
+            .iter()
+            .any(|net| matches!(net, ipnet::IpNet::V6(_)) && net.to_string() == "2001:db8::/32"));
+        assert!(resolved
+            .allow_ips
+            .iter()
+            .any(|net| matches!(net, ipnet::IpNet::V4(_))));
     }
 
     #[tokio::test]
     async fn acl_ip_entry_update_and_delete_target_a_single_row() {
         let pool = memory_pool().await;
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now()).await.unwrap();
-        let id1 = add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", None).await.unwrap();
-        let id2 = add_acl_ip_entry(&pool, acl_id, "192.168.1.0/24", None).await.unwrap();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
+        let id1 = add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", None)
+            .await
+            .unwrap();
+        let id2 = add_acl_ip_entry(&pool, acl_id, "192.168.1.0/24", None)
+            .await
+            .unwrap();
 
-        let updated = update_acl_ip_entry(&pool, id1, "10.0.0.0/16", Some("widened")).await.unwrap();
+        let updated = update_acl_ip_entry(&pool, id1, "10.0.0.0/16", Some("widened"))
+            .await
+            .unwrap();
         assert!(updated);
         let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
-        assert_eq!(entries.iter().find(|e| e.id == id1).unwrap().cidr, "10.0.0.0/16");
-        assert_eq!(entries.iter().find(|e| e.id == id1).unwrap().description.as_deref(), Some("widened"));
+        assert_eq!(
+            entries.iter().find(|e| e.id == id1).unwrap().cidr,
+            "10.0.0.0/16"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.id == id1)
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("widened")
+        );
 
         let deleted = delete_acl_ip_entry(&pool, id2).await.unwrap();
         assert!(deleted);
@@ -1655,16 +2189,23 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, id1);
 
-        assert!(!delete_acl_ip_entry(&pool, id2).await.unwrap(), "deleting an already-deleted entry must report false, not error");
+        assert!(
+            !delete_acl_ip_entry(&pool, id2).await.unwrap(),
+            "deleting an already-deleted entry must report false, not error"
+        );
     }
 
     #[tokio::test]
     async fn acl_credentials_can_be_added_individually_and_listed_without_password_hashes() {
         let pool = memory_pool().await;
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now()).await.unwrap();
+        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now())
+            .await
+            .unwrap();
 
-        let id = add_acl_credential(&pool, acl_id, "alice", "hashed-secret", Some("contractor")).await.unwrap();
+        let id = add_acl_credential(&pool, acl_id, "alice", "hashed-secret", Some("contractor"))
+            .await
+            .unwrap();
 
         let creds = list_acl_credentials(&pool, acl_id).await.unwrap();
         assert_eq!(creds.len(), 1);
@@ -1677,15 +2218,24 @@ mod tests {
     async fn acl_credential_update_without_a_new_password_preserves_the_existing_hash() {
         let pool = memory_pool().await;
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now()).await.unwrap();
-        let id = add_acl_credential(&pool, acl_id, "alice", "original-hash", None).await.unwrap();
+        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now())
+            .await
+            .unwrap();
+        let id = add_acl_credential(&pool, acl_id, "alice", "original-hash", None)
+            .await
+            .unwrap();
 
-        let updated = update_acl_credential(&pool, id, "alice2", None, Some("renamed")).await.unwrap();
+        let updated = update_acl_credential(&pool, id, "alice2", None, Some("renamed"))
+            .await
+            .unwrap();
         assert!(updated);
 
         let resolved = resolve_acl_ids(&pool, &[acl_id]).await.unwrap();
         assert_eq!(resolved.credentials[0].username, "alice2");
-        assert_eq!(resolved.credentials[0].password_hash, "original-hash", "an update with password_hash=None must not clobber the existing hash");
+        assert_eq!(
+            resolved.credentials[0].password_hash, "original-hash",
+            "an update with password_hash=None must not clobber the existing hash"
+        );
         let creds = list_acl_credentials(&pool, acl_id).await.unwrap();
         assert_eq!(creds[0].description.as_deref(), Some("renamed"));
     }
@@ -1694,9 +2244,15 @@ mod tests {
     async fn acl_credential_delete_removes_a_single_row() {
         let pool = memory_pool().await;
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now()).await.unwrap();
-        let id1 = add_acl_credential(&pool, acl_id, "alice", "hash1", None).await.unwrap();
-        let _id2 = add_acl_credential(&pool, acl_id, "bob", "hash2", None).await.unwrap();
+        create_acl_list(&pool, acl_id, "viewers", AclKind::Login, Utc::now())
+            .await
+            .unwrap();
+        let id1 = add_acl_credential(&pool, acl_id, "alice", "hash1", None)
+            .await
+            .unwrap();
+        let _id2 = add_acl_credential(&pool, acl_id, "bob", "hash2", None)
+            .await
+            .unwrap();
 
         assert!(delete_acl_credential(&pool, id1).await.unwrap());
         let creds = list_acl_credentials(&pool, acl_id).await.unwrap();
@@ -1719,7 +2275,11 @@ mod tests {
         assert_eq!(load_expose_admin_port(&pool).await.unwrap(), Some(false));
 
         set_expose_admin_port(&pool, true).await.unwrap();
-        assert_eq!(load_expose_admin_port(&pool).await.unwrap(), Some(true), "a second call must update the existing row, not fail on the unique id");
+        assert_eq!(
+            load_expose_admin_port(&pool).await.unwrap(),
+            Some(true),
+            "a second call must update the existing row, not fail on the unique id"
+        );
     }
 
     #[tokio::test]
@@ -1728,16 +2288,24 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let pool = connect(&src).await.unwrap();
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "backup test", AclKind::IpAllow, Utc::now()).await.unwrap();
+        create_acl_list(&pool, acl_id, "backup test", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
 
-        let dest = std::env::temp_dir().join(format!("rust-proxy-backup-test-{}.db", Uuid::new_v4()));
+        let dest =
+            std::env::temp_dir().join(format!("rust-proxy-backup-test-{}.db", Uuid::new_v4()));
         let _ = std::fs::remove_file(&dest);
 
         backup_to(&pool, &dest).await.unwrap();
         assert!(dest.is_file(), "backup_to must have written a real file");
 
         let backup_pool = connect(&dest).await.unwrap();
-        assert!(acl_list_name_exists(&backup_pool, "backup test").await.unwrap(), "the backup must contain the same data as the live DB at the moment it was taken");
+        assert!(
+            acl_list_name_exists(&backup_pool, "backup test")
+                .await
+                .unwrap(),
+            "the backup must contain the same data as the live DB at the moment it was taken"
+        );
 
         let _ = std::fs::remove_file(&dest);
         let _ = std::fs::remove_file(&src);
@@ -1748,11 +2316,15 @@ mod tests {
         let src = std::env::temp_dir().join(format!("rust-proxy-backup-src-{}.db", Uuid::new_v4()));
         let _ = std::fs::remove_file(&src);
         let pool = connect(&src).await.unwrap();
-        let dest = std::env::temp_dir().join(format!("rust-proxy-backup-test-{}.db", Uuid::new_v4()));
+        let dest =
+            std::env::temp_dir().join(format!("rust-proxy-backup-test-{}.db", Uuid::new_v4()));
         std::fs::write(&dest, b"not a real backup").unwrap();
 
         let result = backup_to(&pool, &dest).await;
-        assert!(result.is_err(), "VACUUM INTO must refuse an already-existing destination, not silently overwrite it");
+        assert!(
+            result.is_err(),
+            "VACUUM INTO must refuse an already-existing destination, not silently overwrite it"
+        );
 
         let _ = std::fs::remove_file(&dest);
         let _ = std::fs::remove_file(&src);
@@ -1764,19 +2336,32 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let pool = connect(&src).await.unwrap();
         let acl_id = Uuid::new_v4();
-        create_acl_list(&pool, acl_id, "vacuum test", AclKind::IpAllow, Utc::now()).await.unwrap();
+        create_acl_list(&pool, acl_id, "vacuum test", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
         // Delete-then-recreate a bunch of rows so there's real freed
         // space for VACUUM to actually reclaim, not just a no-op on an
         // already-minimal file.
         for _ in 0..50 {
             let id = Uuid::new_v4();
-            create_acl_list(&pool, id, &format!("throwaway {id}"), AclKind::IpAllow, Utc::now()).await.unwrap();
+            create_acl_list(
+                &pool,
+                id,
+                &format!("throwaway {id}"),
+                AclKind::IpAllow,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
             delete_acl_list(&pool, id).await.unwrap();
         }
 
         vacuum(&pool).await.unwrap();
 
-        assert!(acl_list_name_exists(&pool, "vacuum test").await.unwrap(), "VACUUM must never lose live data");
+        assert!(
+            acl_list_name_exists(&pool, "vacuum test").await.unwrap(),
+            "VACUUM must never lose live data"
+        );
         let _ = std::fs::remove_file(&src);
     }
 }

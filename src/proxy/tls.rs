@@ -44,13 +44,23 @@ impl ResolvesServerCert for CertResolver {
 
 /// Exact match first, then a `*.parent` wildcard cert covering exactly one
 /// label under `parent` -- same lookup shape as `proxy::router::match_host`.
-pub fn select_cert_for_sni<'a>(certs: &'a HashMap<String, CertEntry>, sni: &str) -> Option<&'a CertEntry> {
-    if let Some(entry) = certs.iter().find(|(domain, _)| domain.eq_ignore_ascii_case(sni)).map(|(_, entry)| entry) {
+pub fn select_cert_for_sni<'a>(
+    certs: &'a HashMap<String, CertEntry>,
+    sni: &str,
+) -> Option<&'a CertEntry> {
+    if let Some(entry) = certs
+        .iter()
+        .find(|(domain, _)| domain.eq_ignore_ascii_case(sni))
+        .map(|(_, entry)| entry)
+    {
         return Some(entry);
     }
     let (_, parent) = sni.split_once('.')?;
     let wildcard = format!("*.{parent}");
-    certs.iter().find(|(domain, _)| domain.eq_ignore_ascii_case(&wildcard)).map(|(_, entry)| entry)
+    certs
+        .iter()
+        .find(|(domain, _)| domain.eq_ignore_ascii_case(&wildcard))
+        .map(|(_, entry)| entry)
 }
 
 fn build_certified_key(entry: &CertEntry) -> Result<CertifiedKey, rustls::Error> {
@@ -97,7 +107,10 @@ mod tests {
     #[test]
     fn wildcard_cert_resolves_for_any_single_label_subdomain() {
         let mut certs = HashMap::new();
-        certs.insert("*.pages.example.com".to_string(), self_signed_entry("*.pages.example.com"));
+        certs.insert(
+            "*.pages.example.com".to_string(),
+            self_signed_entry("*.pages.example.com"),
+        );
         assert!(select_cert_for_sni(&certs, "myproject.pages.example.com").is_some());
         assert!(select_cert_for_sni(&certs, "another.pages.example.com").is_some());
         assert!(select_cert_for_sni(&certs, "a.b.pages.example.com").is_none());
@@ -106,8 +119,14 @@ mod tests {
     #[test]
     fn exact_cert_wins_over_wildcard_when_both_are_present() {
         let mut certs = HashMap::new();
-        certs.insert("*.pages.example.com".to_string(), self_signed_entry("*.pages.example.com"));
-        certs.insert("myproject.pages.example.com".to_string(), self_signed_entry("myproject.pages.example.com"));
+        certs.insert(
+            "*.pages.example.com".to_string(),
+            self_signed_entry("*.pages.example.com"),
+        );
+        certs.insert(
+            "myproject.pages.example.com".to_string(),
+            self_signed_entry("myproject.pages.example.com"),
+        );
         // Both resolve to *some* entry; this just confirms the exact-match
         // branch is actually reachable and doesn't error out first.
         assert!(select_cert_for_sni(&certs, "myproject.pages.example.com").is_some());

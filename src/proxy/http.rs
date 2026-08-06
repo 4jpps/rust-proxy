@@ -57,6 +57,11 @@ pub struct UpstreamOptions<'a> {
     /// disable this, unlike `preserve_host` (which controls the `Host`
     /// header's own semantics for routing, a separate concern).
     pub client_ip: std::net::IpAddr,
+    /// `config::ProxyHost::rewrite_samesite_none_cookies` -- see that
+    /// field's doc comment for why this exists, and
+    /// `rewrite_samesite_none_to_lax`'s doc comment for the real
+    /// production incident that led to building it.
+    pub rewrite_samesite_none_cookies: bool,
 }
 
 pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
@@ -69,9 +74,72 @@ pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
         .headers()
         .get(CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("upgrade")))
+        .map(|s| {
+            s.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+        })
         .unwrap_or(false);
     has_upgrade_header && has_connection_upgrade
+}
+
+/// Downgrades `SameSite=None` to `SameSite=Lax` on every `Set-Cookie`
+/// response header -- see `config::ProxyHost::rewrite_samesite_none_cookies`'s
+/// doc comment for why an operator would opt a host into this. Every
+/// other `Set-Cookie` attribute (`Secure`, `HttpOnly`, `Path`,
+/// `Expires`, the cookie's own name/value, which may itself
+/// legitimately contain mixed-case text) is left completely
+/// untouched -- only the literal `SameSite=None` substring, matched
+/// case-insensitively, is replaced. A cookie with no `SameSite`
+/// attribute at all, or one already set to `Lax`/`Strict`, is left
+/// exactly as the upstream sent it.
+///
+/// Real production incident this exists for: a GitLab instance behind
+/// this proxy set `SameSite=None` on its session cookie
+/// unconditionally -- a since-obsoleted Chrome-v80-era browser-compat
+/// workaround baked into GitLab's own code, not anything this proxy or
+/// its operator controlled. That cookie reliably vanished from one
+/// real user's browser between the page load that set it and their
+/// very next request -- confirmed via temporary server-side logging
+/// showing a valid session cookie in GitLab's response but completely
+/// absent from the client's next request -- while no server-side
+/// reproduction attempt (curl, httpx -- neither enforces `SameSite`
+/// policy at all) ever reproduced it, since this is purely a real
+/// browser privacy/tracking-protection feature silently dropping
+/// exactly the kind of cookie `SameSite=None` marks as tracking-
+/// capable, even in ordinary first-party same-site use. This can't be
+/// fixed once upstream for every application a jpps/proxy operator
+/// might put behind it -- hence a per-host proxy-level option instead
+/// of a GitLab-specific patch.
+fn rewrite_samesite_none_to_lax(headers: &mut hyper::HeaderMap) {
+    let mut changed = false;
+    let rewritten: Vec<hyper::header::HeaderValue> = headers
+        .get_all(hyper::header::SET_COOKIE)
+        .iter()
+        .map(|value| {
+            let Ok(s) = value.to_str() else { return value.clone() };
+            let Some(idx) = s.to_ascii_lowercase().find("samesite=none") else { return value.clone() };
+            let mut new_value = String::with_capacity(s.len());
+            new_value.push_str(&s[..idx]);
+            new_value.push_str("SameSite=Lax");
+            new_value.push_str(&s[idx + "samesite=none".len()..]);
+            match hyper::header::HeaderValue::from_str(&new_value) {
+                Ok(v) => {
+                    changed = true;
+                    v
+                }
+                Err(_) => value.clone(),
+            }
+        })
+        .collect();
+
+    if !changed {
+        return;
+    }
+
+    headers.remove(hyper::header::SET_COOKIE);
+    for value in rewritten {
+        headers.append(hyper::header::SET_COOKIE, value);
+    }
 }
 
 /// Forwards `req` to `upstream`, streaming the response body back
@@ -94,10 +162,12 @@ pub async fn forward_http(
         .get(hyper::header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
-        .or_else(|| req.uri().host().map(|h| match req.uri().port_u16() {
-            Some(port) => format!("{h}:{port}"),
-            None => h.to_string(),
-        }));
+        .or_else(|| {
+            req.uri().host().map(|h| match req.uri().port_u16() {
+                Some(port) => format!("{h}:{port}"),
+                None => h.to_string(),
+            })
+        });
 
     if !opts.preserve_host {
         let value = hyper::header::HeaderValue::from_str(opts.upstream_host_port)?;
@@ -142,14 +212,21 @@ pub async fn forward_http(
     // caller) only ever runs for genuine HTTPS client connections --
     // the plain-HTTP listener is redirect-only (`https_redirect_response`)
     // and never reaches here -- so `X-Forwarded-Proto` is always `https`.
-    let xff_value = match req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+    let xff_value = match req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(existing) if !existing.is_empty() => format!("{existing}, {}", opts.client_ip),
         _ => opts.client_ip.to_string(),
     };
     if let Ok(value) = hyper::header::HeaderValue::from_str(&xff_value) {
         req.headers_mut().insert("x-forwarded-for", value);
     }
-    req.headers_mut().insert("x-forwarded-proto", hyper::header::HeaderValue::from_static("https"));
+    req.headers_mut().insert(
+        "x-forwarded-proto",
+        hyper::header::HeaderValue::from_static("https"),
+    );
     if let Some(host) = original_host {
         if let Ok(value) = hyper::header::HeaderValue::from_str(&host) {
             req.headers_mut().insert("x-forwarded-host", value);
@@ -188,10 +265,19 @@ pub async fn forward_http(
 
     let tcp = TcpStream::connect(upstream).await?;
     let io: TokioIo<Box<dyn UpstreamIo>> = if opts.https {
-        let host_only = opts.upstream_host_port.rsplit_once(':').map_or(opts.upstream_host_port, |(host, _)| host);
+        let host_only = opts
+            .upstream_host_port
+            .rsplit_once(':')
+            .map_or(opts.upstream_host_port, |(host, _)| host);
         let server_name = rustls_pki_types::ServerName::try_from(host_only.to_string())?;
-        let config = if opts.tls_verify { super::upstream_tls::verified_client_config() } else { super::upstream_tls::insecure_client_config() };
-        let tls_stream = tokio_rustls::TlsConnector::from(config).connect(server_name, tcp).await?;
+        let config = if opts.tls_verify {
+            super::upstream_tls::verified_client_config()
+        } else {
+            super::upstream_tls::insecure_client_config()
+        };
+        let tls_stream = tokio_rustls::TlsConnector::from(config)
+            .connect(server_name, tcp)
+            .await?;
         TokioIo::new(Box::new(tls_stream) as Box<dyn UpstreamIo>)
     } else {
         TokioIo::new(Box::new(tcp) as Box<dyn UpstreamIo>)
@@ -205,14 +291,23 @@ pub async fn forward_http(
 
     let mut resp = sender.send_request(req).await?;
 
-    if let (true, Some(client_upgrade)) = (resp.status() == hyper::StatusCode::SWITCHING_PROTOCOLS, client_upgrade) {
+    if opts.rewrite_samesite_none_cookies {
+        rewrite_samesite_none_to_lax(resp.headers_mut());
+    }
+
+    if let (true, Some(client_upgrade)) = (
+        resp.status() == hyper::StatusCode::SWITCHING_PROTOCOLS,
+        client_upgrade,
+    ) {
         let upstream_upgrade = hyper::upgrade::on(&mut resp);
         tokio::spawn(async move {
             match (client_upgrade.await, upstream_upgrade.await) {
                 (Ok(client), Ok(upstream)) => {
                     let mut client = TokioIo::new(client);
                     let mut upstream = TokioIo::new(upstream);
-                    if let Err(err) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                    if let Err(err) =
+                        tokio::io::copy_bidirectional(&mut client, &mut upstream).await
+                    {
                         tracing::debug!(error = %err, "websocket passthrough ended");
                     }
                 }
@@ -222,7 +317,9 @@ pub async fn forward_http(
         let (parts, _empty) = resp.into_parts();
         return Ok(Response::from_parts(
             parts,
-            http_body_util::Empty::new().map_err(|never: std::convert::Infallible| match never {}).boxed(),
+            http_body_util::Empty::new()
+                .map_err(|never: std::convert::Infallible| match never {})
+                .boxed(),
         ));
     }
 
@@ -239,13 +336,21 @@ pub fn https_redirect_response<B>(req: &Request<B>) -> Response<BoxBody<Bytes, h
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let host_no_port = host.split(':').next().unwrap_or(host);
-    let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
     let location = format!("https://{host_no_port}{path_and_query}");
 
     Response::builder()
         .status(hyper::StatusCode::MOVED_PERMANENTLY)
         .header(hyper::header::LOCATION, location)
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Empty::new()
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static redirect response is always valid")
 }
 
@@ -255,9 +360,16 @@ pub fn https_redirect_response<B>(req: &Request<B>) -> Response<BoxBody<Bytes, h
 /// reflected from request input, so -- unlike `proxy::login`'s
 /// `return_to` -- it's fine for this to leave the site; that's the whole
 /// point of the feature.
-pub fn redirect_target_response<B>(req: &Request<B>, target: &RedirectTarget) -> Response<BoxBody<Bytes, hyper::Error>> {
+pub fn redirect_target_response<B>(
+    req: &Request<B>,
+    target: &RedirectTarget,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     let location = if target.preserve_path {
-        let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
         format!("{}{}", target.target.trim_end_matches('/'), path_and_query)
     } else {
         target.target.clone()
@@ -270,7 +382,11 @@ pub fn redirect_target_response<B>(req: &Request<B>, target: &RedirectTarget) ->
     Response::builder()
         .status(status)
         .header(hyper::header::LOCATION, location)
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Empty::new()
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static redirect response is always valid")
 }
 
@@ -280,8 +396,14 @@ pub fn redirect_target_response<B>(req: &Request<B>, target: &RedirectTarget) ->
 /// SS8.3. This must be checked before `https_redirect_response` on a
 /// `force_https` host's port-80 listener -- the CA's validator speaks
 /// plain HTTP and never follows a redirect to `https`.
-pub fn http01_challenge_response<B>(state: &AppState, req: &Request<B>) -> Option<Response<BoxBody<Bytes, hyper::Error>>> {
-    let token = req.uri().path().strip_prefix(crate::acme::http01::CHALLENGE_PATH_PREFIX)?;
+pub fn http01_challenge_response<B>(
+    state: &AppState,
+    req: &Request<B>,
+) -> Option<Response<BoxBody<Bytes, hyper::Error>>> {
+    let token = req
+        .uri()
+        .path()
+        .strip_prefix(crate::acme::http01::CHALLENGE_PATH_PREFIX)?;
     let key_authorization = state.get_http01_challenge(token)?;
     Some(
         Response::builder()
@@ -322,7 +444,13 @@ fn percent_decode(input: &str) -> String {
 }
 
 fn content_type_for(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
@@ -348,7 +476,11 @@ fn static_not_found_response() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(hyper::StatusCode::NOT_FOUND)
         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(http_body_util::Full::new(Bytes::from(body)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Full::new(Bytes::from(body))
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static 404 response is always valid")
 }
 
@@ -357,7 +489,10 @@ fn static_not_found_response() -> Response<BoxBody<Bytes, hyper::Error>> {
 /// to `index.html` inside it; anything that resolves outside `root`
 /// (traversal via `../` or its percent-encoded form) or that doesn't
 /// exist as a file is a plain 404 -- never a directory listing.
-pub async fn serve_static_response<B>(req: &Request<B>, root: &Path) -> Response<BoxBody<Bytes, hyper::Error>> {
+pub async fn serve_static_response<B>(
+    req: &Request<B>,
+    root: &Path,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     let root = match tokio::fs::canonicalize(root).await {
         Ok(root) => root,
         Err(_) => return static_not_found_response(),
@@ -381,7 +516,11 @@ pub async fn serve_static_response<B>(req: &Request<B>, root: &Path) -> Response
         return static_not_found_response();
     }
 
-    let file_path = if resolved.is_dir() { resolved.join("index.html") } else { resolved };
+    let file_path = if resolved.is_dir() {
+        resolved.join("index.html")
+    } else {
+        resolved
+    };
     let file_path = match tokio::fs::canonicalize(&file_path).await {
         Ok(p) if p.starts_with(&root) && p.is_file() => p,
         _ => return static_not_found_response(),
@@ -391,7 +530,11 @@ pub async fn serve_static_response<B>(req: &Request<B>, root: &Path) -> Response
         Ok(contents) => Response::builder()
             .status(hyper::StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, content_type_for(&file_path))
-            .body(http_body_util::Full::new(Bytes::from(contents)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+            .body(
+                http_body_util::Full::new(Bytes::from(contents))
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed(),
+            )
             .expect("static file response is always valid"),
         Err(_) => static_not_found_response(),
     }
@@ -424,6 +567,111 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_samesite_none_downgrades_to_lax_and_preserves_other_attributes() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("_gitlab_session=abc123; path=/; secure; HttpOnly; SameSite=None"),
+        );
+
+        rewrite_samesite_none_to_lax(&mut headers);
+
+        let value = headers.get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert_eq!(value, "_gitlab_session=abc123; path=/; secure; HttpOnly; SameSite=Lax");
+    }
+
+    #[test]
+    fn rewrite_samesite_none_is_case_insensitive() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("foo=bar; samesite=none"));
+
+        rewrite_samesite_none_to_lax(&mut headers);
+
+        assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap(), "foo=bar; SameSite=Lax");
+    }
+
+    #[test]
+    fn rewrite_samesite_none_leaves_lax_and_strict_cookies_untouched() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("a=1; SameSite=Lax"));
+        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("b=2; SameSite=Strict"));
+        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("c=3"));
+
+        rewrite_samesite_none_to_lax(&mut headers);
+
+        let values: Vec<&str> = headers.get_all(hyper::header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(values, vec!["a=1; SameSite=Lax", "b=2; SameSite=Strict", "c=3"]);
+    }
+
+    #[test]
+    fn rewrite_samesite_none_handles_multiple_set_cookie_headers_independently() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("session=x; SameSite=None; Secure"));
+        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("pref=en; path=/"));
+        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("other=y; SameSite=None; Secure"));
+
+        rewrite_samesite_none_to_lax(&mut headers);
+
+        let values: Vec<&str> = headers.get_all(hyper::header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(values, vec!["session=x; SameSite=Lax; Secure", "pref=en; path=/", "other=y; SameSite=Lax; Secure"]);
+    }
+
+    #[tokio::test]
+    async fn forward_http_rewrites_samesite_none_cookies_only_when_the_host_option_is_enabled() {
+        async fn run(rewrite_enabled: bool) -> String {
+            let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = upstream_listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = upstream_listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    let body: BoxBody<Bytes, hyper::Error> =
+                        Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .header(hyper::header::SET_COOKIE, "session=x; Secure; SameSite=None")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            });
+
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = proxy_listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = proxy_listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+                let service = service_fn(move |req: Request<Incoming>| async move {
+                    let opts = UpstreamOptions {
+                        websockets_enabled: false,
+                        https: false,
+                        tls_verify: true,
+                        upstream_host_port: "unused:0",
+                        preserve_host: true,
+                        client_ip: "203.0.113.42".parse().unwrap(),
+                        rewrite_samesite_none_cookies: rewrite_enabled,
+                    };
+                    forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            });
+
+            let stream = TcpStream::connect(proxy_addr).await.unwrap();
+            let io = TokioIo::new(stream);
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+            tokio::spawn(conn);
+            let req = Request::builder().uri("/").header(hyper::header::HOST, "example.com").body(Empty::<Bytes>::new()).unwrap();
+            let resp = sender.send_request(req).await.unwrap();
+            resp.headers().get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap().to_string()
+        }
+
+        assert_eq!(run(true).await, "session=x; Secure; SameSite=Lax", "enabled must downgrade the upstream's SameSite=None");
+        assert_eq!(run(false).await, "session=x; Secure; SameSite=None", "disabled (the default) must leave the upstream's cookie untouched");
+    }
+
+    #[test]
     fn connection_header_with_multiple_tokens_still_detected() {
         let req = Request::builder()
             .header(CONNECTION, "keep-alive, Upgrade")
@@ -442,7 +690,12 @@ mod tests {
             .unwrap();
         let resp = https_redirect_response(&req);
         assert_eq!(resp.status(), hyper::StatusCode::MOVED_PERMANENTLY);
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "https://example.com/some/path?x=1");
     }
 
@@ -451,7 +704,9 @@ mod tests {
         use std::path::PathBuf;
 
         let cfg = Config {
-            network: NetworkConfig { bind_ranges: vec![] },
+            network: NetworkConfig {
+                bind_ranges: vec![],
+            },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
                 bind_ip_v6: None,
@@ -460,7 +715,9 @@ mod tests {
                 expose_admin_port: None,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
-                admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
+                admin_password_hash: Some(
+                    "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                ),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -477,7 +734,9 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -523,11 +782,20 @@ mod tests {
             .body(())
             .unwrap();
         let resp = https_redirect_response(&req);
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "https://example.com/");
     }
 
-    fn redirect_target(target: &str, preserve_path: bool, status: RedirectStatus) -> RedirectTarget {
+    fn redirect_target(
+        target: &str,
+        preserve_path: bool,
+        status: RedirectStatus,
+    ) -> RedirectTarget {
         RedirectTarget {
             target: target.into(),
             preserve_path,
@@ -541,7 +809,12 @@ mod tests {
         let target = redirect_target("https://new.example.com", true, RedirectStatus::Permanent);
         let resp = redirect_target_response(&req, &target);
         assert_eq!(resp.status(), hyper::StatusCode::MOVED_PERMANENTLY);
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "https://new.example.com/blog/post?x=1");
     }
 
@@ -550,16 +823,30 @@ mod tests {
         let req = Request::builder().uri("/post").body(()).unwrap();
         let target = redirect_target("https://new.example.com/", true, RedirectStatus::Permanent);
         let resp = redirect_target_response(&req, &target);
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "https://new.example.com/post");
     }
 
     #[test]
     fn redirect_target_response_ignores_the_request_path_when_not_preserving_it() {
         let req = Request::builder().uri("/whatever/path").body(()).unwrap();
-        let target = redirect_target("https://new.example.com/landing", false, RedirectStatus::Permanent);
+        let target = redirect_target(
+            "https://new.example.com/landing",
+            false,
+            RedirectStatus::Permanent,
+        );
         let resp = redirect_target_response(&req, &target);
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "https://new.example.com/landing");
     }
 
@@ -583,11 +870,20 @@ mod tests {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             let service = service_fn(|_req: Request<Incoming>| async {
-                let body: BoxBody<Bytes, hyper::Error> =
-                    Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
-                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-upstream", "yes").body(body).unwrap())
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(200)
+                        .header("x-upstream", "yes")
+                        .body(body)
+                        .unwrap(),
+                )
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -604,10 +900,15 @@ mod tests {
                     upstream_host_port: &upstream_host_port,
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
+                rewrite_samesite_none_cookies: false,
                 };
-                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -636,11 +937,26 @@ mod tests {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             let service = service_fn(|req: Request<Incoming>| async move {
-                let seen_host = req.headers().get(hyper::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
-                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-seen-host", seen_host).body(body).unwrap())
+                let seen_host = req
+                    .headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(200)
+                        .header("x-seen-host", seen_host)
+                        .body(body)
+                        .unwrap(),
+                )
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -656,21 +972,34 @@ mod tests {
                     upstream_host_port: "backend.internal:9999",
                     preserve_host: false,
                     client_ip: "127.0.0.1".parse().unwrap(),
+                rewrite_samesite_none_cookies: false,
                 };
-                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
         let io = TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
         tokio::spawn(conn);
-        let req = Request::builder().uri("/").header(hyper::header::HOST, "public.example.com").body(Empty::<Bytes>::new()).unwrap();
+        let req = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "public.example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let resp = sender.send_request(req).await.unwrap();
 
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("x-seen-host").unwrap(), "backend.internal:9999", "the upstream must see its own host:port, not the client's original Host header");
+        assert_eq!(
+            resp.headers().get("x-seen-host").unwrap(),
+            "backend.internal:9999",
+            "the upstream must see its own host:port, not the client's original Host header"
+        );
     }
 
     /// Real production bug this guards against: a genuine HTTP/2 request
@@ -684,18 +1013,34 @@ mod tests {
     /// from the request's own declared authority -- not the client's
     /// literal header, since here there isn't one.
     #[tokio::test]
-    async fn forward_http_synthesizes_a_host_header_from_an_h2_requests_authority_when_preserve_host_is_enabled() {
+    async fn forward_http_synthesizes_a_host_header_from_an_h2_requests_authority_when_preserve_host_is_enabled(
+    ) {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             let service = service_fn(|req: Request<Incoming>| async move {
-                let seen_host = req.headers().get(hyper::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
-                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-seen-host", seen_host).body(body).unwrap())
+                let seen_host = req
+                    .headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(200)
+                        .header("x-seen-host", seen_host)
+                        .body(body)
+                        .unwrap(),
+                )
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         // The "proxy" hop here speaks h2 cleartext (prior-knowledge,
@@ -716,8 +1061,11 @@ mod tests {
                     upstream_host_port: "unused:0",
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
+                rewrite_samesite_none_cookies: false,
                 };
-                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
             });
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)
@@ -727,12 +1075,18 @@ mod tests {
 
         let tcp = TcpStream::connect(proxy_addr).await.unwrap();
         let io = TokioIo::new(tcp);
-        let (mut sender, conn) = hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .unwrap();
         tokio::spawn(conn);
 
         // Absolute-form URI, no Host header at all -- hyper's h2 client
         // derives the :authority pseudo-header from the URI itself.
-        let req = Request::builder().uri("https://real.example.com/").body(Empty::<Bytes>::new()).unwrap();
+        let req = Request::builder()
+            .uri("https://real.example.com/")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let resp = sender.send_request(req).await.unwrap();
 
         assert_eq!(resp.status(), 200);
@@ -778,15 +1132,40 @@ mod tests {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             let service = service_fn(|req: Request<Incoming>| async move {
-                let xff = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let xfp = req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let xfh = req.headers().get("x-forwarded-host").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                let xff = req
+                    .headers()
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let xfp = req
+                    .headers()
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let xfh = req
+                    .headers()
+                    .get("x-forwarded-host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed();
                 Ok::<_, std::convert::Infallible>(
-                    Response::builder().status(200).header("x-seen-xff", xff).header("x-seen-xfp", xfp).header("x-seen-xfh", xfh).body(body).unwrap(),
+                    Response::builder()
+                        .status(200)
+                        .header("x-seen-xff", xff)
+                        .header("x-seen-xfp", xfp)
+                        .header("x-seen-xfh", xfh)
+                        .body(body)
+                        .unwrap(),
                 )
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -802,10 +1181,15 @@ mod tests {
                     upstream_host_port: "unused:0",
                     preserve_host: true,
                     client_ip: "203.0.113.42".parse().unwrap(),
+                    rewrite_samesite_none_cookies: false,
                 };
-                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -824,13 +1208,21 @@ mod tests {
         let resp = sender.send_request(req).await.unwrap();
 
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("x-seen-xff").unwrap(), "198.51.100.7, 203.0.113.42", "must append the real peer IP, not replace an existing chain");
+        assert_eq!(
+            resp.headers().get("x-seen-xff").unwrap(),
+            "198.51.100.7, 203.0.113.42",
+            "must append the real peer IP, not replace an existing chain"
+        );
         assert_eq!(resp.headers().get("x-seen-xfp").unwrap(), "https");
-        assert_eq!(resp.headers().get("x-seen-xfh").unwrap(), "public.example.com");
+        assert_eq!(
+            resp.headers().get("x-seen-xfh").unwrap(),
+            "public.example.com"
+        );
     }
 
     #[tokio::test]
-    async fn forward_http_downgrades_an_h2_requests_absolute_form_uri_to_origin_form_for_the_http1_upstream() {
+    async fn forward_http_downgrades_an_h2_requests_absolute_form_uri_to_origin_form_for_the_http1_upstream(
+    ) {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -853,8 +1245,18 @@ mod tests {
             let (stream, _) = proxy_listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             let service = service_fn(move |req: Request<Incoming>| async move {
-                let opts = UpstreamOptions { websockets_enabled: false, https: false, tls_verify: true, upstream_host_port: "unused:0", preserve_host: true, client_ip: "127.0.0.1".parse().unwrap() };
-                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: false,
+                    tls_verify: true,
+                    upstream_host_port: "unused:0",
+                    preserve_host: true,
+                    client_ip: "127.0.0.1".parse().unwrap(),
+                rewrite_samesite_none_cookies: false,
+                };
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
             });
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)
@@ -864,14 +1266,20 @@ mod tests {
 
         let tcp = TcpStream::connect(proxy_addr).await.unwrap();
         let io = TokioIo::new(tcp);
-        let (mut sender, conn) = hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .unwrap();
         tokio::spawn(conn);
 
         // Absolute-form URI, exactly what a real HTTP/2 client (every
         // modern browser) sends -- hyper's h2 client builds the request
         // from this directly, no literal Host header involved.
-        let req =
-            Request::builder().method("POST").uri("https://pve.jpps.us/api2/json/access/ticket").body(Empty::<Bytes>::new()).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://pve.jpps.us/api2/json/access/ticket")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let resp = sender.send_request(req).await.unwrap();
 
         assert_eq!(resp.status(), 200, "upstream only returns 200 if it saw an origin-form request line -- see the mock's own check");
@@ -894,21 +1302,36 @@ mod tests {
     /// just that the code compiles or that a verifier type is wired in
     /// somewhere. `verify: false` accepts it; `verify: true` (the next
     /// test) must reject the same upstream.
-    async fn run_https_upstream_round_trip(tls_verify: bool) -> Result<Response<Incoming>, BoxError> {
+    async fn run_https_upstream_round_trip(
+        tls_verify: bool,
+    ) -> Result<Response<Incoming>, BoxError> {
         let tls_config = Arc::new(self_signed_server_config("upstream.internal"));
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let Ok((stream, _)) = upstream_listener.accept().await else { return };
+            let Ok((stream, _)) = upstream_listener.accept().await else {
+                return;
+            };
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-            let Ok(tls_stream) = acceptor.accept(stream).await else { return };
+            let Ok(tls_stream) = acceptor.accept(stream).await else {
+                return;
+            };
             let io = TokioIo::new(tls_stream);
             let service = service_fn(|_req: Request<Incoming>| async {
-                let body: BoxBody<Bytes, hyper::Error> =
-                    Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
-                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-upstream-tls", "yes").body(body).unwrap())
+                let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(200)
+                        .header("x-upstream-tls", "yes")
+                        .body(body)
+                        .unwrap(),
+                )
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -924,18 +1347,30 @@ mod tests {
                     upstream_host_port: "upstream.internal:0",
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
+                rewrite_samesite_none_cookies: false,
                 };
-                forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let stream = TcpStream::connect(proxy_addr).await.unwrap();
         let io = TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
         tokio::spawn(conn);
-        let req = Request::builder().uri("/").header(hyper::header::HOST, "example.com").body(Empty::<Bytes>::new()).unwrap();
-        sender.send_request(req).await.map_err(|e| Box::new(e) as BoxError)
+        let req = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        sender
+            .send_request(req)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
     }
 
     #[tokio::test]
@@ -955,7 +1390,10 @@ mod tests {
     #[tokio::test]
     async fn forward_http_rejects_a_self_signed_https_upstream_when_verify_is_enabled() {
         let result = run_https_upstream_round_trip(true).await;
-        assert!(result.is_err(), "a self-signed cert must be rejected when tls_verify is enabled, not silently accepted");
+        assert!(
+            result.is_err(),
+            "a self-signed cert must be rejected when tls_verify is enabled, not silently accepted"
+        );
     }
 
     /// Mirrors this codebase's existing convention for filesystem-backed
@@ -969,7 +1407,10 @@ mod tests {
     }
 
     fn static_root_fixture() -> StaticRootFixture {
-        let base = std::env::temp_dir().join(format!("rust-proxy-static-root-test-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!(
+            "rust-proxy-static-root-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         let root = base.join("root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("index.html"), "<h1>home</h1>").unwrap();
@@ -1003,7 +1444,10 @@ mod tests {
         let req = Request::builder().uri("/style.css").body(()).unwrap();
         let resp = serve_static_response(&req, root.path()).await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);
-        assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "text/css; charset=utf-8");
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/css; charset=utf-8"
+        );
         assert_eq!(body_string(resp).await, "body{}");
     }
 
@@ -1044,7 +1488,10 @@ mod tests {
     #[tokio::test]
     async fn serve_static_response_refuses_a_percent_encoded_traversal_path() {
         let root = static_root_fixture();
-        let req = Request::builder().uri("/%2e%2e/%2e%2e/etc/passwd").body(()).unwrap();
+        let req = Request::builder()
+            .uri("/%2e%2e/%2e%2e/etc/passwd")
+            .body(())
+            .unwrap();
         let resp = serve_static_response(&req, root.path()).await;
         assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
     }

@@ -12,7 +12,10 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use super::jws::{b64url, encode_jws, AccountKey, JwsError};
-use super::types::{Authorization, Directory, FinalizePayload, Identifier, NewAccountPayload, NewOrderPayload, Order, Problem};
+use super::types::{
+    Authorization, Directory, FinalizePayload, Identifier, NewAccountPayload, NewOrderPayload,
+    Order, Problem,
+};
 
 const REPLAY_NONCE_HEADER: &str = "replay-nonce";
 const MAX_NONCE_RETRIES: u32 = 3;
@@ -53,7 +56,10 @@ pub struct AcmeClient {
 }
 
 impl AcmeClient {
-    pub async fn discover(http: &reqwest::Client, directory_url: &str) -> Result<Directory, AcmeError> {
+    pub async fn discover(
+        http: &reqwest::Client,
+        directory_url: &str,
+    ) -> Result<Directory, AcmeError> {
         let resp = http.get(directory_url).send().await?.error_for_status()?;
         Ok(resp.json().await?)
     }
@@ -72,7 +78,11 @@ impl AcmeClient {
 
     /// For tests / callers that already have a directory and don't want a
     /// second discovery round-trip.
-    pub fn with_directory(http: reqwest::Client, account_key: AccountKey, directory: Directory) -> Self {
+    pub fn with_directory(
+        http: reqwest::Client,
+        account_key: AccountKey,
+        directory: Directory,
+    ) -> Self {
         Self {
             http,
             account_key,
@@ -92,10 +102,18 @@ impl AcmeClient {
         }
         let resp = self.http.head(&self.directory.new_nonce).send().await?;
         remember_nonce_header(&self.nonce, resp.headers()).await;
-        self.nonce.lock().await.take().ok_or(AcmeError::MissingNonce)
+        self.nonce
+            .lock()
+            .await
+            .take()
+            .ok_or(AcmeError::MissingNonce)
     }
 
-    async fn signed_post(&self, url: &str, payload: Option<&Value>) -> Result<SignedResponse, AcmeError> {
+    async fn signed_post(
+        &self,
+        url: &str,
+        payload: Option<&Value>,
+    ) -> Result<SignedResponse, AcmeError> {
         for attempt in 0..MAX_NONCE_RETRIES {
             let nonce = self.fresh_nonce().await?;
             let kid = self.kid.lock().await.clone();
@@ -119,7 +137,8 @@ impl AcmeClient {
             }
 
             if let Ok(problem) = serde_json::from_slice::<Problem>(&body) {
-                let is_bad_nonce = problem.typ.as_deref() == Some("urn:ietf:params:acme:error:badNonce");
+                let is_bad_nonce =
+                    problem.typ.as_deref() == Some("urn:ietf:params:acme:error:badNonce");
                 if is_bad_nonce && attempt + 1 < MAX_NONCE_RETRIES {
                     continue;
                 }
@@ -135,16 +154,21 @@ impl AcmeClient {
             terms_of_service_agreed: true,
             contact: vec![format!("mailto:{contact_email}")],
         })?;
-        let resp = self.signed_post(&self.directory.new_account, Some(&payload)).await?;
+        let resp = self
+            .signed_post(&self.directory.new_account, Some(&payload))
+            .await?;
         let location = location_header(&resp.headers)?;
         *self.kid.lock().await = Some(location.clone());
         Ok(location)
     }
 
     pub async fn new_order(&self, domains: &[String]) -> Result<(String, Order), AcmeError> {
-        let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::dns(d.clone())).collect();
+        let identifiers: Vec<Identifier> =
+            domains.iter().map(|d| Identifier::dns(d.clone())).collect();
         let payload = serde_json::to_value(NewOrderPayload { identifiers })?;
-        let resp = self.signed_post(&self.directory.new_order, Some(&payload)).await?;
+        let resp = self
+            .signed_post(&self.directory.new_order, Some(&payload))
+            .await?;
         let location = location_header(&resp.headers)?;
         let order: Order = serde_json::from_slice(&resp.body)?;
         Ok((location, order))
@@ -159,7 +183,8 @@ impl AcmeClient {
     /// the actual DNS TXT record must already be published (see `dns01`)
     /// before this is called.
     pub async fn notify_challenge_ready(&self, challenge_url: &str) -> Result<(), AcmeError> {
-        self.signed_post(challenge_url, Some(&serde_json::json!({}))).await?;
+        self.signed_post(challenge_url, Some(&serde_json::json!({})))
+            .await?;
         Ok(())
     }
 
@@ -169,7 +194,9 @@ impl AcmeClient {
     }
 
     pub async fn finalize(&self, finalize_url: &str, csr_der: &[u8]) -> Result<Order, AcmeError> {
-        let payload = serde_json::to_value(FinalizePayload { csr: b64url(csr_der) })?;
+        let payload = serde_json::to_value(FinalizePayload {
+            csr: b64url(csr_der),
+        })?;
         let resp = self.signed_post(finalize_url, Some(&payload)).await?;
         Ok(serde_json::from_slice(&resp.body)?)
     }
@@ -186,7 +213,10 @@ impl AcmeClient {
 }
 
 async fn remember_nonce_header(slot: &Mutex<Option<String>>, headers: &HeaderMap) {
-    if let Some(value) = headers.get(REPLAY_NONCE_HEADER).and_then(|v| v.to_str().ok()) {
+    if let Some(value) = headers
+        .get(REPLAY_NONCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
         *slot.lock().await = Some(value.to_string());
     }
 }
@@ -233,7 +263,9 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let dir = AcmeClient::discover(&http, &format!("{}/directory", server.uri())).await.unwrap();
+        let dir = AcmeClient::discover(&http, &format!("{}/directory", server.uri()))
+            .await
+            .unwrap();
         assert_eq!(dir.new_nonce, format!("{}/acme/new-nonce", server.uri()));
     }
 
@@ -274,7 +306,9 @@ mod tests {
 
         Mock::given(method("HEAD"))
             .and(path("/acme/new-nonce"))
-            .respond_with(ResponseTemplate::new(200).insert_header(REPLAY_NONCE_HEADER, "stale-nonce"))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header(REPLAY_NONCE_HEADER, "stale-nonce"),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -345,7 +379,10 @@ mod tests {
 
         let err = client.new_account("admin@example.com").await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("contact field invalid"), "unexpected error message: {msg}");
+        assert!(
+            msg.contains("contact field invalid"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -378,7 +415,10 @@ mod tests {
         let directory = mock_directory(&server).await;
         let client = test_client(reqwest::Client::new(), directory);
 
-        let (location, order) = client.new_order(&["example.com".to_string()]).await.unwrap();
+        let (location, order) = client
+            .new_order(&["example.com".to_string()])
+            .await
+            .unwrap();
         assert_eq!(location, order_url);
         assert_eq!(order.authorizations.len(), 1);
         assert!(order.finalize.ends_with("/finalize"));

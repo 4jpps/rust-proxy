@@ -28,9 +28,7 @@ struct Args {
 enum Command {
     /// Hashes a password with argon2 for `admin.admin_password_hash` in
     /// config.toml -- the daemon never accepts a plaintext password there.
-    HashPassword {
-        password: String,
-    },
+    HashPassword { password: String },
     /// Safely snapshots the live sqlite DB to `destination`, then
     /// compacts the live DB in place -- always both together, in that
     /// order, never just one: a real backup should exist before the
@@ -47,9 +45,7 @@ enum Command {
     /// the nightly automated run every install gets out of the box;
     /// also usable by hand before a risky manual change.
     #[command(name = "backup-and-compact")]
-    BackupAndCompact {
-        destination: PathBuf,
-    },
+    BackupAndCompact { destination: PathBuf },
 }
 
 #[tokio::main]
@@ -66,11 +62,18 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(Command::BackupAndCompact { destination }) = &args.command {
         if destination.exists() {
-            anyhow::bail!("{} already exists -- refusing to overwrite (VACUUM INTO doesn't support it)", destination.display());
+            anyhow::bail!(
+                "{} already exists -- refusing to overwrite (VACUUM INTO doesn't support it)",
+                destination.display()
+            );
         }
         let pool = db::connect(&cfg.admin.db_path).await?;
         db::backup_to(&pool, destination).await?;
-        println!("backed up {} to {}", cfg.admin.db_path.display(), destination.display());
+        println!(
+            "backed up {} to {}",
+            cfg.admin.db_path.display(),
+            destination.display()
+        );
         db::vacuum(&pool).await?;
         println!("compacted {}", cfg.admin.db_path.display());
         return Ok(());
@@ -82,7 +85,12 @@ async fn main() -> anyhow::Result<()> {
     // logging.rs's own doc comment for the split's rationale. `_guards`
     // must stay alive for the whole process; dropping it early would
     // silently stop these files from being written to.
-    let log_dir = cfg.admin.db_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_dir = cfg
+        .admin
+        .db_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let _log_guards = logging::init(&log_dir)?;
 
     tracing::info!(config = %args.config.display(), "starting rust-proxy");

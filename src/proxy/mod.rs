@@ -102,7 +102,10 @@ fn reconcile_map<K: std::hash::Hash + Eq + Copy, F: Fn(&K) -> JoinHandle<()>>(
 
 fn passthrough_keys(port_rules: &[crate::config::PortRule]) -> Vec<(IpAddr, u16, Protocol)> {
     let mut keys = Vec::new();
-    for rule in port_rules.iter().filter(|r| r.enabled && r.passthrough_target.is_some()) {
+    for rule in port_rules
+        .iter()
+        .filter(|r| r.enabled && r.passthrough_target.is_some())
+    {
         for bind_ip in crate::config::port_rule_bind_ips(rule) {
             for port in rule.port_start..=rule.port_end {
                 keys.push((bind_ip, port, rule.protocol));
@@ -152,7 +155,9 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let sni = sni.clone();
-                    async move { handle_https_request(state, bind_ip, bind_port, peer_ip, sni, req).await }
+                    async move {
+                        handle_https_request(state, bind_ip, bind_port, peer_ip, sni, req).await
+                    }
                 });
                 // `auto::Builder` sniffs the connection preface to pick
                 // HTTP/1 vs HTTP/2 per-connection -- ALPN already steered
@@ -185,7 +190,9 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
 /// HTTP/2 multiplexing -- the same split Nginx itself makes.
 fn build_https_server_config(state: AppState) -> rustls::ServerConfig {
     let resolver = Arc::new(tls::CertResolver::new(state));
-    let mut server_config = rustls::ServerConfig::builder().with_no_client_auth().with_cert_resolver(resolver);
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     server_config
 }
@@ -236,7 +243,10 @@ async fn handle_https_request(
     // which *host* a given request routes to. `sni` remains the
     // fallback for the rare case a request genuinely declares no host
     // at all.
-    let lookup_name = uri_host.clone().or_else(|| host_header.clone()).or_else(|| sni.clone());
+    let lookup_name = uri_host
+        .clone()
+        .or_else(|| host_header.clone())
+        .or_else(|| sni.clone());
 
     let hosts = state.hosts();
     let matched = lookup_name
@@ -294,10 +304,18 @@ async fn handle_https_request(
         if resolved_acls.has_login_acl {
             let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
                 .zip(state.admin_identity())
-                .map(|(token, identity)| login::verify_session(&identity.session_secret, &host.domain, &token))
+                .map(|(token, identity)| {
+                    login::verify_session(&identity.session_secret, &host.domain, &token)
+                })
                 .unwrap_or(false);
             if !has_valid_session {
-                return Ok(handle_login_gate(&state, &host.domain, &resolved_acls.credentials, req).await);
+                return Ok(handle_login_gate(
+                    &state,
+                    &host.domain,
+                    &resolved_acls.credentials,
+                    req,
+                )
+                .await);
             }
         } else if resolved_acls.has_ip_allow_acl {
             return Ok(forbidden_page(&host.domain));
@@ -328,6 +346,7 @@ async fn handle_https_request(
         upstream_host_port: &host.upstream,
         preserve_host: host.upstream_preserve_host,
         client_ip: peer_ip,
+        rewrite_samesite_none_cookies: host.rewrite_samesite_none_cookies,
     };
     match http::forward_http(req, upstream, opts).await {
         Ok(resp) => Ok(resp),
@@ -352,7 +371,9 @@ fn apply_path_rewrite<B>(req: &mut Request<B>, rewrite: &crate::config::PathRewr
     if !re.is_match(original_path) {
         return;
     }
-    let new_path = re.replace(original_path, rewrite.replacement.as_str()).into_owned();
+    let new_path = re
+        .replace(original_path, rewrite.replacement.as_str())
+        .into_owned();
     let new_path_and_query = match req.uri().query() {
         Some(query) => format!("{new_path}?{query}"),
         None => new_path,
@@ -368,12 +389,15 @@ fn apply_path_rewrite<B>(req: &mut Request<B>, rewrite: &crate::config::PathRewr
 }
 
 fn find_cookie(req: &Request<Incoming>, name: &str) -> Option<String> {
-    req.headers().get(hyper::header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|raw| {
-        raw.split(';').find_map(|pair| {
-            let (k, v) = pair.trim().split_once('=')?;
-            (k == name).then(|| v.to_string())
+    req.headers()
+        .get(hyper::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|pair| {
+                let (k, v) = pair.trim().split_once('=')?;
+                (k == name).then(|| v.to_string())
+            })
         })
-    })
 }
 
 /// Handles every request to a login-gated host that arrived without a
@@ -391,10 +415,22 @@ async fn handle_login_gate(
     if req.method() == hyper::Method::POST && req.uri().path() == login::LOGIN_SUBMIT_PATH {
         let body_bytes = match req.into_body().collect().await {
             Ok(collected) => collected.to_bytes(),
-            Err(_) => return login_page_response(domain, "/", Some("invalid request"), hyper::StatusCode::BAD_REQUEST),
+            Err(_) => {
+                return login_page_response(
+                    domain,
+                    "/",
+                    Some("invalid request"),
+                    hyper::StatusCode::BAD_REQUEST,
+                )
+            }
         };
         let Ok(submission) = serde_json::from_slice::<login::LoginSubmission>(&body_bytes) else {
-            return login_page_response(domain, "/", Some("invalid request"), hyper::StatusCode::BAD_REQUEST);
+            return login_page_response(
+                domain,
+                "/",
+                Some("invalid request"),
+                hyper::StatusCode::BAD_REQUEST,
+            );
         };
         if login::verify_credentials_any(credentials, &submission.username, &submission.password) {
             let Some(identity) = state.admin_identity() else {
@@ -415,16 +451,30 @@ async fn handle_login_gate(
         );
     }
 
-    let return_to = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
+    let return_to = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/")
+        .to_string();
     login_page_response(domain, &return_to, None, hyper::StatusCode::OK)
 }
 
-fn login_page_response(domain: &str, return_to: &str, error: Option<&str>, status: hyper::StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
+fn login_page_response(
+    domain: &str,
+    return_to: &str,
+    error: Option<&str>,
+    status: hyper::StatusCode,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     let html = login::render_login_page(domain, return_to, error);
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(http_body_util::Full::new(Bytes::from(html)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Full::new(Bytes::from(html))
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static login page response is always valid")
 }
 
@@ -439,7 +489,11 @@ fn login_success_response(token: &str) -> Response<BoxBody<Bytes, hyper::Error>>
     Response::builder()
         .status(hyper::StatusCode::OK)
         .header(hyper::header::SET_COOKIE, cookie)
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Empty::new()
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static login success response is always valid")
 }
 
@@ -479,7 +533,9 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
                 }
             });
             tokio::spawn(async move {
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
             });
         }
     })
@@ -493,7 +549,12 @@ fn spawn_passthrough_listener(
 ) -> JoinHandle<()> {
     let target = port_rules
         .iter()
-        .find(|r| r.enabled && crate::config::port_rule_bind_ips(r).contains(&bind_ip) && (r.port_start..=r.port_end).contains(&port) && r.protocol == protocol)
+        .find(|r| {
+            r.enabled
+                && crate::config::port_rule_bind_ips(r).contains(&bind_ip)
+                && (r.port_start..=r.port_end).contains(&port)
+                && r.protocol == protocol
+        })
         .and_then(|r| r.passthrough_target.clone());
 
     let bind_addr = SocketAddr::from((bind_ip, port));
@@ -518,23 +579,33 @@ fn spawn_passthrough_listener(
 
 fn resolve_upstream(upstream: &str) -> Result<SocketAddr, std::io::Error> {
     use std::net::ToSocketAddrs;
-    upstream
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "upstream did not resolve to any address"))
+    upstream.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "upstream did not resolve to any address",
+        )
+    })
 }
 
 fn not_found() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(hyper::StatusCode::NOT_FOUND)
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Empty::new()
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static response is always valid")
 }
 
 fn bad_gateway() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(hyper::StatusCode::BAD_GATEWAY)
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Empty::new()
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static response is always valid")
 }
 
@@ -547,21 +618,32 @@ fn forbidden_page(domain: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(hyper::StatusCode::FORBIDDEN)
         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(http_body_util::Full::new(Bytes::from(html)).map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Full::new(Bytes::from(html))
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static forbidden page response is always valid")
 }
 
 fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
-        .body(http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed())
+        .body(
+            http_body_util::Empty::new()
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed(),
+        )
         .expect("static response is always valid")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig, PortRule, ProxyHost, Protocol};
+    use crate::config::{
+        AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig, PortRule, Protocol,
+        ProxyHost,
+    };
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::{DigitallySignedStruct, SignatureScheme};
     use rustls_pki_types::{CertificateDer, ServerName as RustlsServerName, UnixTime};
@@ -569,7 +651,10 @@ mod tests {
     use uuid::Uuid;
 
     fn path_rewrite(pattern: &str, replacement: &str) -> crate::config::PathRewrite {
-        crate::config::PathRewrite { pattern: pattern.into(), replacement: replacement.into() }
+        crate::config::PathRewrite {
+            pattern: pattern.into(),
+            replacement: replacement.into(),
+        }
     }
 
     /// This is the exact pattern/replacement wiki.jpps.us uses in
@@ -619,7 +704,10 @@ mod tests {
         // clicking a real wiki page link (already under /-/wikis/) must
         // never be rewritten a second time.
         let rw = gitlab_wiki_rewrite();
-        let mut req = Request::builder().uri("/jpps/rust-proxy/-/wikis/Getting-Started").body(()).unwrap();
+        let mut req = Request::builder()
+            .uri("/jpps/rust-proxy/-/wikis/Getting-Started")
+            .body(())
+            .unwrap();
         apply_path_rewrite(&mut req, &rw);
         assert_eq!(req.uri().path(), "/jpps/rust-proxy/-/wikis/Getting-Started");
     }
@@ -632,7 +720,10 @@ mod tests {
         // calls, which aren't project paths at all.
         let rw = gitlab_wiki_rewrite();
 
-        let mut assets_req = Request::builder().uri("/assets/application-abc123.css").body(()).unwrap();
+        let mut assets_req = Request::builder()
+            .uri("/assets/application-abc123.css")
+            .body(())
+            .unwrap();
         apply_path_rewrite(&mut assets_req, &rw);
         assert_eq!(assets_req.uri().path(), "/assets/application-abc123.css");
 
@@ -652,7 +743,10 @@ mod tests {
     #[test]
     fn apply_path_rewrite_does_not_touch_a_namespace_outside_the_allowlist() {
         let rw = gitlab_wiki_rewrite();
-        let mut req = Request::builder().uri("/someone-else/their-project").body(()).unwrap();
+        let mut req = Request::builder()
+            .uri("/someone-else/their-project")
+            .body(())
+            .unwrap();
         apply_path_rewrite(&mut req, &rw);
         assert_eq!(req.uri().path(), "/someone-else/their-project");
     }
@@ -660,7 +754,10 @@ mod tests {
     #[test]
     fn apply_path_rewrite_preserves_the_query_string() {
         let rw = path_rewrite(r"^/old(/.*)?$", "/new$1");
-        let mut req = Request::builder().uri("/old/page?x=1&y=2").body(()).unwrap();
+        let mut req = Request::builder()
+            .uri("/old/page?x=1&y=2")
+            .body(())
+            .unwrap();
         apply_path_rewrite(&mut req, &rw);
         assert_eq!(req.uri().path(), "/new/page");
         assert_eq!(req.uri().query(), Some("x=1&y=2"));
@@ -682,7 +779,13 @@ mod tests {
         assert_eq!(req.uri().path(), "/original");
     }
 
-    fn rule(bind_ip: &str, start: u16, end: u16, proto: Protocol, target: Option<&str>) -> PortRule {
+    fn rule(
+        bind_ip: &str,
+        start: u16,
+        end: u16,
+        proto: Protocol,
+        target: Option<&str>,
+    ) -> PortRule {
         PortRule {
             id: Uuid::new_v4(),
             bind_ip_v4: Some(bind_ip.parse().unwrap()),
@@ -699,7 +802,13 @@ mod tests {
 
     #[test]
     fn passthrough_keys_expand_a_range_into_one_key_per_port() {
-        let rules = vec![rule("10.0.0.4", 21115, 21119, Protocol::Tcp, Some("127.0.0.1:9000"))];
+        let rules = vec![rule(
+            "10.0.0.4",
+            21115,
+            21119,
+            Protocol::Tcp,
+            Some("127.0.0.1:9000"),
+        )];
         let keys = passthrough_keys(&rules);
         assert_eq!(keys.len(), 5);
         assert!(keys.contains(&("10.0.0.4".parse().unwrap(), 21117, Protocol::Tcp)));
@@ -724,7 +833,9 @@ mod tests {
 
     async fn test_state_with_cert(domain: &str) -> AppState {
         let cfg = Config {
-            network: NetworkConfig { bind_ranges: vec![] },
+            network: NetworkConfig {
+                bind_ranges: vec![],
+            },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
                 bind_ip_v6: None,
@@ -733,7 +844,9 @@ mod tests {
                 expose_admin_port: None,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
-                admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
+                admin_password_hash: Some(
+                    "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                ),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -750,7 +863,9 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         let state = AppState::new(cfg, pool, vec![], vec![], None, None, None);
         state.upsert_cert(domain.to_string(), tls::self_signed_entry(domain));
         state
@@ -787,15 +902,39 @@ mod tests {
         let mut acl_ids = Vec::new();
         if !access_allow_ips.is_empty() {
             let acl_id = Uuid::new_v4();
-            crate::db::create_acl_list(pool, acl_id, "test ip allow", crate::config::AclKind::IpAllow, chrono::Utc::now()).await.unwrap();
+            crate::db::create_acl_list(
+                pool,
+                acl_id,
+                "test ip allow",
+                crate::config::AclKind::IpAllow,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
             let cidrs: Vec<String> = access_allow_ips.iter().map(|net| net.to_string()).collect();
-            crate::db::add_acl_ip_entries(pool, acl_id, &cidrs).await.unwrap();
+            crate::db::add_acl_ip_entries(pool, acl_id, &cidrs)
+                .await
+                .unwrap();
             acl_ids.push(acl_id);
         }
         if let Some(auth) = access_login {
             let acl_id = Uuid::new_v4();
-            crate::db::create_acl_list(pool, acl_id, "test login", crate::config::AclKind::Login, chrono::Utc::now()).await.unwrap();
-            crate::db::add_acl_credentials(pool, acl_id, &[(auth.username.clone(), auth.password_hash.clone())]).await.unwrap();
+            crate::db::create_acl_list(
+                pool,
+                acl_id,
+                "test login",
+                crate::config::AclKind::Login,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            crate::db::add_acl_credentials(
+                pool,
+                acl_id,
+                &[(auth.username.clone(), auth.password_hash.clone())],
+            )
+            .await
+            .unwrap();
             acl_ids.push(acl_id);
         }
         ProxyHost {
@@ -817,6 +956,7 @@ mod tests {
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         }
     }
@@ -852,7 +992,9 @@ mod tests {
                 let sni = sni.clone();
                 async move { handle_https_request(state, bind_ip, bind_port, peer_ip, sni, req).await }
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -871,12 +1013,22 @@ mod tests {
             }
             None => Vec::new(),
         };
-        let req = builder.body(http_body_util::Full::new(Bytes::from(body_bytes))).unwrap();
+        let req = builder
+            .body(http_body_util::Full::new(Bytes::from(body_bytes)))
+            .unwrap();
         sender.send_request(req).await.unwrap()
     }
 
     async fn response_text(resp: Response<Incoming>) -> String {
-        String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+        String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
     }
 
     /// Real production bug this guards against: HTTP/2 connection
@@ -921,9 +1073,21 @@ mod tests {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let state = state.clone();
                 let sni = stale_sni.clone();
-                async move { handle_https_request(state, bind_ip, bind_port, "203.0.113.7".parse().unwrap(), sni, req).await }
+                async move {
+                    handle_https_request(
+                        state,
+                        bind_ip,
+                        bind_port,
+                        "203.0.113.7".parse().unwrap(),
+                        sni,
+                        req,
+                    )
+                    .await
+                }
             });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -938,8 +1102,16 @@ mod tests {
             .unwrap();
         let resp = sender.send_request(req).await.unwrap();
 
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
-        assert_eq!(location, "https://b.example.com", "the request's real Host header must win over the connection's stale SNI");
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            location, "https://b.example.com",
+            "the request's real Host header must win over the connection's stale SNI"
+        );
     }
 
     /// Real production gap the first fix (preferring the `Host` header
@@ -953,7 +1125,8 @@ mod tests {
     /// connection's possibly-stale `sni` -- the exact scenario
     /// connection coalescing creates.
     #[tokio::test]
-    async fn an_h2_requests_authority_wins_over_a_stale_connection_level_sni_with_no_host_header_at_all() {
+    async fn an_h2_requests_authority_wins_over_a_stale_connection_level_sni_with_no_host_header_at_all(
+    ) {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let target_first = crate::config::RedirectTarget {
@@ -989,7 +1162,17 @@ mod tests {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let state = state.clone();
                 let sni = sni.clone();
-                async move { handle_https_request(state, bind_ip, bind_port, "203.0.113.7".parse().unwrap(), sni, req).await }
+                async move {
+                    handle_https_request(
+                        state,
+                        bind_ip,
+                        bind_port,
+                        "203.0.113.7".parse().unwrap(),
+                        sni,
+                        req,
+                    )
+                    .await
+                }
             });
             hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)
@@ -1007,20 +1190,34 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let server_name = RustlsServerName::try_from("first.example.com").unwrap();
         let tls_stream = connector.connect(server_name, tcp).await.unwrap();
-        assert_eq!(tls_stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]), "must actually be h2 -- that's the whole point of this test");
+        assert_eq!(
+            tls_stream.get_ref().1.alpn_protocol(),
+            Some(&b"h2"[..]),
+            "must actually be h2 -- that's the whole point of this test"
+        );
 
         let io = TokioIo::new(tls_stream);
-        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .unwrap();
         tokio::spawn(conn);
 
         // Absolute-form URI, no Host header at all -- hyper's h2 client
         // derives the :authority pseudo-header from the URI itself,
         // same as a real browser reusing a coalesced connection for a
         // different origin than the one it originally connected to.
-        let req = Request::builder().uri("https://second.example.com/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        let req = Request::builder()
+            .uri("https://second.example.com/")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
         let resp = sender.send_request(req).await.unwrap();
 
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(
             location, "https://b.example.com",
             "an h2 request's :authority (no Host header at all) must win over the connection's stale SNI"
@@ -1029,7 +1226,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_from_an_ip_outside_the_allow_list_is_forbidden() {
-        let state = test_state_with_access("example.com", vec!["192.168.1.0/24".parse().unwrap()], None).await;
+        let state =
+            test_state_with_access("example.com", vec!["192.168.1.0/24".parse().unwrap()], None)
+                .await;
         let resp = send_test_request(
             state,
             "203.0.113.7".parse().unwrap(),
@@ -1040,23 +1239,23 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::FORBIDDEN);
-        assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "text/html; charset=utf-8");
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
         let body = response_text(resp).await;
-        assert!(body.contains("Access denied"), "an IP-only-denied host must get a real page, not a bare empty 403");
+        assert!(
+            body.contains("Access denied"),
+            "an IP-only-denied host must get a real page, not a bare empty 403"
+        );
     }
 
     #[tokio::test]
     async fn request_from_an_allowed_ip_without_a_login_gate_configured_is_not_blocked() {
-        let state = test_state_with_access("example.com", vec!["10.0.0.0/24".parse().unwrap()], None).await;
-        let resp = send_test_request(
-            state,
-            "10.0.0.42".parse().unwrap(),
-            "GET",
-            "/",
-            None,
-            None,
-        )
-        .await;
+        let state =
+            test_state_with_access("example.com", vec!["10.0.0.0/24".parse().unwrap()], None).await;
+        let resp =
+            send_test_request(state, "10.0.0.42".parse().unwrap(), "GET", "/", None, None).await;
         // Upstream is unreachable (127.0.0.1:1) so this proves access
         // control let the request through, not that it fully succeeded.
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
@@ -1070,9 +1269,16 @@ mod tests {
     /// credentials. The two now combine by OR: a matching IP admits the
     /// request outright, without ever touching the login gate.
     #[tokio::test]
-    async fn matching_ip_admits_the_request_without_requiring_login_even_when_a_login_acl_is_also_configured() {
-        let state = test_state_with_access("example.com", vec!["10.0.0.0/24".parse().unwrap()], Some(viewer_auth())).await;
-        let resp = send_test_request(state, "10.0.0.42".parse().unwrap(), "GET", "/", None, None).await;
+    async fn matching_ip_admits_the_request_without_requiring_login_even_when_a_login_acl_is_also_configured(
+    ) {
+        let state = test_state_with_access(
+            "example.com",
+            vec!["10.0.0.0/24".parse().unwrap()],
+            Some(viewer_auth()),
+        )
+        .await;
+        let resp =
+            send_test_request(state, "10.0.0.42".parse().unwrap(), "GET", "/", None, None).await;
         // Upstream is unreachable (127.0.0.1:1) so BAD_GATEWAY (not the
         // login page) proves the IP match alone was enough to admit it.
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
@@ -1084,11 +1290,27 @@ mod tests {
     /// configured on the host.
     #[tokio::test]
     async fn non_matching_ip_falls_through_to_the_login_gate_instead_of_403() {
-        let state = test_state_with_access("example.com", vec!["192.168.1.0/24".parse().unwrap()], Some(viewer_auth())).await;
-        let resp = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/", None, None).await;
+        let state = test_state_with_access(
+            "example.com",
+            vec!["192.168.1.0/24".parse().unwrap()],
+            Some(viewer_auth()),
+        )
+        .await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/",
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);
         let body = response_text(resp).await;
-        assert!(body.contains("Sign in to example.com"), "a non-matching IP with a login ACL also configured must get the login page, not a 403");
+        assert!(
+            body.contains("Sign in to example.com"),
+            "a non-matching IP with a login ACL also configured must get the login page, not a 403"
+        );
     }
 
     fn viewer_auth() -> crate::config::HostAuth {
@@ -1111,7 +1333,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);
-        assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "text/html; charset=utf-8");
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
         let body = response_text(resp).await;
         assert!(body.contains("Sign in to example.com"));
         // The originally-requested path is threaded through as return_to
@@ -1132,7 +1357,12 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);
-        let set_cookie = resp.headers().get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap();
+        let set_cookie = resp
+            .headers()
+            .get(hyper::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(set_cookie.starts_with(&format!("{}=", login::SESSION_COOKIE)));
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("Secure"));
@@ -1209,6 +1439,7 @@ mod tests {
             redirect: Some(redirect),
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         }
     }
@@ -1234,7 +1465,12 @@ mod tests {
         // the request fell through to resolve_upstream instead of being
         // answered as a redirect.
         assert_eq!(resp.status(), hyper::StatusCode::MOVED_PERMANENTLY);
-        let location = resp.headers().get(hyper::header::LOCATION).unwrap().to_str().unwrap();
+        let location = resp
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(location, "https://new.example.com/blog/post?x=1");
     }
 
@@ -1248,8 +1484,18 @@ mod tests {
         let mut host = redirect_host("example.com", target);
         let state = test_state_with_cert("example.com").await;
         let acl_id = Uuid::new_v4();
-        crate::db::create_acl_list(state.db(), acl_id, "test ip allow", crate::config::AclKind::IpAllow, chrono::Utc::now()).await.unwrap();
-        crate::db::add_acl_ip_entries(state.db(), acl_id, &["192.168.1.0/24".to_string()]).await.unwrap();
+        crate::db::create_acl_list(
+            state.db(),
+            acl_id,
+            "test ip allow",
+            crate::config::AclKind::IpAllow,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        crate::db::add_acl_ip_entries(state.db(), acl_id, &["192.168.1.0/24".to_string()])
+            .await
+            .unwrap();
         host.acl_ids = vec![acl_id];
         state.set_hosts(vec![host]);
         let resp = send_test_request(
@@ -1300,7 +1546,9 @@ mod tests {
             Ok(HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 
@@ -1325,9 +1573,16 @@ mod tests {
             let tls_stream = acceptor.accept(stream).await.unwrap();
             let io = TokioIo::new(tls_stream);
             let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
-                let body: BoxBody<Bytes, hyper::Error> =
-                    http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
-                Ok::<_, std::convert::Infallible>(Response::builder().status(200).header("x-h2-test", "yes").body(body).unwrap())
+                let body: BoxBody<Bytes, hyper::Error> = http_body_util::Empty::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(200)
+                        .header("x-h2-test", "yes")
+                        .body(body)
+                        .unwrap(),
+                )
             });
             hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)
@@ -1347,12 +1602,21 @@ mod tests {
         let tls_stream = connector.connect(server_name, tcp).await.unwrap();
 
         let negotiated = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
-        assert_eq!(negotiated, Some(b"h2".to_vec()), "server should have negotiated h2 when the client offered it");
+        assert_eq!(
+            negotiated,
+            Some(b"h2".to_vec()),
+            "server should have negotiated h2 when the client offered it"
+        );
 
         let io = TokioIo::new(tls_stream);
-        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .unwrap();
         tokio::spawn(conn);
-        let req = Request::builder().uri("/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
+        let req = Request::builder()
+            .uri("/")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
         let resp = sender.send_request(req).await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-h2-test").unwrap(), "yes");
@@ -1375,9 +1639,12 @@ mod tests {
             let tls_stream = acceptor.accept(stream).await.unwrap();
             let io = TokioIo::new(tls_stream);
             let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
-                let body: BoxBody<Bytes, hyper::Error> =
-                    http_body_util::Empty::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
-                Ok::<_, std::convert::Infallible>(Response::builder().status(200).body(body).unwrap())
+                let body: BoxBody<Bytes, hyper::Error> = http_body_util::Empty::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder().status(200).body(body).unwrap(),
+                )
             });
             hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(io, service)

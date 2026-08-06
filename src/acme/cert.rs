@@ -42,7 +42,11 @@ pub struct GeneratedCsr {
 /// enterprise ACME CA such as step-ca configured for OV) -- worth
 /// sending regardless, since it costs nothing against a CA that ignores
 /// it and is exactly what's needed against one that doesn't.
-pub fn generate_csr(domains: &[String], organization: Option<&str>, organizational_unit: Option<&str>) -> Result<GeneratedCsr, CertError> {
+pub fn generate_csr(
+    domains: &[String],
+    organization: Option<&str>,
+    organizational_unit: Option<&str>,
+) -> Result<GeneratedCsr, CertError> {
     let key_pair = KeyPair::generate()?;
     let mut params = CertificateParams::new(domains.to_vec())?;
     // `CertificateParams::new` (via its `Default` impl) hard-codes the
@@ -106,7 +110,8 @@ pub fn build_cert_entry(chain_pem: &str, key_pem: &str) -> Result<CertEntry, Cer
 /// this is what the renewal loop compares against `renew_before_days`, so
 /// it has to reflect the certificate the CA actually issued, not a guess.
 fn leaf_expiry(leaf: &CertificateDer<'static>) -> Result<chrono::DateTime<chrono::Utc>, CertError> {
-    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref()).map_err(|e| CertError::X509(e.to_string()))?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|e| CertError::X509(e.to_string()))?;
     let not_after_unix = parsed.validity().not_after.timestamp();
     chrono::DateTime::from_timestamp(not_after_unix, 0)
         .ok_or_else(|| CertError::X509(format!("notAfter timestamp {not_after_unix} out of range")))
@@ -120,7 +125,10 @@ mod tests {
     fn generates_a_der_csr_for_a_single_domain() {
         let csr = generate_csr(&["example.com".to_string()], None, None).unwrap();
         assert!(!csr.der.is_empty());
-        assert!(csr.key_pair_pem.contains("BEGIN PRIVATE KEY") || csr.key_pair_pem.contains("BEGIN EC PRIVATE KEY"));
+        assert!(
+            csr.key_pair_pem.contains("BEGIN PRIVATE KEY")
+                || csr.key_pair_pem.contains("BEGIN EC PRIVATE KEY")
+        );
     }
 
     /// Regression test for a real production failure: `rcgen`'s default
@@ -147,25 +155,42 @@ mod tests {
         // ASN.1 for these two -- if they're not requested at all,
         // neither string should appear anywhere in the DER, regardless
         // of encoding position.
-        assert!(!csr.der.windows(b"Acme Corp".len()).any(|w| w == b"Acme Corp"));
+        assert!(!csr
+            .der
+            .windows(b"Acme Corp".len())
+            .any(|w| w == b"Acme Corp"));
     }
 
     #[test]
     fn organization_and_organizational_unit_are_embedded_in_the_csr_when_set() {
-        let csr = generate_csr(&["example.com".to_string()], Some("Acme Corp"), Some("Platform Engineering")).unwrap();
+        let csr = generate_csr(
+            &["example.com".to_string()],
+            Some("Acme Corp"),
+            Some("Platform Engineering"),
+        )
+        .unwrap();
         assert!(
-            csr.der.windows(b"Acme Corp".len()).any(|w| w == b"Acme Corp"),
+            csr.der
+                .windows(b"Acme Corp".len())
+                .any(|w| w == b"Acme Corp"),
             "organization must actually be present in the CSR's Subject DN"
         );
         assert!(
-            csr.der.windows(b"Platform Engineering".len()).any(|w| w == b"Platform Engineering"),
+            csr.der
+                .windows(b"Platform Engineering".len())
+                .any(|w| w == b"Platform Engineering"),
             "organizational_unit must actually be present in the CSR's Subject DN"
         );
     }
 
     #[test]
     fn generates_a_csr_covering_multiple_sans() {
-        let csr = generate_csr(&["example.com".to_string(), "www.example.com".to_string()], None, None).unwrap();
+        let csr = generate_csr(
+            &["example.com".to_string(), "www.example.com".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!csr.der.is_empty());
     }
 

@@ -56,7 +56,11 @@ impl HetznerDns01 {
 
     #[cfg(test)]
     fn with_base_url(http: reqwest::Client, api_token: String, base_url: String) -> Self {
-        Self { http, api_token, base_url }
+        Self {
+            http,
+            api_token,
+            base_url,
+        }
     }
 
     async fn query_zone(&self, name: &str) -> Result<Option<DnsZone>, Dns01Error> {
@@ -71,7 +75,10 @@ impl HetznerDns01 {
             return Ok(None);
         }
         let body: HetznerZoneListResponse = resp.json().await?;
-        Ok(body.zones.into_iter().next().map(|z| DnsZone { id: z.id, name: z.name }))
+        Ok(body.zones.into_iter().next().map(|z| DnsZone {
+            id: z.id,
+            name: z.name,
+        }))
     }
 }
 
@@ -88,7 +95,12 @@ impl DnsProvider for HetznerDns01 {
         Err(Dns01Error::ZoneNotFound(domain.to_string()))
     }
 
-    async fn create_txt_record(&self, zone: &DnsZone, name: &str, content: &str) -> Result<String, Dns01Error> {
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error> {
         let relative_name = relative_record_name(name, &zone.name);
         let resp = self
             .http
@@ -158,7 +170,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/zones"))
             .and(query_param("name", "foo.example.com"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"zones": [], "meta": {}})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"zones": [], "meta": {}})),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -171,7 +186,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client =
+            HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
         let zone = client.find_zone("foo.example.com").await.unwrap();
         assert_eq!(zone.id, "zone-xyz");
         assert_eq!(zone.name, "example.com");
@@ -182,11 +198,15 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/zones"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"zones": [], "meta": {}})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"zones": [], "meta": {}})),
+            )
             .mount(&server)
             .await;
 
-        let client = HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client =
+            HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
         let err = client.find_zone("foo.example.com").await.unwrap_err();
         assert!(matches!(err, Dns01Error::ZoneNotFound(_)));
     }
@@ -202,8 +222,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "zone-xyz".into(), name: "example.com".into() };
+        let client =
+            HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let zone = DnsZone {
+            id: "zone-xyz".into(),
+            name: "example.com".into(),
+        };
         let id = client
             .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
             .await
@@ -222,8 +246,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "zone-xyz".into(), name: "example.com".into() };
+        let client =
+            HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let zone = DnsZone {
+            id: "zone-xyz".into(),
+            name: "example.com".into(),
+        };
         let err = client
             .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
             .await
@@ -240,8 +268,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "zone-xyz".into(), name: "example.com".into() };
-        client.delete_txt_record(&zone, "record-id-1").await.unwrap();
+        let client =
+            HetznerDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let zone = DnsZone {
+            id: "zone-xyz".into(),
+            name: "example.com".into(),
+        };
+        client
+            .delete_txt_record(&zone, "record-id-1")
+            .await
+            .unwrap();
     }
 }

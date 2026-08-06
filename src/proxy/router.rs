@@ -17,9 +17,19 @@ use crate::config::{host_bind_ips, ProxyHost};
 /// `bind_ip` is the family+address the connection actually arrived on
 /// (whichever of `bind_ip_v4`/`bind_ip_v6` the listener that accepted it
 /// was bound to) -- a host matches on either family it's configured for.
-pub fn match_host<'a>(hosts: &'a [ProxyHost], bind_ip: IpAddr, bind_port: u16, name: &str) -> Option<&'a ProxyHost> {
+pub fn match_host<'a>(
+    hosts: &'a [ProxyHost],
+    bind_ip: IpAddr,
+    bind_port: u16,
+    name: &str,
+) -> Option<&'a ProxyHost> {
     let name = strip_port_suffix(name);
-    let is_candidate = |h: &&ProxyHost, domain: &str| h.enabled && h.bind_port == bind_port && host_bind_ips(h).contains(&bind_ip) && h.domain.eq_ignore_ascii_case(domain);
+    let is_candidate = |h: &&ProxyHost, domain: &str| {
+        h.enabled
+            && h.bind_port == bind_port
+            && host_bind_ips(h).contains(&bind_ip)
+            && h.domain.eq_ignore_ascii_case(domain)
+    };
 
     if let Some(host) = hosts.iter().find(|h| is_candidate(h, name)) {
         return Some(host);
@@ -45,7 +55,11 @@ fn strip_port_suffix(name: &str) -> &str {
 /// keys and gets two real listener sockets. What the supervisor diffs
 /// against currently-running listeners to decide what to spawn/stop.
 pub fn https_listener_keys(hosts: &[ProxyHost]) -> Vec<(IpAddr, u16)> {
-    let mut keys: Vec<(IpAddr, u16)> = hosts.iter().filter(|h| h.enabled).flat_map(|h| host_bind_ips(h).into_iter().map(|ip| (ip, h.bind_port))).collect();
+    let mut keys: Vec<(IpAddr, u16)> = hosts
+        .iter()
+        .filter(|h| h.enabled)
+        .flat_map(|h| host_bind_ips(h).into_iter().map(|ip| (ip, h.bind_port)))
+        .collect();
     keys.sort();
     keys.dedup();
     keys
@@ -73,7 +87,13 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    fn host(domain: &str, bind_ip: &str, bind_port: u16, force_https: bool, enabled: bool) -> ProxyHost {
+    fn host(
+        domain: &str,
+        bind_ip: &str,
+        bind_port: u16,
+        force_https: bool,
+        enabled: bool,
+    ) -> ProxyHost {
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
@@ -93,6 +113,7 @@ mod tests {
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled,
         }
     }
@@ -171,7 +192,13 @@ mod tests {
     #[test]
     fn host_header_port_suffix_is_stripped_before_matching() {
         let hosts = vec![host("example.com", "10.0.0.2", 8443, true, true)];
-        let found = match_host(&hosts, "10.0.0.2".parse().unwrap(), 8443, "example.com:8443").unwrap();
+        let found = match_host(
+            &hosts,
+            "10.0.0.2".parse().unwrap(),
+            8443,
+            "example.com:8443",
+        )
+        .unwrap();
         assert_eq!(found.domain, "example.com");
     }
 
@@ -183,7 +210,13 @@ mod tests {
             host("c.example.com", "10.0.0.3", 8443, false, true),
         ];
         let keys = https_listener_keys(&hosts);
-        assert_eq!(keys, vec![("10.0.0.2".parse().unwrap(), 443), ("10.0.0.3".parse().unwrap(), 8443)]);
+        assert_eq!(
+            keys,
+            vec![
+                ("10.0.0.2".parse().unwrap(), 443),
+                ("10.0.0.3".parse().unwrap(), 8443)
+            ]
+        );
     }
 
     #[test]

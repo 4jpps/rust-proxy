@@ -39,15 +39,23 @@ const FALLBACK_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 /// or dev environment deliberately relying on an external firewall
 /// instead of `CAP_NET_ADMIN`.
 pub async fn validate_environment() -> Result<(), String> {
-    let output = Command::new("nft").arg("--version").output().await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "the `nft` binary was not found on PATH -- install the nftables package".to_string()
-        } else {
-            format!("couldn't run `nft --version`: {e}")
-        }
-    })?;
+    let output = Command::new("nft")
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "the `nft` binary was not found on PATH -- install the nftables package".to_string()
+            } else {
+                format!("couldn't run `nft --version`: {e}")
+            }
+        })?;
     if !output.status.success() {
-        return Err(format!("`nft --version` exited with {}: {}", output.status, String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "`nft --version` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(())
 }
@@ -78,14 +86,23 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
     // Only AclKind::IpAllow contributes; a Login-kind list selected on a
     // port rule is silently ignored (see PortRule::acl_ids' doc comment).
     let mut rule_allow_ips = std::collections::HashMap::new();
-    for rule in port_rules.iter().filter(|r| r.enabled && !r.acl_ids.is_empty()) {
+    for rule in port_rules
+        .iter()
+        .filter(|r| r.enabled && !r.acl_ids.is_empty())
+    {
         let resolved = crate::db::resolve_acl_ids(state.db(), &rule.acl_ids).await?;
         if resolved.has_ip_allow_acl {
             rule_allow_ips.insert(rule.id, resolved.allow_ips);
         }
     }
 
-    let ruleset = generator::generate_ruleset(&hosts, &port_rules, state.admin(), state.expose_admin_port(), &rule_allow_ips);
+    let ruleset = generator::generate_ruleset(
+        &hosts,
+        &port_rules,
+        state.admin(),
+        state.expose_admin_port(),
+        &rule_allow_ips,
+    );
     apply(&ruleset).await
 }
 

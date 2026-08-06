@@ -56,7 +56,12 @@ impl Route53Dns01 {
         let secret_access_key = parts.next().unwrap_or_default().to_string();
         Self {
             http,
-            signer: SigV4Signer::new(access_key_id, secret_access_key, SIGNING_REGION.to_string(), SIGNING_SERVICE.to_string()),
+            signer: SigV4Signer::new(
+                access_key_id,
+                secret_access_key,
+                SIGNING_REGION.to_string(),
+                SIGNING_SERVICE.to_string(),
+            ),
             base_url: BASE_URL.to_string(),
         }
     }
@@ -78,11 +83,21 @@ impl Route53Dns01 {
         "route53.amazonaws.com"
     }
 
-    async fn list_hosted_zones_by_name(&self, dns_name: &str) -> Result<Option<DnsZone>, Dns01Error> {
+    async fn list_hosted_zones_by_name(
+        &self,
+        dns_name: &str,
+    ) -> Result<Option<DnsZone>, Dns01Error> {
         let path = format!("/{API_VERSION}/hostedzonesbyname");
         let dns_name = dns_name.trim_end_matches('.');
         let query = [("dnsname", dns_name), ("maxitems", "1")];
-        let signed = self.signer.sign("GET", self.host_header(), &path, &query, b"", chrono::Utc::now());
+        let signed = self.signer.sign(
+            "GET",
+            self.host_header(),
+            &path,
+            &query,
+            b"",
+            chrono::Utc::now(),
+        );
 
         let resp = self
             .http
@@ -100,10 +115,23 @@ impl Route53Dns01 {
         parse_list_hosted_zones_response(&body, dns_name)
     }
 
-    async fn change_resource_record_sets(&self, zone_id: &str, action: &str, name: &str, content: &str) -> Result<(), Dns01Error> {
+    async fn change_resource_record_sets(
+        &self,
+        zone_id: &str,
+        action: &str,
+        name: &str,
+        content: &str,
+    ) -> Result<(), Dns01Error> {
         let path = format!("/{API_VERSION}/hostedzone/{zone_id}/rrset");
         let body = change_batch_xml(action, name, content);
-        let signed = self.signer.sign("POST", self.host_header(), &path, &[], body.as_bytes(), chrono::Utc::now());
+        let signed = self.signer.sign(
+            "POST",
+            self.host_header(),
+            &path,
+            &[],
+            body.as_bytes(),
+            chrono::Utc::now(),
+        );
 
         let resp = self
             .http
@@ -135,8 +163,14 @@ impl DnsProvider for Route53Dns01 {
         Err(Dns01Error::ZoneNotFound(domain.to_string()))
     }
 
-    async fn create_txt_record(&self, zone: &DnsZone, name: &str, content: &str) -> Result<String, Dns01Error> {
-        self.change_resource_record_sets(&zone.id, "UPSERT", name, content).await?;
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error> {
+        self.change_resource_record_sets(&zone.id, "UPSERT", name, content)
+            .await?;
         Ok(format!("{name}|{content}"))
     }
 
@@ -144,7 +178,8 @@ impl DnsProvider for Route53Dns01 {
         let (name, content) = record_id
             .split_once('|')
             .ok_or_else(|| Dns01Error::Api(format!("malformed Route53 record id: {record_id}")))?;
-        self.change_resource_record_sets(&zone.id, "DELETE", name, content).await
+        self.change_resource_record_sets(&zone.id, "DELETE", name, content)
+            .await
     }
 }
 
@@ -179,7 +214,9 @@ fn change_batch_xml(action: &str, name: &str, content: &str) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Walks `<ListHostedZonesByNameResponse><HostedZones><HostedZone>
@@ -190,7 +227,10 @@ fn xml_escape(s: &str) -> String {
 /// `ListHostedZonesByName` returns the *closest* match sorted near the
 /// requested name even when there's no exact match, so a naive
 /// "first result" read would silently pick the wrong zone.
-fn parse_list_hosted_zones_response(body: &str, dns_name: &str) -> Result<Option<DnsZone>, Dns01Error> {
+fn parse_list_hosted_zones_response(
+    body: &str,
+    dns_name: &str,
+) -> Result<Option<DnsZone>, Dns01Error> {
     let wanted = dns_name.trim_end_matches('.').to_ascii_lowercase();
     let mut reader = Reader::from_str(body);
     let mut buf = Vec::new();
@@ -204,7 +244,9 @@ fn parse_list_hosted_zones_response(body: &str, dns_name: &str) -> Result<Option
             Ok(Event::Start(e)) if e.name().as_ref() == b"Name" => in_name = true,
             Ok(Event::End(e)) if e.name().as_ref() == b"Name" => in_name = false,
             Ok(Event::Text(t)) if in_id => current_id = t.unescape().ok().map(|s| s.into_owned()),
-            Ok(Event::Text(t)) if in_name => current_name = t.unescape().ok().map(|s| s.into_owned()),
+            Ok(Event::Text(t)) if in_name => {
+                current_name = t.unescape().ok().map(|s| s.into_owned())
+            }
             Ok(Event::End(e)) if e.name().as_ref() == b"HostedZone" => {
                 if let (Some(id), Some(name)) = (current_id.take(), current_name.take()) {
                     let stripped_name = name.trim_end_matches('.').to_ascii_lowercase();
@@ -218,7 +260,11 @@ fn parse_list_hosted_zones_response(body: &str, dns_name: &str) -> Result<Option
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
-            Err(err) => return Err(Dns01Error::Api(format!("failed to parse Route53 response: {err}"))),
+            Err(err) => {
+                return Err(Dns01Error::Api(format!(
+                    "failed to parse Route53 response: {err}"
+                )))
+            }
         }
         buf.clear();
     }
@@ -287,11 +333,14 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/2013-04-01/hostedzonesbyname"))
             .and(query_param("dnsname", "example.com"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(list_zones_xml(&hosted_zone_xml("/hostedzone/Z123", "example.com."))))
+            .respond_with(ResponseTemplate::new(200).set_body_string(list_zones_xml(
+                &hosted_zone_xml("/hostedzone/Z123", "example.com."),
+            )))
             .mount(&server)
             .await;
 
-        let client = Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
+        let client =
+            Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
         let zone = client.find_zone("foo.example.com").await.unwrap();
         assert_eq!(zone.id, "Z123");
         assert_eq!(zone.name, "example.com");
@@ -305,7 +354,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
+        let client =
+            Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
         let err = client.find_zone("foo.example.com").await.unwrap_err();
         assert!(matches!(err, Dns01Error::ZoneNotFound(_)));
     }
@@ -318,16 +368,21 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(query_param("dnsname", "foo.example.com"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(list_zones_xml(&hosted_zone_xml("/hostedzone/Z999", "other.com."))))
+            .respond_with(ResponseTemplate::new(200).set_body_string(list_zones_xml(
+                &hosted_zone_xml("/hostedzone/Z999", "other.com."),
+            )))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(query_param("dnsname", "example.com"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(list_zones_xml(&hosted_zone_xml("/hostedzone/Z123", "example.com."))))
+            .respond_with(ResponseTemplate::new(200).set_body_string(list_zones_xml(
+                &hosted_zone_xml("/hostedzone/Z123", "example.com."),
+            )))
             .mount(&server)
             .await;
 
-        let client = Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
+        let client =
+            Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
         let zone = client.find_zone("foo.example.com").await.unwrap();
         assert_eq!(zone.id, "Z123");
     }
@@ -343,9 +398,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
-        let zone = DnsZone { id: "Z123".into(), name: "example.com".into() };
-        let record_id = client.create_txt_record(&zone, "_acme-challenge.example.com", "digest-value").await.unwrap();
+        let client =
+            Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
+        let zone = DnsZone {
+            id: "Z123".into(),
+            name: "example.com".into(),
+        };
+        let record_id = client
+            .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
+            .await
+            .unwrap();
         assert_eq!(record_id, "_acme-challenge.example.com|digest-value");
     }
 
@@ -359,9 +421,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
-        let zone = DnsZone { id: "Z123".into(), name: "example.com".into() };
-        let err = client.create_txt_record(&zone, "_acme-challenge.example.com", "digest-value").await.unwrap_err();
+        let client =
+            Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
+        let zone = DnsZone {
+            id: "Z123".into(),
+            name: "example.com".into(),
+        };
+        let err = client
+            .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("bad request"));
     }
 
@@ -376,16 +445,33 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
-        let zone = DnsZone { id: "Z123".into(), name: "example.com".into() };
-        client.delete_txt_record(&zone, "_acme-challenge.example.com|digest-value").await.unwrap();
+        let client =
+            Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), server.uri());
+        let zone = DnsZone {
+            id: "Z123".into(),
+            name: "example.com".into(),
+        };
+        client
+            .delete_txt_record(&zone, "_acme-challenge.example.com|digest-value")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn delete_txt_record_rejects_a_malformed_record_id() {
-        let client = Route53Dns01::with_base_url(reqwest::Client::new(), "AKID:SECRET".into(), "http://localhost".into());
-        let zone = DnsZone { id: "Z123".into(), name: "example.com".into() };
-        let err = client.delete_txt_record(&zone, "no-separator-here").await.unwrap_err();
+        let client = Route53Dns01::with_base_url(
+            reqwest::Client::new(),
+            "AKID:SECRET".into(),
+            "http://localhost".into(),
+        );
+        let zone = DnsZone {
+            id: "Z123".into(),
+            name: "example.com".into(),
+        };
+        let err = client
+            .delete_txt_record(&zone, "no-separator-here")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("malformed"));
     }
 }

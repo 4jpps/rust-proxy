@@ -144,6 +144,10 @@
           <label class="chk" id="host-upstream-tls-verify-wrap"><input type="checkbox" name="upstream_tls_verify" checked> Verify upstream certificate (uncheck to accept a self-signed one)</label>
           <label class="chk"><input type="checkbox" name="upstream_preserve_host" checked> Forward the original Host header to upstream (uncheck to send upstream's own host:port instead)</label>
         </div>
+        <div class="checks">
+          <label class="chk"><input type="checkbox" name="rewrite_samesite_none_cookies"> Downgrade SameSite=None cookies from upstream to SameSite=Lax</label>
+        </div>
+        <p class="hint">Some applications hardcode <code>SameSite=None</code> on their session cookie even with no real cross-site need -- modern browsers' privacy/tracking-protection features can silently drop exactly that kind of cookie, breaking login with no clear error. Only enable this if you're seeing unexplained login/session failures with a specific upstream; a host that genuinely needs <code>SameSite=None</code> (an embeddable widget, a real cross-site OAuth flow) would break if this were on unconditionally.</p>
         <p class="hint" id="host-existing-cert-hint" style="display:none"></p>
       </fieldset>
 
@@ -629,6 +633,7 @@ function setHostFormMode(host) {
   toggleUpstreamTlsVerifyVisibility();
   form.websockets.checked = host.websockets;
   form.force_https.checked = host.force_https;
+  form.rewrite_samesite_none_cookies.checked = host.rewrite_samesite_none_cookies;
   form.enabled.checked = host.enabled;
   form.acme_enabled.checked = host.acme_enabled;
   form.acme_challenge_type.value = host.acme_challenge_type;
@@ -765,6 +770,7 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
     upstream_https: fd.get('upstream_https') === 'on',
     upstream_tls_verify: fd.get('upstream_tls_verify') === 'on',
     upstream_preserve_host: fd.get('upstream_preserve_host') === 'on',
+    rewrite_samesite_none_cookies: fd.get('rewrite_samesite_none_cookies') === 'on',
     websockets: fd.get('websockets') === 'on',
     force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
     acme_challenge_type: fd.get('acme_challenge_type'),

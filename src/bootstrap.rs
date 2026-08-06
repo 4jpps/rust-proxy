@@ -23,7 +23,10 @@ use crate::state::{AdminIdentity, AppState};
 /// silently overwrites admin-UI-managed state, but a genuinely fresh
 /// DB still gets whatever config.toml shipped instead of an empty
 /// dashboard.
-pub async fn load_or_seed_hosts_and_port_rules(db_pool: &SqlitePool, cfg: &Config) -> Result<(Vec<ProxyHost>, Vec<PortRule>), sqlx::Error> {
+pub async fn load_or_seed_hosts_and_port_rules(
+    db_pool: &SqlitePool,
+    cfg: &Config,
+) -> Result<(Vec<ProxyHost>, Vec<PortRule>), sqlx::Error> {
     let mut hosts = crate::db::load_hosts(db_pool).await?;
     let mut port_rules = crate::db::load_port_rules(db_pool).await?;
     if hosts.is_empty() && !cfg.hosts.is_empty() {
@@ -43,9 +46,17 @@ pub async fn load_or_seed_hosts_and_port_rules(db_pool: &SqlitePool, cfg: &Confi
 /// forward from before the multi-credential DB table existed. Omitted/
 /// blank `dns_api_token` means no implicit row; credentials must then
 /// come from the DB (admin UI or setup wizard) instead.
-pub async fn seed_default_dns_credential_if_configured(db_pool: &SqlitePool, cfg: &Config) -> Result<(), sqlx::Error> {
+pub async fn seed_default_dns_credential_if_configured(
+    db_pool: &SqlitePool,
+    cfg: &Config,
+) -> Result<(), sqlx::Error> {
     if !cfg.acme.dns_api_token.trim().is_empty() {
-        crate::db::seed_default_dns_credential(db_pool, cfg.acme.dns_provider, &cfg.acme.dns_api_token).await?;
+        crate::db::seed_default_dns_credential(
+            db_pool,
+            cfg.acme.dns_provider,
+            &cfg.acme.dns_api_token,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -57,7 +68,9 @@ pub async fn seed_default_dns_credential_if_configured(db_pool: &SqlitePool, cfg
 /// set) always win over this at *read* time, on every call to
 /// `AppState::admin_identity`, not just here at startup -- this
 /// function only resolves what's persisted, not the final precedence.
-pub async fn load_persisted_admin_identity(db_pool: &SqlitePool) -> Result<Option<AdminIdentity>, sqlx::Error> {
+pub async fn load_persisted_admin_identity(
+    db_pool: &SqlitePool,
+) -> Result<Option<AdminIdentity>, sqlx::Error> {
     let row = crate::db::load_admin_identity(db_pool).await?;
     Ok(row.map(|row| AdminIdentity {
         username: row.username,
@@ -80,7 +93,15 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
     let acme_contact_email = crate::db::load_acme_contact_email(&db_pool).await?;
     let expose_admin_port = crate::db::load_expose_admin_port(&db_pool).await?;
 
-    let state = AppState::new(cfg, db_pool, hosts, port_rules, admin_identity, acme_contact_email, expose_admin_port);
+    let state = AppState::new(
+        cfg,
+        db_pool,
+        hosts,
+        port_rules,
+        admin_identity,
+        acme_contact_email,
+        expose_admin_port,
+    );
     crate::acme::load_certs_from_disk(&state)?;
     Ok(state)
 }
@@ -93,7 +114,9 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            network: crate::config::NetworkConfig { bind_ranges: vec![] },
+            network: crate::config::NetworkConfig {
+                bind_ranges: vec![],
+            },
             admin: crate::config::AdminConfig {
                 bind_ip_v4: Some(Ipv4Addr::UNSPECIFIED),
                 bind_ip_v6: None,
@@ -122,7 +145,9 @@ mod tests {
     }
 
     async fn memory_pool() -> SqlitePool {
-        crate::db::connect(&PathBuf::from(":memory:")).await.unwrap()
+        crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -148,16 +173,25 @@ mod tests {
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
 
-        let (hosts, _) = load_or_seed_hosts_and_port_rules(&pool, &cfg).await.unwrap();
+        let (hosts, _) = load_or_seed_hosts_and_port_rules(&pool, &cfg)
+            .await
+            .unwrap();
         assert_eq!(hosts.len(), 1, "empty DB should be seeded from config.toml");
 
         // Second call, DB no longer empty -- config.toml's copy must not
         // be re-applied/duplicated even though cfg.hosts is unchanged.
-        let (hosts_again, _) = load_or_seed_hosts_and_port_rules(&pool, &cfg).await.unwrap();
-        assert_eq!(hosts_again.len(), 1, "must not duplicate on a second call once the DB has real data");
+        let (hosts_again, _) = load_or_seed_hosts_and_port_rules(&pool, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            hosts_again.len(),
+            1,
+            "must not duplicate on a second call once the DB has real data"
+        );
     }
 
     #[tokio::test]
@@ -165,11 +199,21 @@ mod tests {
         let pool = memory_pool().await;
         let mut cfg = test_config();
         cfg.acme.dns_api_token = "  ".into(); // blank after trim
-        seed_default_dns_credential_if_configured(&pool, &cfg).await.unwrap();
-        assert!(crate::db::list_dns_credentials(&pool).await.unwrap().is_empty(), "a blank token must not seed anything");
+        seed_default_dns_credential_if_configured(&pool, &cfg)
+            .await
+            .unwrap();
+        assert!(
+            crate::db::list_dns_credentials(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a blank token must not seed anything"
+        );
 
         cfg.acme.dns_api_token = "real-token".into();
-        seed_default_dns_credential_if_configured(&pool, &cfg).await.unwrap();
+        seed_default_dns_credential_if_configured(&pool, &cfg)
+            .await
+            .unwrap();
         let creds = crate::db::list_dns_credentials(&pool).await.unwrap();
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].name, "default");
@@ -178,10 +222,18 @@ mod tests {
     #[tokio::test]
     async fn persisted_admin_identity_is_none_before_setup_and_populated_after() {
         let pool = memory_pool().await;
-        assert!(load_persisted_admin_identity(&pool).await.unwrap().is_none());
+        assert!(load_persisted_admin_identity(&pool)
+            .await
+            .unwrap()
+            .is_none());
 
-        crate::db::create_admin_identity_if_absent(&pool, "admin", "hash", "secret").await.unwrap();
-        let identity = load_persisted_admin_identity(&pool).await.unwrap().expect("should now be present");
+        crate::db::create_admin_identity_if_absent(&pool, "admin", "hash", "secret")
+            .await
+            .unwrap();
+        let identity = load_persisted_admin_identity(&pool)
+            .await
+            .unwrap()
+            .expect("should now be present");
         assert_eq!(identity.username, "admin");
         assert_eq!(identity.password_hash, "hash");
         assert_eq!(identity.session_secret, "secret");
@@ -190,7 +242,9 @@ mod tests {
     #[tokio::test]
     async fn build_app_state_wires_everything_together() {
         let cfg = test_config();
-        let state = build_app_state(cfg).await.expect("should build cleanly with no hosts/certs configured");
+        let state = build_app_state(cfg)
+            .await
+            .expect("should build cleanly with no hosts/certs configured");
         assert_eq!(state.hosts().len(), 0);
         assert_eq!(state.port_rules().len(), 0);
         assert!(state.admin_identity().is_none());

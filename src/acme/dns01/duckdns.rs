@@ -40,7 +40,11 @@ impl DuckDnsDns01 {
 
     #[cfg(test)]
     fn with_base_url(http: reqwest::Client, token: String, base_url: String) -> Self {
-        Self { http, token, base_url }
+        Self {
+            http,
+            token,
+            base_url,
+        }
     }
 
     async fn update(&self, subdomain: &str, txt: &str, clear: bool) -> Result<(), Dns01Error> {
@@ -61,7 +65,10 @@ impl DuckDnsDns01 {
         // this client doesn't set) -- there's no structured error body
         // to extract a message from.
         if body.trim() != "OK" {
-            return Err(Dns01Error::Api(format!("DuckDNS update returned \"{}\" (expected OK)", body.trim())));
+            return Err(Dns01Error::Api(format!(
+                "DuckDNS update returned \"{}\" (expected OK)",
+                body.trim()
+            )));
         }
         Ok(())
     }
@@ -87,7 +94,8 @@ fn registered_subdomain(domain: &str) -> Option<String> {
 #[async_trait]
 impl DnsProvider for DuckDnsDns01 {
     async fn find_zone(&self, domain: &str) -> Result<DnsZone, Dns01Error> {
-        let subdomain = registered_subdomain(domain).ok_or_else(|| Dns01Error::ZoneNotFound(domain.to_string()))?;
+        let subdomain = registered_subdomain(domain)
+            .ok_or_else(|| Dns01Error::ZoneNotFound(domain.to_string()))?;
         Ok(DnsZone {
             id: subdomain.clone(),
             name: subdomain,
@@ -97,7 +105,12 @@ impl DnsProvider for DuckDnsDns01 {
     /// `name` (the fully-qualified `_acme-challenge...` record name) is
     /// unused -- DuckDNS has no concept of a record name to target, only
     /// the one TXT slot for the whole subdomain.
-    async fn create_txt_record(&self, zone: &DnsZone, _name: &str, content: &str) -> Result<String, Dns01Error> {
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        _name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error> {
         self.update(&zone.id, content, false).await?;
         Ok(zone.id.clone())
     }
@@ -117,17 +130,26 @@ mod tests {
 
     #[test]
     fn registered_subdomain_strips_the_duckdns_org_suffix() {
-        assert_eq!(registered_subdomain("myhost.duckdns.org").as_deref(), Some("myhost"));
+        assert_eq!(
+            registered_subdomain("myhost.duckdns.org").as_deref(),
+            Some("myhost")
+        );
     }
 
     #[test]
     fn registered_subdomain_reduces_a_deeper_hostname_to_the_registered_label() {
-        assert_eq!(registered_subdomain("app.myhost.duckdns.org").as_deref(), Some("myhost"));
+        assert_eq!(
+            registered_subdomain("app.myhost.duckdns.org").as_deref(),
+            Some("myhost")
+        );
     }
 
     #[test]
     fn registered_subdomain_is_case_insensitive() {
-        assert_eq!(registered_subdomain("MyHost.DuckDNS.org").as_deref(), Some("myhost"));
+        assert_eq!(
+            registered_subdomain("MyHost.DuckDNS.org").as_deref(),
+            Some("myhost")
+        );
     }
 
     #[test]
@@ -140,7 +162,8 @@ mod tests {
         // No mock mounted at all -- if find_zone made any HTTP request
         // this would fail with a connection error, proving it doesn't.
         let server = MockServer::start().await;
-        let client = DuckDnsDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client =
+            DuckDnsDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
         let zone = client.find_zone("app.myhost.duckdns.org").await.unwrap();
         assert_eq!(zone.id, "myhost");
         assert_eq!(zone.name, "myhost");
@@ -148,7 +171,11 @@ mod tests {
 
     #[tokio::test]
     async fn find_zone_errors_for_a_non_duckdns_domain() {
-        let client = DuckDnsDns01::with_base_url(reqwest::Client::new(), "test-token".into(), "http://unused.invalid".into());
+        let client = DuckDnsDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            "http://unused.invalid".into(),
+        );
         let err = client.find_zone("example.com").await.unwrap_err();
         assert!(matches!(err, Dns01Error::ZoneNotFound(_)));
     }
@@ -166,9 +193,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DuckDnsDns01::with_base_url(reqwest::Client::new(), "test-token".into(), format!("{}/update", server.uri()));
-        let zone = DnsZone { id: "myhost".into(), name: "myhost".into() };
-        let record_id = client.create_txt_record(&zone, "_acme-challenge.myhost.duckdns.org", "digest-value").await.unwrap();
+        let client = DuckDnsDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            format!("{}/update", server.uri()),
+        );
+        let zone = DnsZone {
+            id: "myhost".into(),
+            name: "myhost".into(),
+        };
+        let record_id = client
+            .create_txt_record(&zone, "_acme-challenge.myhost.duckdns.org", "digest-value")
+            .await
+            .unwrap();
         assert_eq!(record_id, "myhost");
     }
 
@@ -181,9 +218,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DuckDnsDns01::with_base_url(reqwest::Client::new(), "test-token".into(), format!("{}/update", server.uri()));
-        let zone = DnsZone { id: "myhost".into(), name: "myhost".into() };
-        let err = client.create_txt_record(&zone, "_acme-challenge.myhost.duckdns.org", "digest-value").await.unwrap_err();
+        let client = DuckDnsDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            format!("{}/update", server.uri()),
+        );
+        let zone = DnsZone {
+            id: "myhost".into(),
+            name: "myhost".into(),
+        };
+        let err = client
+            .create_txt_record(&zone, "_acme-challenge.myhost.duckdns.org", "digest-value")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("KO"));
     }
 
@@ -200,8 +247,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DuckDnsDns01::with_base_url(reqwest::Client::new(), "test-token".into(), format!("{}/update", server.uri()));
-        let zone = DnsZone { id: "myhost".into(), name: "myhost".into() };
+        let client = DuckDnsDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            format!("{}/update", server.uri()),
+        );
+        let zone = DnsZone {
+            id: "myhost".into(),
+            name: "myhost".into(),
+        };
         client.delete_txt_record(&zone, "myhost").await.unwrap();
     }
 }

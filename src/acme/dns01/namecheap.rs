@@ -115,7 +115,12 @@ impl NamecheapDns01 {
         parse_get_hosts_response(&body)
     }
 
-    async fn set_hosts(&self, sld: &str, tld: &str, hosts: &[HostRecord]) -> Result<(), Dns01Error> {
+    async fn set_hosts(
+        &self,
+        sld: &str,
+        tld: &str,
+        hosts: &[HostRecord],
+    ) -> Result<(), Dns01Error> {
         let mut params = self.base_params("namecheap.domains.dns.setHosts");
         params.push(("SLD".to_string(), sld.to_string()));
         params.push(("TLD".to_string(), tld.to_string()));
@@ -163,14 +168,27 @@ impl NamecheapDns01 {
 #[async_trait]
 impl DnsProvider for NamecheapDns01 {
     async fn find_zone(&self, domain: &str) -> Result<DnsZone, Dns01Error> {
-        let candidate = Self::zone_candidate(domain).ok_or_else(|| Dns01Error::ZoneNotFound(domain.to_string()))?;
-        let (sld, tld) = Self::split_sld_tld(&candidate).ok_or_else(|| Dns01Error::ZoneNotFound(domain.to_string()))?;
-        self.get_hosts(&sld, &tld).await.map_err(|_| Dns01Error::ZoneNotFound(domain.to_string()))?;
-        Ok(DnsZone { id: candidate.clone(), name: candidate })
+        let candidate = Self::zone_candidate(domain)
+            .ok_or_else(|| Dns01Error::ZoneNotFound(domain.to_string()))?;
+        let (sld, tld) = Self::split_sld_tld(&candidate)
+            .ok_or_else(|| Dns01Error::ZoneNotFound(domain.to_string()))?;
+        self.get_hosts(&sld, &tld)
+            .await
+            .map_err(|_| Dns01Error::ZoneNotFound(domain.to_string()))?;
+        Ok(DnsZone {
+            id: candidate.clone(),
+            name: candidate,
+        })
     }
 
-    async fn create_txt_record(&self, zone: &DnsZone, name: &str, content: &str) -> Result<String, Dns01Error> {
-        let (sld, tld) = Self::split_sld_tld(&zone.name).ok_or_else(|| Dns01Error::ZoneNotFound(zone.name.clone()))?;
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error> {
+        let (sld, tld) = Self::split_sld_tld(&zone.name)
+            .ok_or_else(|| Dns01Error::ZoneNotFound(zone.name.clone()))?;
         let relative_name = relative_record_name(name, &zone.name);
 
         let mut hosts = self.get_hosts(&sld, &tld).await?;
@@ -190,9 +208,13 @@ impl DnsProvider for NamecheapDns01 {
     /// doc). Matches by `(Name, Type=TXT)` only, same as lego's own
     /// cleanup, and rewrites the full host list without it.
     async fn delete_txt_record(&self, zone: &DnsZone, record_id: &str) -> Result<(), Dns01Error> {
-        let (sld, tld) = Self::split_sld_tld(&zone.name).ok_or_else(|| Dns01Error::ZoneNotFound(zone.name.clone()))?;
+        let (sld, tld) = Self::split_sld_tld(&zone.name)
+            .ok_or_else(|| Dns01Error::ZoneNotFound(zone.name.clone()))?;
         let hosts = self.get_hosts(&sld, &tld).await?;
-        let remaining: Vec<HostRecord> = hosts.into_iter().filter(|h| !(h.typ == "TXT" && h.name == record_id)).collect();
+        let remaining: Vec<HostRecord> = hosts
+            .into_iter()
+            .filter(|h| !(h.typ == "TXT" && h.name == record_id))
+            .collect();
         self.set_hosts(&sld, &tld, &remaining).await
     }
 }
@@ -234,12 +256,18 @@ fn parse_get_hosts_response(body: &str) -> Result<Vec<HostRecord>, Dns01Error> {
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
-            Err(err) => return Err(Dns01Error::Api(format!("failed to parse Namecheap response: {err}"))),
+            Err(err) => {
+                return Err(Dns01Error::Api(format!(
+                    "failed to parse Namecheap response: {err}"
+                )))
+            }
         }
         buf.clear();
     }
     if !errors.is_empty() {
-        return Err(Dns01Error::Api(join_api_errors(errors.iter().map(String::as_str))));
+        return Err(Dns01Error::Api(join_api_errors(
+            errors.iter().map(String::as_str),
+        )));
     }
     Ok(hosts)
 }
@@ -268,15 +296,23 @@ fn parse_set_hosts_response(body: &str) -> Result<(), Dns01Error> {
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
-            Err(err) => return Err(Dns01Error::Api(format!("failed to parse Namecheap response: {err}"))),
+            Err(err) => {
+                return Err(Dns01Error::Api(format!(
+                    "failed to parse Namecheap response: {err}"
+                )))
+            }
         }
         buf.clear();
     }
     if !errors.is_empty() {
-        return Err(Dns01Error::Api(join_api_errors(errors.iter().map(String::as_str))));
+        return Err(Dns01Error::Api(join_api_errors(
+            errors.iter().map(String::as_str),
+        )));
     }
     if !is_success {
-        return Err(Dns01Error::Api("Namecheap setHosts did not report success".to_string()));
+        return Err(Dns01Error::Api(
+            "Namecheap setHosts did not report success".to_string(),
+        ));
     }
     Ok(())
 }
@@ -320,7 +356,9 @@ mod tests {
 
     #[test]
     fn parses_host_records_from_a_real_shaped_response() {
-        let xml = get_hosts_xml(r#"<host HostId="1" Name="@" Type="A" Address="1.2.3.4" MXPref="10" TTL="1800" /><host HostId="2" Name="_acme-challenge" Type="TXT" Address="digest" MXPref="10" TTL="1800" />"#);
+        let xml = get_hosts_xml(
+            r#"<host HostId="1" Name="@" Type="A" Address="1.2.3.4" MXPref="10" TTL="1800" /><host HostId="2" Name="_acme-challenge" Type="TXT" Address="digest" MXPref="10" TTL="1800" />"#,
+        );
         let hosts = parse_get_hosts_response(&xml).unwrap();
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[1].typ, "TXT");
@@ -365,7 +403,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = NamecheapDns01::with_base_url(reqwest::Client::new(), "user:key:1.2.3.4".into(), server.uri());
+        let client = NamecheapDns01::with_base_url(
+            reqwest::Client::new(),
+            "user:key:1.2.3.4".into(),
+            server.uri(),
+        );
         let zone = client.find_zone("foo.example.com").await.unwrap();
         assert_eq!(zone.name, "example.com");
     }
@@ -378,7 +420,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = NamecheapDns01::with_base_url(reqwest::Client::new(), "user:key:1.2.3.4".into(), server.uri());
+        let client = NamecheapDns01::with_base_url(
+            reqwest::Client::new(),
+            "user:key:1.2.3.4".into(),
+            server.uri(),
+        );
         let err = client.find_zone("foo.example.com").await.unwrap_err();
         assert!(matches!(err, Dns01Error::ZoneNotFound(_)));
     }
@@ -394,7 +440,9 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(body_string_contains("Command=namecheap.domains.dns.setHosts"))
+            .and(body_string_contains(
+                "Command=namecheap.domains.dns.setHosts",
+            ))
             .and(body_string_contains("HostName1=%40"))
             .and(body_string_contains("HostName2=_acme-challenge"))
             .and(body_string_contains("RecordType2=TXT"))
@@ -403,9 +451,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = NamecheapDns01::with_base_url(reqwest::Client::new(), "user:key:1.2.3.4".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
-        let record_id = client.create_txt_record(&zone, "_acme-challenge.example.com", "digest-value").await.unwrap();
+        let client = NamecheapDns01::with_base_url(
+            reqwest::Client::new(),
+            "user:key:1.2.3.4".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
+        let record_id = client
+            .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
+            .await
+            .unwrap();
         assert_eq!(record_id, "_acme-challenge");
     }
 
@@ -420,14 +478,26 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(body_string_contains("Command=namecheap.domains.dns.setHosts"))
+            .and(body_string_contains(
+                "Command=namecheap.domains.dns.setHosts",
+            ))
             .and(body_string_contains("HostName1=%40"))
             .respond_with(ResponseTemplate::new(200).set_body_string(set_hosts_success_xml()))
             .mount(&server)
             .await;
 
-        let client = NamecheapDns01::with_base_url(reqwest::Client::new(), "user:key:1.2.3.4".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
-        client.delete_txt_record(&zone, "_acme-challenge").await.unwrap();
+        let client = NamecheapDns01::with_base_url(
+            reqwest::Client::new(),
+            "user:key:1.2.3.4".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
+        client
+            .delete_txt_record(&zone, "_acme-challenge")
+            .await
+            .unwrap();
     }
 }

@@ -33,7 +33,12 @@ pub struct SignedHeaders {
 }
 
 impl SigV4Signer {
-    pub fn new(access_key_id: String, secret_access_key: String, region: String, service: String) -> Self {
+    pub fn new(
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        service: String,
+    ) -> Self {
         Self {
             access_key_id,
             secret_access_key,
@@ -68,8 +73,10 @@ impl SigV4Signer {
             format!("{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{hashed_payload}");
         let hashed_canonical_request = hex_encode(&Sha256::digest(canonical_request.as_bytes()));
 
-        let credential_scope = format!("{date_stamp}/{}/{}/aws4_request", self.region, self.service);
-        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_canonical_request}");
+        let credential_scope =
+            format!("{date_stamp}/{}/{}/aws4_request", self.region, self.service);
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_canonical_request}");
 
         let signing_key = self.derive_signing_key(&date_stamp);
         let signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
@@ -79,11 +86,17 @@ impl SigV4Signer {
             self.access_key_id
         );
 
-        SignedHeaders { x_amz_date: amz_date, authorization }
+        SignedHeaders {
+            x_amz_date: amz_date,
+            authorization,
+        }
     }
 
     fn derive_signing_key(&self, date_stamp: &str) -> Vec<u8> {
-        let k_date = hmac_sha256(format!("AWS4{}", self.secret_access_key).as_bytes(), date_stamp.as_bytes());
+        let k_date = hmac_sha256(
+            format!("AWS4{}", self.secret_access_key).as_bytes(),
+            date_stamp.as_bytes(),
+        );
         let k_region = hmac_sha256(&k_date, self.region.as_bytes());
         let k_service = hmac_sha256(&k_region, self.service.as_bytes());
         hmac_sha256(&k_service, b"aws4_request")
@@ -104,9 +117,16 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// `uri_encode`, then sort entries by encoded key. Empty when there are
 /// no query parameters.
 fn canonical_query_string(pairs: &[(&str, &str)]) -> String {
-    let mut encoded: Vec<(String, String)> = pairs.iter().map(|(k, v)| (uri_encode(k, true), uri_encode(v, true))).collect();
+    let mut encoded: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
+        .collect();
     encoded.sort();
-    encoded.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+    encoded
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// AWS's URI-encoding rules: every byte except unreserved characters
@@ -117,7 +137,9 @@ fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             b'/' if !encode_slash => out.push('/'),
             _ => out.push_str(&format!("%{byte:02X}")),
         }
@@ -150,7 +172,9 @@ mod tests {
     }
 
     fn fixed_now() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339("2015-08-30T12:36:00Z").unwrap().with_timezone(&chrono::Utc)
+        chrono::DateTime::parse_from_rfc3339("2015-08-30T12:36:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
     }
 
     #[test]
@@ -167,7 +191,8 @@ mod tests {
 
     #[test]
     fn matches_the_aws_post_vanilla_test_vector() {
-        let signed = test_signer().sign("POST", "example.amazonaws.com", "/", &[], b"", fixed_now());
+        let signed =
+            test_signer().sign("POST", "example.amazonaws.com", "/", &[], b"", fixed_now());
         assert_eq!(
             signed.authorization,
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \

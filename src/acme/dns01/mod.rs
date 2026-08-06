@@ -77,7 +77,12 @@ pub trait DnsProvider: Send + Sync {
     /// ID, needed later to clean it up. `name` is always the fully-
     /// qualified record name (e.g. `_acme-challenge.foo.example.com`);
     /// providers that need a zone-relative name convert it internally.
-    async fn create_txt_record(&self, zone: &DnsZone, name: &str, content: &str) -> Result<String, Dns01Error>;
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error>;
 
     async fn delete_txt_record(&self, zone: &DnsZone, record_id: &str) -> Result<(), Dns01Error>;
 }
@@ -127,7 +132,11 @@ pub(crate) fn join_api_errors<'a>(messages: impl IntoIterator<Item = &'a str>) -
 /// doc comment). Used by `acme::resolve_dns_credential` to build a
 /// provider per host at issuance/renewal time, since credentials are
 /// now DB-backed and multi-row rather than one global startup value.
-pub fn build_provider(kind: crate::config::DnsProviderKind, http: reqwest::Client, token: String) -> Box<dyn DnsProvider> {
+pub fn build_provider(
+    kind: crate::config::DnsProviderKind,
+    http: reqwest::Client,
+    token: String,
+) -> Box<dyn DnsProvider> {
     use crate::config::DnsProviderKind;
     match kind {
         DnsProviderKind::Cloudflare => Box::new(CloudflareDns01::new(http, token)),
@@ -149,7 +158,15 @@ mod tests {
     fn build_provider_dispatches_every_provider_kind_without_panicking() {
         use crate::config::DnsProviderKind::*;
         let http = reqwest::Client::new();
-        for kind in [Cloudflare, DigitalOcean, Hetzner, DuckDns, GoDaddy, Namecheap, Route53] {
+        for kind in [
+            Cloudflare,
+            DigitalOcean,
+            Hetzner,
+            DuckDns,
+            GoDaddy,
+            Namecheap,
+            Route53,
+        ] {
             let _: Box<dyn DnsProvider> = build_provider(kind, http.clone(), "token".to_string());
         }
     }
@@ -174,7 +191,10 @@ mod tests {
 
     #[test]
     fn record_name_is_prefixed_correctly() {
-        assert_eq!(acme_challenge_record_name("example.com"), "_acme-challenge.example.com");
+        assert_eq!(
+            acme_challenge_record_name("example.com"),
+            "_acme-challenge.example.com"
+        );
         assert_eq!(
             acme_challenge_record_name("foo.bar.example.com"),
             "_acme-challenge.foo.bar.example.com"
@@ -185,12 +205,18 @@ mod tests {
     fn wildcard_record_name_strips_the_wildcard_label() {
         // RFC 8555 8.4: dns-01 for `*.example.com` validates at
         // `_acme-challenge.example.com`, not `_acme-challenge.*.example.com`.
-        assert_eq!(acme_challenge_record_name("*.pages.example.com"), "_acme-challenge.pages.example.com");
+        assert_eq!(
+            acme_challenge_record_name("*.pages.example.com"),
+            "_acme-challenge.pages.example.com"
+        );
     }
 
     #[test]
     fn relative_record_name_strips_the_zone_suffix() {
-        assert_eq!(relative_record_name("_acme-challenge.example.com", "example.com"), "_acme-challenge");
+        assert_eq!(
+            relative_record_name("_acme-challenge.example.com", "example.com"),
+            "_acme-challenge"
+        );
         assert_eq!(
             relative_record_name("_acme-challenge.foo.example.com", "example.com"),
             "_acme-challenge.foo"
@@ -199,7 +225,10 @@ mod tests {
 
     #[test]
     fn relative_record_name_falls_back_to_the_input_if_the_suffix_does_not_match() {
-        assert_eq!(relative_record_name("_acme-challenge.example.com", "other.com"), "_acme-challenge.example.com");
+        assert_eq!(
+            relative_record_name("_acme-challenge.example.com", "other.com"),
+            "_acme-challenge.example.com"
+        );
     }
 }
 

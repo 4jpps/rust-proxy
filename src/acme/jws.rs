@@ -54,8 +54,9 @@ impl AccountKey {
 
     pub fn from_pkcs8(pkcs8_bytes: &[u8]) -> Result<Self, JwsError> {
         let rng = SystemRandom::new();
-        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_bytes, &rng)
-            .map_err(|e| JwsError::KeyGen(format!("{e:?}")))?;
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_bytes, &rng)
+                .map_err(|e| JwsError::KeyGen(format!("{e:?}")))?;
         Ok(Self { key_pair })
     }
 
@@ -123,7 +124,10 @@ impl AccountKey {
     /// default to.
     fn sign_raw(&self, signing_input: &[u8]) -> Result<Vec<u8>, JwsError> {
         let rng = SystemRandom::new();
-        let sig = self.key_pair.sign(&rng, signing_input).map_err(|_| JwsError::Sign)?;
+        let sig = self
+            .key_pair
+            .sign(&rng, signing_input)
+            .map_err(|_| JwsError::Sign)?;
         Ok(sig.as_ref().to_vec())
     }
 
@@ -197,8 +201,14 @@ mod tests {
     fn generated_jws_signature_self_verifies() {
         let (key, _) = AccountKey::generate().unwrap();
         let payload = json!({"termsOfServiceAgreed": true});
-        let jws = encode_jws(&key, "https://example.invalid/acme/new-account", "test-nonce-123", None, Some(&payload))
-            .unwrap();
+        let jws = encode_jws(
+            &key,
+            "https://example.invalid/acme/new-account",
+            "test-nonce-123",
+            None,
+            Some(&payload),
+        )
+        .unwrap();
 
         let protected_b64 = jws["protected"].as_str().unwrap();
         let payload_b64 = jws["payload"].as_str().unwrap();
@@ -213,14 +223,23 @@ mod tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
         let public_key_bytes = key.public_key_der();
         let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &public_key_bytes);
-        assert!(public_key.verify(signing_input.as_bytes(), &sig_bytes).is_ok());
+        assert!(public_key
+            .verify(signing_input.as_bytes(), &sig_bytes)
+            .is_ok());
     }
 
     #[test]
     fn tampered_payload_fails_verification() {
         let (key, _) = AccountKey::generate().unwrap();
         let payload = json!({"termsOfServiceAgreed": true});
-        let jws = encode_jws(&key, "https://example.invalid/acme/new-account", "nonce", None, Some(&payload)).unwrap();
+        let jws = encode_jws(
+            &key,
+            "https://example.invalid/acme/new-account",
+            "nonce",
+            None,
+            Some(&payload),
+        )
+        .unwrap();
 
         let protected_b64 = jws["protected"].as_str().unwrap();
         let sig_b64 = jws["signature"].as_str().unwrap();
@@ -230,15 +249,28 @@ mod tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
         let public_key_bytes = key.public_key_der();
         let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &public_key_bytes);
-        assert!(public_key.verify(signing_input.as_bytes(), &sig_bytes).is_err());
+        assert!(public_key
+            .verify(signing_input.as_bytes(), &sig_bytes)
+            .is_err());
     }
 
     #[test]
     fn protected_header_uses_jwk_before_kid_is_known() {
         let (key, _) = AccountKey::generate().unwrap();
-        let jws = encode_jws(&key, "https://example.invalid/acme/new-account", "nonce", None, None).unwrap();
-        let protected: Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(jws["protected"].as_str().unwrap()).unwrap()).unwrap();
+        let jws = encode_jws(
+            &key,
+            "https://example.invalid/acme/new-account",
+            "nonce",
+            None,
+            None,
+        )
+        .unwrap();
+        let protected: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(jws["protected"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
         assert!(protected.get("jwk").is_some());
         assert!(protected.get("kid").is_none());
     }
@@ -254,8 +286,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let protected: Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(jws["protected"].as_str().unwrap()).unwrap()).unwrap();
+        let protected: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(jws["protected"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(protected["kid"], "https://example.invalid/acme/acct/1");
         assert!(protected.get("jwk").is_none());
     }
@@ -263,7 +299,14 @@ mod tests {
     #[test]
     fn post_as_get_has_empty_string_payload() {
         let (key, _) = AccountKey::generate().unwrap();
-        let jws = encode_jws(&key, "https://example.invalid/acme/order/1", "nonce", Some("kid"), None).unwrap();
+        let jws = encode_jws(
+            &key,
+            "https://example.invalid/acme/order/1",
+            "nonce",
+            Some("kid"),
+            None,
+        )
+        .unwrap();
         assert_eq!(jws["payload"], "");
     }
 

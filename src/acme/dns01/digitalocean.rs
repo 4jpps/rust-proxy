@@ -14,7 +14,9 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use super::{join_api_errors, relative_record_name, ApiErrorMessage, Dns01Error, DnsProvider, DnsZone};
+use super::{
+    join_api_errors, relative_record_name, ApiErrorMessage, Dns01Error, DnsProvider, DnsZone,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.digitalocean.com/v2";
 
@@ -45,7 +47,11 @@ impl DigitalOceanDns01 {
 
     #[cfg(test)]
     fn with_base_url(http: reqwest::Client, api_token: String, base_url: String) -> Self {
-        Self { http, api_token, base_url }
+        Self {
+            http,
+            api_token,
+            base_url,
+        }
     }
 
     /// `GET /v2/domains/{name}` returns 200 with the domain resource if
@@ -69,13 +75,21 @@ impl DnsProvider for DigitalOceanDns01 {
         for i in 0..labels.len().saturating_sub(1) {
             let candidate = labels[i..].join(".");
             if self.domain_exists(&candidate).await? {
-                return Ok(DnsZone { id: candidate.clone(), name: candidate });
+                return Ok(DnsZone {
+                    id: candidate.clone(),
+                    name: candidate,
+                });
             }
         }
         Err(Dns01Error::ZoneNotFound(domain.to_string()))
     }
 
-    async fn create_txt_record(&self, zone: &DnsZone, name: &str, content: &str) -> Result<String, Dns01Error> {
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error> {
         let relative_name = relative_record_name(name, &zone.name);
         let resp = self
             .http
@@ -99,7 +113,10 @@ impl DnsProvider for DigitalOceanDns01 {
     async fn delete_txt_record(&self, zone: &DnsZone, record_id: &str) -> Result<(), Dns01Error> {
         let resp = self
             .http
-            .delete(format!("{}/domains/{}/records/{record_id}", self.base_url, zone.id))
+            .delete(format!(
+                "{}/domains/{}/records/{record_id}",
+                self.base_url, zone.id
+            ))
             .bearer_auth(&self.api_token)
             .send()
             .await?;
@@ -144,7 +161,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DigitalOceanDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client = DigitalOceanDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
         let zone = client.find_zone("foo.example.com").await.unwrap();
         assert_eq!(zone.id, "example.com");
         assert_eq!(zone.name, "example.com");
@@ -153,9 +174,16 @@ mod tests {
     #[tokio::test]
     async fn zone_lookup_errors_when_no_parent_domain_is_registered() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
 
-        let client = DigitalOceanDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client = DigitalOceanDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
         let err = client.find_zone("foo.example.com").await.unwrap_err();
         assert!(matches!(err, Dns01Error::ZoneNotFound(_)));
     }
@@ -171,8 +199,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DigitalOceanDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
+        let client = DigitalOceanDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
         let id = client
             .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
             .await
@@ -192,8 +227,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DigitalOceanDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
+        let client = DigitalOceanDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
         let err = client
             .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
             .await
@@ -210,8 +252,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DigitalOceanDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
+        let client = DigitalOceanDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
         client.delete_txt_record(&zone, "3352896").await.unwrap();
     }
 }

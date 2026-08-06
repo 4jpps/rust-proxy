@@ -42,6 +42,8 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
         }
         (Some(v4), None) => serve_one(IpAddr::V4(v4), bind_port, state).await,
         (None, Some(v6)) => serve_one(IpAddr::V6(v6), bind_port, state).await,
-        (None, None) => anyhow::bail!("admin.bind_ip_v4 and admin.bind_ip_v6 are both unset -- nothing to bind"),
+        (None, None) => {
+            anyhow::bail!("admin.bind_ip_v4 and admin.bind_ip_v6 are both unset -- nothing to bind")
+        }
     }
 }

@@ -55,7 +55,8 @@ fn default_return_to() -> String {
 /// `verify_session` use, without requiring a second secret in the
 /// config file.
 fn derive_key(admin_session_secret: &str) -> Vec<u8> {
-    Sha256::digest(format!("rust-proxy-host-login-session-v1:{admin_session_secret}").as_bytes()).to_vec()
+    Sha256::digest(format!("rust-proxy-host-login-session-v1:{admin_session_secret}").as_bytes())
+        .to_vec()
 }
 
 /// Checks a submitted username/password against `auth`. Plain equality
@@ -69,7 +70,9 @@ pub fn verify_credentials(auth: &HostAuth, username: &str, password: &str) -> bo
 /// Login ACLs -- succeeds if the submitted username/password matches ANY
 /// one of them, per the union-within-kind semantics the ACL system uses.
 pub fn verify_credentials_any(credentials: &[HostAuth], username: &str, password: &str) -> bool {
-    credentials.iter().any(|auth| verify_credentials(auth, username, password))
+    credentials
+        .iter()
+        .any(|auth| verify_credentials(auth, username, password))
 }
 
 pub fn sign_session(admin_session_secret: &str, domain: &str, username: &str) -> String {
@@ -133,7 +136,9 @@ pub(super) fn html_escape(s: &str) -> String {
 /// early, turning the rest of the string into live HTML/script. Escaping
 /// every `/` is the standard, over-broad-but-safe fix.
 fn json_for_script(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()).replace('/', "\\/")
+    serde_json::to_string(s)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('/', "\\/")
 }
 
 /// Only a same-origin relative path is a safe post-login destination for
@@ -150,7 +155,10 @@ fn json_for_script(s: &str) -> String {
 /// cosmetic bug. `//host/...` and `/\host/...` are also rejected --
 /// browsers can treat both as scheme-relative to a different origin.
 fn sanitize_return_to(return_to: &str) -> &str {
-    let is_safe = return_to.starts_with('/') && !return_to.starts_with("//") && !return_to.starts_with("/\\") && !return_to.contains("://");
+    let is_safe = return_to.starts_with('/')
+        && !return_to.starts_with("//")
+        && !return_to.starts_with("/\\")
+        && !return_to.contains("://");
     if is_safe {
         return_to
     } else {
@@ -297,14 +305,19 @@ mod tests {
     fn a_tampered_session_token_is_rejected() {
         let token = sign_session("secret", "example.com", "viewer");
         let (_, sig) = token.split_once('.').unwrap();
-        let tampered_payload = URL_SAFE_NO_PAD.encode(br#"{"domain":"example.com","username":"admin","exp":9999999999}"#);
+        let tampered_payload = URL_SAFE_NO_PAD
+            .encode(br#"{"domain":"example.com","username":"admin","exp":9999999999}"#);
         let tampered = format!("{tampered_payload}.{sig}");
         assert!(!verify_session("secret", "example.com", &tampered));
     }
 
     #[test]
     fn a_malformed_token_is_rejected_not_panicking() {
-        assert!(!verify_session("secret", "example.com", "not-a-valid-token"));
+        assert!(!verify_session(
+            "secret",
+            "example.com",
+            "not-a-valid-token"
+        ));
         assert!(!verify_session("secret", "example.com", ""));
         assert!(!verify_session("secret", "example.com", "a.b.c"));
     }
@@ -386,7 +399,11 @@ mod tests {
 
     #[test]
     fn render_login_page_json_escapes_return_to_for_safe_inline_embedding() {
-        let html = render_login_page("example.com", "/a\"</script><script>alert(1)</script>", None);
+        let html = render_login_page(
+            "example.com",
+            "/a\"</script><script>alert(1)</script>",
+            None,
+        );
         assert!(!html.contains("</script><script>alert(1)"));
     }
 }

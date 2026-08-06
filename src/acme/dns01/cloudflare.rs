@@ -54,7 +54,11 @@ impl CloudflareDns01 {
 
     #[cfg(test)]
     fn with_base_url(http: reqwest::Client, api_token: String, base_url: String) -> Self {
-        Self { http, api_token, base_url }
+        Self {
+            http,
+            api_token,
+            base_url,
+        }
     }
 
     async fn query_zone(&self, name: &str) -> Result<Option<DnsZone>, Dns01Error> {
@@ -66,7 +70,10 @@ impl CloudflareDns01 {
             .send()
             .await?;
         let body: CfListResponse<CfZone> = resp.json().await?;
-        Ok(body.result.into_iter().next().map(|z| DnsZone { id: z.id, name: z.name }))
+        Ok(body.result.into_iter().next().map(|z| DnsZone {
+            id: z.id,
+            name: z.name,
+        }))
     }
 }
 
@@ -84,7 +91,12 @@ impl DnsProvider for CloudflareDns01 {
         Err(Dns01Error::ZoneNotFound(domain.to_string()))
     }
 
-    async fn create_txt_record(&self, zone: &DnsZone, name: &str, content: &str) -> Result<String, Dns01Error> {
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error> {
         let resp = self
             .http
             .post(format!("{}/zones/{}/dns_records", self.base_url, zone.id))
@@ -99,7 +111,9 @@ impl DnsProvider for CloudflareDns01 {
             .await?;
         let body: CfSingleResponse<CfDnsRecord> = resp.json().await?;
         if !body.success {
-            return Err(Dns01Error::Api(join_api_errors(body.errors.iter().map(|e| e.message.as_str()))));
+            return Err(Dns01Error::Api(join_api_errors(
+                body.errors.iter().map(|e| e.message.as_str()),
+            )));
         }
         body.result.map(|r| r.id).ok_or(Dns01Error::MissingResult)
     }
@@ -107,13 +121,18 @@ impl DnsProvider for CloudflareDns01 {
     async fn delete_txt_record(&self, zone: &DnsZone, record_id: &str) -> Result<(), Dns01Error> {
         let resp = self
             .http
-            .delete(format!("{}/zones/{}/dns_records/{record_id}", self.base_url, zone.id))
+            .delete(format!(
+                "{}/zones/{}/dns_records/{record_id}",
+                self.base_url, zone.id
+            ))
             .bearer_auth(&self.api_token)
             .send()
             .await?;
         let body: CfSingleResponse<CfDnsRecord> = resp.json().await?;
         if !body.success {
-            return Err(Dns01Error::Api(join_api_errors(body.errors.iter().map(|e| e.message.as_str()))));
+            return Err(Dns01Error::Api(join_api_errors(
+                body.errors.iter().map(|e| e.message.as_str()),
+            )));
         }
         Ok(())
     }
@@ -132,7 +151,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/zones"))
             .and(query_param("name", "foo.example.com"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true, "result": []})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "result": []})),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -145,7 +167,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = CloudflareDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client = CloudflareDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
         let zone = client.find_zone("foo.example.com").await.unwrap();
         assert_eq!(zone.id, "zone-abc123");
         assert_eq!(zone.name, "example.com");
@@ -156,11 +182,18 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/zones"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true, "result": []})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "result": []})),
+            )
             .mount(&server)
             .await;
 
-        let client = CloudflareDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client = CloudflareDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
         let err = client.find_zone("foo.example.com").await.unwrap_err();
         assert!(matches!(err, Dns01Error::ZoneNotFound(_)));
     }
@@ -178,8 +211,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = CloudflareDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "zone-1".into(), name: "example.com".into() };
+        let client = CloudflareDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "zone-1".into(),
+            name: "example.com".into(),
+        };
         let id = client
             .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
             .await
@@ -200,8 +240,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = CloudflareDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "zone-1".into(), name: "example.com".into() };
+        let client = CloudflareDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "zone-1".into(),
+            name: "example.com".into(),
+        };
         let err = client
             .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
             .await
@@ -222,8 +269,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = CloudflareDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "zone-1".into(), name: "example.com".into() };
+        let client = CloudflareDns01::with_base_url(
+            reqwest::Client::new(),
+            "test-token".into(),
+            server.uri(),
+        );
+        let zone = DnsZone {
+            id: "zone-1".into(),
+            name: "example.com".into(),
+        };
         client.delete_txt_record(&zone, "record-42").await.unwrap();
     }
 }

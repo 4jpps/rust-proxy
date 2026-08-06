@@ -164,7 +164,11 @@ impl AppState {
     /// first launch, until `set_admin_identity` is called).
     pub fn admin_identity(&self) -> Option<AdminIdentity> {
         let admin = &self.0.admin;
-        if let (Some(username), Some(password_hash), Some(session_secret)) = (&admin.admin_username, &admin.admin_password_hash, &admin.session_secret) {
+        if let (Some(username), Some(password_hash), Some(session_secret)) = (
+            &admin.admin_username,
+            &admin.admin_password_hash,
+            &admin.session_secret,
+        ) {
             return Some(AdminIdentity {
                 username: username.clone(),
                 password_hash: password_hash.clone(),
@@ -227,7 +231,10 @@ impl AppState {
     /// `acme_contact_email`, this has no "already in flight" state to
     /// worry about.
     pub fn expose_admin_port(&self) -> bool {
-        self.0.admin.expose_admin_port.unwrap_or_else(|| *self.0.expose_admin_port_db.load_full())
+        self.0
+            .admin
+            .expose_admin_port
+            .unwrap_or_else(|| *self.0.expose_admin_port_db.load_full())
     }
 
     /// Publishes a newly-set DB-backed value, visible to the next
@@ -326,7 +333,9 @@ mod tests {
                 expose_admin_port: None,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
-                admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
+                admin_password_hash: Some(
+                    "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                ),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -346,7 +355,9 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(test_config(), pool, vec![], vec![], None, None, None)
     }
 
@@ -374,6 +385,7 @@ mod tests {
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         }]);
 
@@ -406,7 +418,10 @@ mod tests {
         assert_eq!(state.get_http01_challenge("token-1"), None);
 
         state.set_http01_challenge("token-1".into(), "token-1.thumbprint".into());
-        assert_eq!(state.get_http01_challenge("token-1"), Some("token-1.thumbprint".into()));
+        assert_eq!(
+            state.get_http01_challenge("token-1"),
+            Some("token-1.thumbprint".into())
+        );
 
         state.remove_http01_challenge("token-1");
         assert_eq!(state.get_http01_challenge("token-1"), None);
@@ -417,7 +432,10 @@ mod tests {
         let state = test_state().await;
         assert!(!state.remove_cert("example.com"), "nothing to remove yet");
 
-        state.upsert_cert("example.com".to_string(), crate::proxy::tls::self_signed_entry("example.com"));
+        state.upsert_cert(
+            "example.com".to_string(),
+            crate::proxy::tls::self_signed_entry("example.com"),
+        );
         assert!(state.certs().contains_key("example.com"));
 
         assert!(state.remove_cert("example.com"));
@@ -451,6 +469,7 @@ mod tests {
                     redirect: None,
                     path_rewrite: None,
                     static_root: None,
+                    rewrite_samesite_none_cookies: false,
                     enabled: true,
                 }]);
             }));
@@ -475,7 +494,9 @@ mod tests {
     #[tokio::test]
     async fn admin_identity_comes_from_config_when_config_supplies_all_three_fields() {
         let state = test_state().await;
-        let identity = state.admin_identity().expect("test_config sets all three identity fields");
+        let identity = state
+            .admin_identity()
+            .expect("test_config sets all three identity fields");
         assert_eq!(identity.username, "admin");
     }
 
@@ -485,7 +506,9 @@ mod tests {
         cfg.admin.session_secret = None;
         cfg.admin.admin_username = None;
         cfg.admin.admin_password_hash = None;
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         let state = AppState::new(cfg, pool, vec![], vec![], None, None, None);
 
         assert!(state.admin_identity().is_none());
@@ -497,7 +520,9 @@ mod tests {
         cfg.admin.session_secret = None;
         cfg.admin.admin_username = None;
         cfg.admin.admin_password_hash = None;
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         let state = AppState::new(cfg, pool, vec![], vec![], None, None, None);
 
         state.set_admin_identity(AdminIdentity {
@@ -524,11 +549,16 @@ mod tests {
         });
 
         let identity = state.admin_identity().unwrap();
-        assert_eq!(identity.username, "admin", "config.toml's identity must still win");
+        assert_eq!(
+            identity.username, "admin",
+            "config.toml's identity must still win"
+        );
     }
 
     async fn test_state_with_blank_contact_email() -> AppState {
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         let mut cfg = test_config();
         cfg.acme.contact_email = String::new();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
@@ -537,7 +567,10 @@ mod tests {
     #[tokio::test]
     async fn acme_contact_email_comes_from_config_when_set() {
         let state = test_state().await; // test_config() sets a non-empty contact_email
-        assert_eq!(state.acme_contact_email().as_deref(), Some("admin@example.com"));
+        assert_eq!(
+            state.acme_contact_email().as_deref(),
+            Some("admin@example.com")
+        );
     }
 
     #[tokio::test]
@@ -550,13 +583,21 @@ mod tests {
     async fn set_acme_contact_email_is_visible_immediately_when_config_is_blank() {
         let state = test_state_with_blank_contact_email().await;
         state.set_acme_contact_email("ops@example.com".into());
-        assert_eq!(state.acme_contact_email().as_deref(), Some("ops@example.com"));
+        assert_eq!(
+            state.acme_contact_email().as_deref(),
+            Some("ops@example.com")
+        );
     }
 
     #[tokio::test]
-    async fn config_supplied_contact_email_always_wins_even_after_set_acme_contact_email_is_called() {
+    async fn config_supplied_contact_email_always_wins_even_after_set_acme_contact_email_is_called()
+    {
         let state = test_state().await; // config's contact_email is non-empty
         state.set_acme_contact_email("db-email@example.com".into());
-        assert_eq!(state.acme_contact_email().as_deref(), Some("admin@example.com"), "config.toml's contact_email must still win");
+        assert_eq!(
+            state.acme_contact_email().as_deref(),
+            Some("admin@example.com"),
+            "config.toml's contact_email must still win"
+        );
     }
 }

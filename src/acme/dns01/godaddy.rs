@@ -45,7 +45,11 @@ impl GoDaddyDns01 {
 
     #[cfg(test)]
     fn with_base_url(http: reqwest::Client, token: String, base_url: String) -> Self {
-        Self { http, token, base_url }
+        Self {
+            http,
+            token,
+            base_url,
+        }
     }
 
     async fn zone_exists(&self, zone: &str) -> Result<bool, Dns01Error> {
@@ -91,7 +95,12 @@ impl DnsProvider for GoDaddyDns01 {
         Err(Dns01Error::ZoneNotFound(domain.to_string()))
     }
 
-    async fn create_txt_record(&self, zone: &DnsZone, name: &str, content: &str) -> Result<String, Dns01Error> {
+    async fn create_txt_record(
+        &self,
+        zone: &DnsZone,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Dns01Error> {
         let relative_name = relative_record_name(name, &zone.name);
         // 600s is GoDaddy's documented minimum TTL -- there's no reason
         // to ask for anything longer for a value that gets deleted
@@ -118,7 +127,10 @@ impl DnsProvider for GoDaddyDns01 {
     async fn delete_txt_record(&self, zone: &DnsZone, record_id: &str) -> Result<(), Dns01Error> {
         let resp = self
             .http
-            .delete(format!("{}/{}/dns-records/{record_id}", self.base_url, zone.id))
+            .delete(format!(
+                "{}/{}/dns-records/{record_id}",
+                self.base_url, zone.id
+            ))
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -153,16 +165,23 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/foo.example.com/dns-records"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({"name": "NOT_FOUND", "message": "not found"})))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(
+                    serde_json::json!({"name": "NOT_FOUND", "message": "not found"}),
+                ),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/example.com/dns-records"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": []})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": []})),
+            )
             .mount(&server)
             .await;
 
-        let client = GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client =
+            GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
         let zone = client.find_zone("foo.example.com").await.unwrap();
         assert_eq!(zone.id, "example.com");
         assert_eq!(zone.name, "example.com");
@@ -172,11 +191,16 @@ mod tests {
     async fn zone_lookup_errors_when_no_zone_matches_any_parent_domain() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({"name": "NOT_FOUND", "message": "not found"})))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(
+                    serde_json::json!({"name": "NOT_FOUND", "message": "not found"}),
+                ),
+            )
             .mount(&server)
             .await;
 
-        let client = GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let client =
+            GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
         let err = client.find_zone("foo.example.com").await.unwrap_err();
         assert!(matches!(err, Dns01Error::ZoneNotFound(_)));
     }
@@ -193,9 +217,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
-        let id = client.create_txt_record(&zone, "_acme-challenge.example.com", "digest-value").await.unwrap();
+        let client =
+            GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
+        let id = client
+            .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
+            .await
+            .unwrap();
         assert_eq!(id, "record-id-1");
     }
 
@@ -210,9 +241,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
-        let err = client.create_txt_record(&zone, "_acme-challenge.example.com", "digest-value").await.unwrap_err();
+        let client =
+            GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
+        let err = client
+            .create_txt_record(&zone, "_acme-challenge.example.com", "digest-value")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("data is required"));
     }
 
@@ -225,8 +263,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
-        let zone = DnsZone { id: "example.com".into(), name: "example.com".into() };
-        client.delete_txt_record(&zone, "record-id-1").await.unwrap();
+        let client =
+            GoDaddyDns01::with_base_url(reqwest::Client::new(), "test-token".into(), server.uri());
+        let zone = DnsZone {
+            id: "example.com".into(),
+            name: "example.com".into(),
+        };
+        client
+            .delete_txt_record(&zone, "record-id-1")
+            .await
+            .unwrap();
     }
 }

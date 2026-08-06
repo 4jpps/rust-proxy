@@ -32,7 +32,11 @@ pub fn list_local_ips() -> Vec<LocalIp> {
 
     let mut ips = Vec::new();
     for iface in interfaces {
-        let name = iface.get("ifname").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = iface
+            .get("ifname")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let Some(addrs) = iface.get("addr_info").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -51,7 +55,10 @@ pub fn list_local_ips() -> Vec<LocalIp> {
                     continue;
                 }
             }
-            ips.push(LocalIp { address, interface: name.clone() });
+            ips.push(LocalIp {
+                address,
+                interface: name.clone(),
+            });
         }
     }
     ips
@@ -68,12 +75,17 @@ mod tests {
     #[test]
     fn list_local_ips_includes_loopback_on_a_real_linux_host() {
         let ips = list_local_ips();
-        assert!(ips.iter().any(|ip| ip.address.is_loopback()), "expected at least loopback among: {ips:?}");
+        assert!(
+            ips.iter().any(|ip| ip.address.is_loopback()),
+            "expected at least loopback among: {ips:?}"
+        );
     }
 
     #[test]
     fn list_local_ips_never_returns_a_link_local_ipv6_address() {
         let ips = list_local_ips();
-        assert!(!ips.iter().any(|ip| matches!(ip.address, IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80)));
+        assert!(!ips.iter().any(
+            |ip| matches!(ip.address, IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80)
+        ));
     }
 }

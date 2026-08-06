@@ -27,26 +27,65 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/dashboard", get(dashboard))
         .route("/api/hosts", get(list_hosts).post(create_host))
-        .route("/api/hosts/:id", axum::routing::put(update_host).delete(delete_host))
-        .route("/api/port-rules", get(list_port_rules).post(create_port_rule))
-        .route("/api/port-rules/:id", axum::routing::put(update_port_rule).delete(delete_port_rule))
+        .route(
+            "/api/hosts/:id",
+            axum::routing::put(update_host).delete(delete_host),
+        )
+        .route(
+            "/api/port-rules",
+            get(list_port_rules).post(create_port_rule),
+        )
+        .route(
+            "/api/port-rules/:id",
+            axum::routing::put(update_port_rule).delete(delete_port_rule),
+        )
         .route("/api/certs", get(list_certs).post(upload_cert))
         .route("/api/certs/:domain", axum::routing::delete(delete_cert))
         .route("/api/tokens", get(list_api_tokens).post(create_api_token))
         .route("/api/tokens/:id", axum::routing::delete(delete_api_token))
-        .route("/api/dns-credentials", get(list_dns_credentials).post(create_dns_credential))
-        .route("/api/dns-credentials/:id", axum::routing::delete(delete_dns_credential))
+        .route(
+            "/api/dns-credentials",
+            get(list_dns_credentials).post(create_dns_credential),
+        )
+        .route(
+            "/api/dns-credentials/:id",
+            axum::routing::delete(delete_dns_credential),
+        )
         .route("/api/acls", get(list_acls).post(create_acl_list))
-        .route("/api/acls/:id", get(get_acl_list_detail).delete(delete_acl_list))
+        .route(
+            "/api/acls/:id",
+            get(get_acl_list_detail).delete(delete_acl_list),
+        )
         .route("/api/acls/:id/ip-entries", post(add_acl_ip_entry))
-        .route("/api/acls/:id/ip-entries/:entry_id", axum::routing::put(update_acl_ip_entry).delete(delete_acl_ip_entry))
+        .route(
+            "/api/acls/:id/ip-entries/:entry_id",
+            axum::routing::put(update_acl_ip_entry).delete(delete_acl_ip_entry),
+        )
         .route("/api/acls/:id/credentials", post(add_acl_credential))
-        .route("/api/acls/:id/credentials/:credential_id", axum::routing::put(update_acl_credential).delete(delete_acl_credential))
-        .route("/api/dns01-certs", get(list_standalone_certs).post(create_standalone_cert))
-        .route("/api/dns01-certs/:id", axum::routing::delete(delete_standalone_cert))
-        .route("/api/acme-settings", get(get_acme_settings).put(update_acme_settings))
-        .route("/api/firewall-settings", get(get_firewall_settings).put(update_firewall_settings))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
+        .route(
+            "/api/acls/:id/credentials/:credential_id",
+            axum::routing::put(update_acl_credential).delete(delete_acl_credential),
+        )
+        .route(
+            "/api/dns01-certs",
+            get(list_standalone_certs).post(create_standalone_cert),
+        )
+        .route(
+            "/api/dns01-certs/:id",
+            axum::routing::delete(delete_standalone_cert),
+        )
+        .route(
+            "/api/acme-settings",
+            get(get_acme_settings).put(update_acme_settings),
+        )
+        .route(
+            "/api/firewall-settings",
+            get(get_firewall_settings).put(update_firewall_settings),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ));
 
     Router::new()
         .route("/", get(admin_ui))
@@ -85,7 +124,11 @@ async fn access_log(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let start = std::time::Instant::now();
     let resp = next.run(req).await;
-    let auth = resp.extensions().get::<AuthenticatedVia>().map(|a| a.0).unwrap_or("unauthenticated");
+    let auth = resp
+        .extensions()
+        .get::<AuthenticatedVia>()
+        .map(|a| a.0)
+        .unwrap_or("unauthenticated");
     tracing::info!(
         target: "rust_proxy::access",
         %method,
@@ -99,7 +142,11 @@ async fn access_log(req: Request, next: Next) -> Response {
 }
 
 async fn admin_ui() -> Response {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], ADMIN_UI_HTML).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        ADMIN_UI_HTML,
+    )
+        .into_response()
 }
 
 /// Every protected route accepts either credential, checked in this
@@ -112,7 +159,12 @@ async fn admin_ui() -> Response {
 /// session it was created from, matching this daemon's single-admin-
 /// account model. Treat a token like a password: anyone holding one can
 /// reconfigure the proxy and the firewall behind it.
-async fn require_admin(State(state): State<AppState>, cookies: Cookies, req: Request, next: Next) -> Response {
+async fn require_admin(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    req: Request,
+    next: Next,
+) -> Response {
     let Some(identity) = state.admin_identity() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -132,7 +184,9 @@ async fn require_admin(State(state): State<AppState>, cookies: Cookies, req: Req
         if let Ok(Some(id)) = crate::db::find_api_token_id_by_hash(state.db(), &hash).await {
             // Best-effort -- a failure to record last-used time must
             // never block the request it's just bookkeeping for.
-            if let Err(err) = crate::db::touch_api_token_last_used(state.db(), id, chrono::Utc::now()).await {
+            if let Err(err) =
+                crate::db::touch_api_token_last_used(state.db(), id, chrono::Utc::now()).await
+            {
                 tracing::warn!(error = %err, "failed to update api token last_used_at");
             }
             let mut resp = next.run(req).await;
@@ -185,11 +239,17 @@ struct LoginRequest {
     password: String,
 }
 
-async fn login(State(state): State<AppState>, cookies: Cookies, Json(body): Json<LoginRequest>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Json(body): Json<LoginRequest>,
+) -> Response {
     let Some(identity) = state.admin_identity() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if body.username != identity.username || !auth::verify_password(&body.password, &identity.password_hash) {
+    if body.username != identity.username
+        || !auth::verify_password(&body.password, &identity.password_hash)
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let token = auth::sign_session(&identity.session_secret, &body.username);
@@ -231,7 +291,9 @@ struct VersionResponse {
 /// baked in at compile time from Cargo.toml, so this is always exactly
 /// the version actually running, not something that can drift.
 async fn get_version() -> Json<VersionResponse> {
-    Json(VersionResponse { version: env!("CARGO_PKG_VERSION") })
+    Json(VersionResponse {
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 #[derive(Deserialize)]
@@ -259,18 +321,34 @@ struct SetupRequest {
 /// `db::create_admin_identity_if_absent`'s atomic `INSERT ... ON
 /// CONFLICT DO NOTHING` against the DB's own single-row constraint --
 /// only the request that actually inserts the row gets to publish it.
-async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>) -> Result<StatusCode, ApiError> {
+async fn setup(
+    State(state): State<AppState>,
+    Json(body): Json<SetupRequest>,
+) -> Result<StatusCode, ApiError> {
     if state.admin_identity().is_some() {
-        return Err(ApiError::Conflict("this instance is already configured".into()));
+        return Err(ApiError::Conflict(
+            "this instance is already configured".into(),
+        ));
     }
     if body.username.trim().is_empty() || body.password.is_empty() {
-        return Err(ApiError::BadRequest("username and password must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "username and password must not be empty".into(),
+        ));
     }
-    let password_hash = auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let password_hash =
+        auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
     let session_secret = generate_session_secret();
-    let created = crate::db::create_admin_identity_if_absent(state.db(), &body.username, &password_hash, &session_secret).await?;
+    let created = crate::db::create_admin_identity_if_absent(
+        state.db(),
+        &body.username,
+        &password_hash,
+        &session_secret,
+    )
+    .await?;
     if !created {
-        return Err(ApiError::Conflict("this instance is already configured".into()));
+        return Err(ApiError::Conflict(
+            "this instance is already configured".into(),
+        ));
     }
     state.set_admin_identity(crate::state::AdminIdentity {
         username: body.username.clone(),
@@ -280,8 +358,19 @@ async fn setup(State(state): State<AppState>, Json(body): Json<SetupRequest>) ->
 
     if let Some(cred) = body.dns_credential {
         let name = cred.name.trim();
-        if !name.is_empty() && !cred.token.trim().is_empty() && !crate::db::dns_credential_name_exists(state.db(), name).await? {
-            crate::db::create_dns_credential(state.db(), Uuid::new_v4(), name, cred.provider, &cred.token, chrono::Utc::now()).await?;
+        if !name.is_empty()
+            && !cred.token.trim().is_empty()
+            && !crate::db::dns_credential_name_exists(state.db(), name).await?
+        {
+            crate::db::create_dns_credential(
+                state.db(),
+                Uuid::new_v4(),
+                name,
+                cred.provider,
+                &cred.token,
+                chrono::Utc::now(),
+            )
+            .await?;
         }
     }
     if let Some(email) = body.acme_contact_email {
@@ -324,13 +413,18 @@ struct UpdateAcmeSettingsRequest {
 /// -- writing to the DB in that case would be silently shadowed forever
 /// (config always wins, see `AppState::acme_contact_email`), which is
 /// more confusing than a clear error explaining why.
-async fn update_acme_settings(State(state): State<AppState>, Json(body): Json<UpdateAcmeSettingsRequest>) -> Result<Json<AcmeSettingsResponse>, ApiError> {
+async fn update_acme_settings(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateAcmeSettingsRequest>,
+) -> Result<Json<AcmeSettingsResponse>, ApiError> {
     if !state.acme().contact_email.trim().is_empty() {
         return Err(ApiError::Conflict("acme.contact_email is set in config.toml, which always takes precedence -- edit it there instead".into()));
     }
     let email = body.contact_email.trim();
     if email.is_empty() {
-        return Err(ApiError::BadRequest("contact_email must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "contact_email must not be empty".into(),
+        ));
     }
     crate::db::set_acme_contact_email(state.db(), email).await?;
     state.set_acme_contact_email(email.to_string());
@@ -362,7 +456,10 @@ struct UpdateFirewallSettingsRequest {
 
 /// Rejected outright when config.toml already supplies
 /// `admin.expose_admin_port` -- same reasoning as `update_acme_settings`.
-async fn update_firewall_settings(State(state): State<AppState>, Json(body): Json<UpdateFirewallSettingsRequest>) -> Result<Json<FirewallSettingsResponse>, ApiError> {
+async fn update_firewall_settings(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateFirewallSettingsRequest>,
+) -> Result<Json<FirewallSettingsResponse>, ApiError> {
     if state.admin().expose_admin_port.is_some() {
         return Err(ApiError::Conflict("admin.expose_admin_port is set in config.toml, which always takes precedence -- edit it there instead".into()));
     }
@@ -412,7 +509,12 @@ async fn dashboard(State(state): State<AppState>) -> Json<DashboardResponse> {
         enabled_host_count: hosts.iter().filter(|h| h.enabled).count(),
         port_rule_count: state.port_rules().len(),
         cert_count: state.certs().len(),
-        bind_ranges: state.network().bind_ranges.iter().map(|n| n.to_string()).collect(),
+        bind_ranges: state
+            .network()
+            .bind_ranges
+            .iter()
+            .map(|n| n.to_string())
+            .collect(),
     })
 }
 
@@ -471,6 +573,9 @@ struct HostRequest {
     /// reasoning as `path_rewrite`'s pattern.
     #[serde(default)]
     static_root: Option<std::path::PathBuf>,
+    /// See `config::ProxyHost::rewrite_samesite_none_cookies`'s doc comment.
+    #[serde(default)]
+    rewrite_samesite_none_cookies: bool,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -485,10 +590,14 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
         return Err(ApiError::BadRequest("bind_port must not be 0".into()));
     }
     match (&req.redirect, &req.static_root) {
-        (Some(redirect), _) => crate::config::validate_redirect_target(&redirect.target).map_err(|e| ApiError::BadRequest(e.to_string()))?,
+        (Some(redirect), _) => crate::config::validate_redirect_target(&redirect.target)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?,
         (None, Some(static_root)) => {
             if !static_root.is_dir() {
-                return Err(ApiError::BadRequest(format!("static_root {} does not exist or is not a directory", static_root.display())));
+                return Err(ApiError::BadRequest(format!(
+                    "static_root {} does not exist or is not a directory",
+                    static_root.display()
+                )));
             }
         }
         (None, None) => {
@@ -497,10 +606,16 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
             }
         }
     }
-    crate::config::validate_dual_bind(&state.network().bind_ranges, req.bind_ip_v4, req.bind_ip_v6, "hosts")
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    crate::config::validate_dual_bind(
+        &state.network().bind_ranges,
+        req.bind_ip_v4,
+        req.bind_ip_v6,
+        "hosts",
+    )
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if let Some(path_rewrite) = &req.path_rewrite {
-        regex::Regex::new(&path_rewrite.pattern).map_err(|e| ApiError::BadRequest(format!("invalid path_rewrite pattern: {e}")))?;
+        regex::Regex::new(&path_rewrite.pattern)
+            .map_err(|e| ApiError::BadRequest(format!("invalid path_rewrite pattern: {e}")))?;
     }
     Ok(())
 }
@@ -514,7 +629,11 @@ async fn validate_acl_ids(state: &AppState, acl_ids: &[Uuid]) -> Result<(), ApiE
     if acl_ids.is_empty() {
         return Ok(());
     }
-    let existing: std::collections::HashSet<Uuid> = crate::db::list_acl_lists(state.db()).await?.into_iter().map(|a| a.id).collect();
+    let existing: std::collections::HashSet<Uuid> = crate::db::list_acl_lists(state.db())
+        .await?
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
     for id in acl_ids {
         if !existing.contains(id) {
             return Err(ApiError::BadRequest(format!("ACL {id} does not exist")));
@@ -536,7 +655,9 @@ fn normalize_cidr(s: &str) -> Result<String, ApiError> {
         let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
         return Ok(format!("{addr}/{prefix_len}"));
     }
-    Err(ApiError::BadRequest(format!("invalid CIDR or IP address: {s}")))
+    Err(ApiError::BadRequest(format!(
+        "invalid CIDR or IP address: {s}"
+    )))
 }
 
 #[derive(Serialize)]
@@ -568,7 +689,12 @@ async fn list_acls(State(state): State<AppState>) -> Result<Json<Vec<AclListSumm
     Ok(Json(
         lists
             .into_iter()
-            .map(|a| AclListSummary { id: a.id, name: a.name, kind: a.kind, created_at: a.created_at })
+            .map(|a| AclListSummary {
+                id: a.id,
+                name: a.name,
+                kind: a.kind,
+                created_at: a.created_at,
+            })
             .collect(),
     ))
 }
@@ -578,13 +704,18 @@ async fn list_acls(State(state): State<AppState>) -> Result<Json<Vec<AclListSumm
 /// can ever match is never useful to create, and passwords are hashed
 /// here (same as every other credential this project stores) so a
 /// plaintext password never reaches sqlite.
-async fn create_acl_list(State(state): State<AppState>, Json(body): Json<CreateAclListRequest>) -> Result<Json<AclListSummary>, ApiError> {
+async fn create_acl_list(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAclListRequest>,
+) -> Result<Json<AclListSummary>, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
         return Err(ApiError::BadRequest("name must not be empty".into()));
     }
     if crate::db::acl_list_name_exists(state.db(), name).await? {
-        return Err(ApiError::BadRequest(format!("an ACL named \"{name}\" already exists")));
+        return Err(ApiError::BadRequest(format!(
+            "an ACL named \"{name}\" already exists"
+        )));
     }
 
     let id = Uuid::new_v4();
@@ -593,22 +724,33 @@ async fn create_acl_list(State(state): State<AppState>, Json(body): Json<CreateA
     match body.kind {
         crate::config::AclKind::IpAllow => {
             if body.ip_entries.is_empty() {
-                return Err(ApiError::BadRequest("ip_entries must not be empty for an IP allow list".into()));
+                return Err(ApiError::BadRequest(
+                    "ip_entries must not be empty for an IP allow list".into(),
+                ));
             }
-            let normalized: Vec<String> = body.ip_entries.iter().map(|s| normalize_cidr(s)).collect::<Result<_, _>>()?;
+            let normalized: Vec<String> = body
+                .ip_entries
+                .iter()
+                .map(|s| normalize_cidr(s))
+                .collect::<Result<_, _>>()?;
             crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
             crate::db::add_acl_ip_entries(state.db(), id, &normalized).await?;
         }
         crate::config::AclKind::Login => {
             if body.credentials.is_empty() {
-                return Err(ApiError::BadRequest("credentials must not be empty for a login list".into()));
+                return Err(ApiError::BadRequest(
+                    "credentials must not be empty for a login list".into(),
+                ));
             }
             let mut hashed = Vec::with_capacity(body.credentials.len());
             for cred in &body.credentials {
                 if cred.username.trim().is_empty() || cred.password.is_empty() {
-                    return Err(ApiError::BadRequest("username and password must not be empty".into()));
+                    return Err(ApiError::BadRequest(
+                        "username and password must not be empty".into(),
+                    ));
                 }
-                let password_hash = auth::hash_password(&cred.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+                let password_hash = auth::hash_password(&cred.password)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
                 hashed.push((cred.username.clone(), password_hash));
             }
             crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
@@ -616,17 +758,27 @@ async fn create_acl_list(State(state): State<AppState>, Json(body): Json<CreateA
         }
     }
 
-    Ok(Json(AclListSummary { id, name: name.to_string(), kind: body.kind, created_at }))
+    Ok(Json(AclListSummary {
+        id,
+        name: name.to_string(),
+        kind: body.kind,
+        created_at,
+    }))
 }
 
 /// Refuses to delete an ACL still selected by any live host's `acl_ids`
 /// -- deletion has no FK/cascade onto hosts, so an orphaned reference
 /// would otherwise silently stop restricting that host's traffic instead
 /// of failing loudly. Same reasoning as `delete_dns_credential`.
-async fn delete_acl_list(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+async fn delete_acl_list(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
     let still_in_use = state.hosts().iter().any(|h| h.acl_ids.contains(&id));
     if still_in_use {
-        return Err(ApiError::Conflict("one or more hosts still select this ACL -- remove it from them first".into()));
+        return Err(ApiError::Conflict(
+            "one or more hosts still select this ACL -- remove it from them first".into(),
+        ));
     }
     let found = crate::db::delete_acl_list(state.db(), id).await?;
     if !found {
@@ -649,11 +801,23 @@ struct AclListDetail {
 /// entries -- `list_acls` deliberately omits these (see `AclList`'s doc
 /// comment), so managing an already-created list's contents needs its
 /// own fetch.
-async fn get_acl_list_detail(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<AclListDetail>, ApiError> {
-    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+async fn get_acl_list_detail(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AclListDetail>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let ip_entries = crate::db::list_acl_ip_entries(state.db(), id).await?;
     let credentials = crate::db::list_acl_credentials(state.db(), id).await?;
-    Ok(Json(AclListDetail { id: list.id, name: list.name, kind: list.kind, created_at: list.created_at, ip_entries, credentials }))
+    Ok(Json(AclListDetail {
+        id: list.id,
+        name: list.name,
+        kind: list.kind,
+        created_at: list.created_at,
+        ip_entries,
+        credentials,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -667,18 +831,33 @@ struct AclIpEntryRequest {
 /// than stored as an empty string, so the UI's "no description set" and
 /// "described as empty string" don't become two indistinguishable states.
 fn normalize_description(description: Option<String>) -> Option<String> {
-    description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty())
+    description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
 }
 
-async fn add_acl_ip_entry(State(state): State<AppState>, Path(id): Path<Uuid>, Json(body): Json<AclIpEntryRequest>) -> Result<Json<crate::db::AclIpEntry>, ApiError> {
-    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+async fn add_acl_ip_entry(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AclIpEntryRequest>,
+) -> Result<Json<crate::db::AclIpEntry>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if list.kind != crate::config::AclKind::IpAllow {
-        return Err(ApiError::BadRequest("this ACL is not an IP allow list".into()));
+        return Err(ApiError::BadRequest(
+            "this ACL is not an IP allow list".into(),
+        ));
     }
     let cidr = normalize_cidr(&body.cidr)?;
     let description = normalize_description(body.description);
-    let entry_id = crate::db::add_acl_ip_entry(state.db(), id, &cidr, description.as_deref()).await?;
-    Ok(Json(crate::db::AclIpEntry { id: entry_id, cidr, description }))
+    let entry_id =
+        crate::db::add_acl_ip_entry(state.db(), id, &cidr, description.as_deref()).await?;
+    Ok(Json(crate::db::AclIpEntry {
+        id: entry_id,
+        cidr,
+        description,
+    }))
 }
 
 async fn update_acl_ip_entry(
@@ -686,20 +865,32 @@ async fn update_acl_ip_entry(
     Path((id, entry_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<AclIpEntryRequest>,
 ) -> Result<Json<crate::db::AclIpEntry>, ApiError> {
-    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if list.kind != crate::config::AclKind::IpAllow {
-        return Err(ApiError::BadRequest("this ACL is not an IP allow list".into()));
+        return Err(ApiError::BadRequest(
+            "this ACL is not an IP allow list".into(),
+        ));
     }
     let cidr = normalize_cidr(&body.cidr)?;
     let description = normalize_description(body.description);
-    let found = crate::db::update_acl_ip_entry(state.db(), entry_id, &cidr, description.as_deref()).await?;
+    let found =
+        crate::db::update_acl_ip_entry(state.db(), entry_id, &cidr, description.as_deref()).await?;
     if !found {
         return Err(ApiError::NotFound);
     }
-    Ok(Json(crate::db::AclIpEntry { id: entry_id, cidr, description }))
+    Ok(Json(crate::db::AclIpEntry {
+        id: entry_id,
+        cidr,
+        description,
+    }))
 }
 
-async fn delete_acl_ip_entry(State(state): State<AppState>, Path((_id, entry_id)): Path<(Uuid, Uuid)>) -> Result<StatusCode, ApiError> {
+async fn delete_acl_ip_entry(
+    State(state): State<AppState>,
+    Path((_id, entry_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
     let found = crate::db::delete_acl_ip_entry(state.db(), entry_id).await?;
     if !found {
         return Err(ApiError::NotFound);
@@ -715,19 +906,39 @@ struct AddAclCredentialRequest {
     description: Option<String>,
 }
 
-async fn add_acl_credential(State(state): State<AppState>, Path(id): Path<Uuid>, Json(body): Json<AddAclCredentialRequest>) -> Result<Json<crate::db::AclCredentialSummary>, ApiError> {
-    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+async fn add_acl_credential(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AddAclCredentialRequest>,
+) -> Result<Json<crate::db::AclCredentialSummary>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if list.kind != crate::config::AclKind::Login {
         return Err(ApiError::BadRequest("this ACL is not a login list".into()));
     }
     let username = body.username.trim();
     if username.is_empty() || body.password.is_empty() {
-        return Err(ApiError::BadRequest("username and password must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "username and password must not be empty".into(),
+        ));
     }
-    let password_hash = auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let password_hash =
+        auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
     let description = normalize_description(body.description);
-    let credential_id = crate::db::add_acl_credential(state.db(), id, username, &password_hash, description.as_deref()).await?;
-    Ok(Json(crate::db::AclCredentialSummary { id: credential_id, username: username.to_string(), description }))
+    let credential_id = crate::db::add_acl_credential(
+        state.db(),
+        id,
+        username,
+        &password_hash,
+        description.as_deref(),
+    )
+    .await?;
+    Ok(Json(crate::db::AclCredentialSummary {
+        id: credential_id,
+        username: username.to_string(),
+        description,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -747,7 +958,9 @@ async fn update_acl_credential(
     Path((id, credential_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateAclCredentialRequest>,
 ) -> Result<Json<crate::db::AclCredentialSummary>, ApiError> {
-    let list = crate::db::get_acl_list(state.db(), id).await?.ok_or(ApiError::NotFound)?;
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if list.kind != crate::config::AclKind::Login {
         return Err(ApiError::BadRequest("this ACL is not a login list".into()));
     }
@@ -756,18 +969,34 @@ async fn update_acl_credential(
         return Err(ApiError::BadRequest("username must not be empty".into()));
     }
     let password_hash = match body.password.as_deref() {
-        Some(p) if !p.is_empty() => Some(auth::hash_password(p).map_err(|e| ApiError::Internal(e.to_string()))?),
+        Some(p) if !p.is_empty() => {
+            Some(auth::hash_password(p).map_err(|e| ApiError::Internal(e.to_string()))?)
+        }
         _ => None,
     };
     let description = normalize_description(body.description);
-    let found = crate::db::update_acl_credential(state.db(), credential_id, username, password_hash.as_deref(), description.as_deref()).await?;
+    let found = crate::db::update_acl_credential(
+        state.db(),
+        credential_id,
+        username,
+        password_hash.as_deref(),
+        description.as_deref(),
+    )
+    .await?;
     if !found {
         return Err(ApiError::NotFound);
     }
-    Ok(Json(crate::db::AclCredentialSummary { id: credential_id, username: username.to_string(), description }))
+    Ok(Json(crate::db::AclCredentialSummary {
+        id: credential_id,
+        username: username.to_string(),
+        description,
+    }))
 }
 
-async fn delete_acl_credential(State(state): State<AppState>, Path((_id, credential_id)): Path<(Uuid, Uuid)>) -> Result<StatusCode, ApiError> {
+async fn delete_acl_credential(
+    State(state): State<AppState>,
+    Path((_id, credential_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
     let found = crate::db::delete_acl_credential(state.db(), credential_id).await?;
     if !found {
         return Err(ApiError::NotFound);
@@ -775,7 +1004,10 @@ async fn delete_acl_credential(State(state): State<AppState>, Path((_id, credent
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest>) -> Result<Json<ProxyHost>, ApiError> {
+async fn create_host(
+    State(state): State<AppState>,
+    Json(body): Json<HostRequest>,
+) -> Result<Json<ProxyHost>, ApiError> {
     validate_host_request(&state, &body)?;
     validate_acl_ids(&state, &body.acl_ids).await?;
     let host = ProxyHost {
@@ -797,6 +1029,7 @@ async fn create_host(State(state): State<AppState>, Json(body): Json<HostRequest
         redirect: body.redirect,
         path_rewrite: body.path_rewrite,
         static_root: body.static_root,
+        rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -835,16 +1068,19 @@ async fn update_host(
         redirect: body.redirect,
         path_rewrite: body.path_rewrite,
         static_root: body.static_root,
+        rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;
     let to_store = updated.clone();
-    let found = mutate_hosts(&state, move |hosts| match hosts.iter_mut().find(|h| h.id == id) {
-        Some(existing) => {
-            *existing = to_store;
-            true
+    let found = mutate_hosts(&state, move |hosts| {
+        match hosts.iter_mut().find(|h| h.id == id) {
+            Some(existing) => {
+                *existing = to_store;
+                true
+            }
+            None => false,
         }
-        None => false,
     })
     .await?;
     if !found {
@@ -853,7 +1089,10 @@ async fn update_host(
     Ok(Json(updated))
 }
 
-async fn delete_host(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+async fn delete_host(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
     let found = mutate_hosts(&state, move |hosts| {
         let before = hosts.len();
         hosts.retain(|h| h.id != id);
@@ -870,7 +1109,10 @@ async fn delete_host(State(state): State<AppState>, Path(id): Path<Uuid>) -> Res
 /// sequence, so two concurrent mutations can never race and clobber each
 /// other -- the lock, not `ArcSwap`, is what makes writes safe under
 /// concurrency; `ArcSwap` alone only makes *reads* lock-free.
-async fn mutate_hosts(state: &AppState, mutate: impl FnOnce(&mut Vec<ProxyHost>) -> bool) -> Result<bool, ApiError> {
+async fn mutate_hosts(
+    state: &AppState,
+    mutate: impl FnOnce(&mut Vec<ProxyHost>) -> bool,
+) -> Result<bool, ApiError> {
     let _guard = state.lock_hosts_for_write().await;
     let mut hosts = (*state.hosts()).clone();
     let changed = mutate(&mut hosts);
@@ -911,14 +1153,24 @@ fn validate_port_rule_request(state: &AppState, req: &PortRuleRequest) -> Result
         return Err(ApiError::BadRequest("ports must not be 0".into()));
     }
     if req.port_start > req.port_end {
-        return Err(ApiError::BadRequest("port_start must be <= port_end".into()));
+        return Err(ApiError::BadRequest(
+            "port_start must be <= port_end".into(),
+        ));
     }
-    crate::config::validate_dual_bind(&state.network().bind_ranges, req.bind_ip_v4, req.bind_ip_v6, "port_rules")
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    crate::config::validate_dual_bind(
+        &state.network().bind_ranges,
+        req.bind_ip_v4,
+        req.bind_ip_v6,
+        "port_rules",
+    )
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(())
 }
 
-async fn create_port_rule(State(state): State<AppState>, Json(body): Json<PortRuleRequest>) -> Result<Json<PortRule>, ApiError> {
+async fn create_port_rule(
+    State(state): State<AppState>,
+    Json(body): Json<PortRuleRequest>,
+) -> Result<Json<PortRule>, ApiError> {
     validate_port_rule_request(&state, &body)?;
     validate_acl_ids(&state, &body.acl_ids).await?;
     let rule = PortRule {
@@ -962,12 +1214,14 @@ async fn update_port_rule(
         enabled: body.enabled,
     };
     let to_store = updated.clone();
-    let found = mutate_port_rules(&state, move |rules| match rules.iter_mut().find(|r| r.id == id) {
-        Some(existing) => {
-            *existing = to_store;
-            true
+    let found = mutate_port_rules(&state, move |rules| {
+        match rules.iter_mut().find(|r| r.id == id) {
+            Some(existing) => {
+                *existing = to_store;
+                true
+            }
+            None => false,
         }
-        None => false,
     })
     .await?;
     if !found {
@@ -976,7 +1230,10 @@ async fn update_port_rule(
     Ok(Json(updated))
 }
 
-async fn delete_port_rule(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+async fn delete_port_rule(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
     let found = mutate_port_rules(&state, move |rules| {
         let before = rules.len();
         rules.retain(|r| r.id != id);
@@ -989,7 +1246,10 @@ async fn delete_port_rule(State(state): State<AppState>, Path(id): Path<Uuid>) -
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn mutate_port_rules(state: &AppState, mutate: impl FnOnce(&mut Vec<PortRule>) -> bool) -> Result<bool, ApiError> {
+async fn mutate_port_rules(
+    state: &AppState,
+    mutate: impl FnOnce(&mut Vec<PortRule>) -> bool,
+) -> Result<bool, ApiError> {
     let _guard = state.lock_port_rules_for_write().await;
     let mut rules = (*state.port_rules()).clone();
     let changed = mutate(&mut rules);
@@ -1035,17 +1295,30 @@ struct UploadCertRequest {
 /// for this domain still has `acme_enabled = true`, the next renewal
 /// check would otherwise silently overwrite this cert with an
 /// ACME-issued one.
-async fn upload_cert(State(state): State<AppState>, Json(body): Json<UploadCertRequest>) -> Result<Json<CertSummary>, ApiError> {
+async fn upload_cert(
+    State(state): State<AppState>,
+    Json(body): Json<UploadCertRequest>,
+) -> Result<Json<CertSummary>, ApiError> {
     let domain = body.domain.trim().to_string();
     crate::config::validate_domain(&domain).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if state.hosts().iter().any(|h| h.domain.eq_ignore_ascii_case(&domain) && h.acme_enabled) {
+    if state
+        .hosts()
+        .iter()
+        .any(|h| h.domain.eq_ignore_ascii_case(&domain) && h.acme_enabled)
+    {
         return Err(ApiError::BadRequest(format!(
             "a host for {domain} still has acme_enabled=true -- disable ACME for it first, otherwise the next renewal check will overwrite this custom certificate"
         )));
     }
-    let entry = crate::acme::cert::build_cert_entry(&body.fullchain_pem, &body.private_key_pem).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    crate::acme::persist_cert_files(&state.acme().cert_dir, &domain, &body.fullchain_pem, &body.private_key_pem)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let entry = crate::acme::cert::build_cert_entry(&body.fullchain_pem, &body.private_key_pem)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    crate::acme::persist_cert_files(
+        &state.acme().cert_dir,
+        &domain,
+        &body.fullchain_pem,
+        &body.private_key_pem,
+    )
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
     let not_after = entry.not_after;
     state.upsert_cert(domain.clone(), entry);
     Ok(Json(CertSummary {
@@ -1055,7 +1328,10 @@ async fn upload_cert(State(state): State<AppState>, Json(body): Json<UploadCertR
     }))
 }
 
-async fn delete_cert(State(state): State<AppState>, Path(domain): Path<String>) -> Result<StatusCode, ApiError> {
+async fn delete_cert(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+) -> Result<StatusCode, ApiError> {
     if !state.remove_cert(&domain) {
         return Err(ApiError::NotFound);
     }
@@ -1092,7 +1368,9 @@ struct ApiTokenCreated {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-async fn list_api_tokens(State(state): State<AppState>) -> Result<Json<Vec<ApiTokenSummary>>, ApiError> {
+async fn list_api_tokens(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApiTokenSummary>>, ApiError> {
     let tokens = crate::db::list_api_tokens(state.db()).await?;
     Ok(Json(
         tokens
@@ -1127,7 +1405,10 @@ async fn create_api_token(
     }))
 }
 
-async fn delete_api_token(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+async fn delete_api_token(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
     let found = crate::db::delete_api_token(state.db(), id).await?;
     if !found {
         return Err(ApiError::NotFound);
@@ -1150,7 +1431,9 @@ struct CreateDnsCredentialRequest {
     token: String,
 }
 
-async fn list_dns_credentials(State(state): State<AppState>) -> Result<Json<Vec<DnsCredentialSummary>>, ApiError> {
+async fn list_dns_credentials(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<DnsCredentialSummary>>, ApiError> {
     let creds = crate::db::list_dns_credentials(state.db()).await?;
     Ok(Json(
         creds
@@ -1165,7 +1448,10 @@ async fn list_dns_credentials(State(state): State<AppState>) -> Result<Json<Vec<
     ))
 }
 
-async fn create_dns_credential(State(state): State<AppState>, Json(body): Json<CreateDnsCredentialRequest>) -> Result<Json<DnsCredentialSummary>, ApiError> {
+async fn create_dns_credential(
+    State(state): State<AppState>,
+    Json(body): Json<CreateDnsCredentialRequest>,
+) -> Result<Json<DnsCredentialSummary>, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
         return Err(ApiError::BadRequest("name must not be empty".into()));
@@ -1174,11 +1460,14 @@ async fn create_dns_credential(State(state): State<AppState>, Json(body): Json<C
         return Err(ApiError::BadRequest("token must not be empty".into()));
     }
     if crate::db::dns_credential_name_exists(state.db(), name).await? {
-        return Err(ApiError::BadRequest(format!("a DNS credential named \"{name}\" already exists")));
+        return Err(ApiError::BadRequest(format!(
+            "a DNS credential named \"{name}\" already exists"
+        )));
     }
     let id = Uuid::new_v4();
     let created_at = chrono::Utc::now();
-    crate::db::create_dns_credential(state.db(), id, name, body.provider, &body.token, created_at).await?;
+    crate::db::create_dns_credential(state.db(), id, name, body.provider, &body.token, created_at)
+        .await?;
     Ok(Json(DnsCredentialSummary {
         id,
         name: name.to_string(),
@@ -1194,10 +1483,19 @@ async fn create_dns_credential(State(state): State<AppState>, Json(body): Json<C
 /// it implicitly" rule only ever applies when a host has NO explicit
 /// `dns_credential_id`, so an orphaned explicit reference doesn't
 /// recover even if only one credential is left afterward.
-async fn delete_dns_credential(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
-    let still_in_use = state.hosts().iter().any(|h| h.dns_credential_id == Some(id));
+async fn delete_dns_credential(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let still_in_use = state
+        .hosts()
+        .iter()
+        .any(|h| h.dns_credential_id == Some(id));
     if still_in_use {
-        return Err(ApiError::Conflict("one or more hosts still reference this DNS credential -- repoint or delete them first".into()));
+        return Err(ApiError::Conflict(
+            "one or more hosts still reference this DNS credential -- repoint or delete them first"
+                .into(),
+        ));
     }
     let found = crate::db::delete_dns_credential(state.db(), id).await?;
     if !found {
@@ -1232,7 +1530,9 @@ struct CreateStandaloneCertRequest {
     organizational_unit: Option<String>,
 }
 
-async fn list_standalone_certs(State(state): State<AppState>) -> Result<Json<Vec<StandaloneCertSummary>>, ApiError> {
+async fn list_standalone_certs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<StandaloneCertSummary>>, ApiError> {
     let certs = crate::db::list_standalone_certs(state.db()).await?;
     Ok(Json(
         certs
@@ -1261,15 +1561,25 @@ async fn list_standalone_certs(State(state): State<AppState>) -> Result<Json<Vec
 /// persisted after issuance actually succeeds, so a failed attempt
 /// doesn't linger being silently retried on a domain that's never
 /// actually gotten a cert.
-async fn create_standalone_cert(State(state): State<AppState>, Json(body): Json<CreateStandaloneCertRequest>) -> Result<Json<StandaloneCertSummary>, ApiError> {
+async fn create_standalone_cert(
+    State(state): State<AppState>,
+    Json(body): Json<CreateStandaloneCertRequest>,
+) -> Result<Json<StandaloneCertSummary>, ApiError> {
     let domain = body.domain.trim();
     crate::config::validate_domain(domain).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if crate::db::standalone_cert_domain_exists(state.db(), domain).await? {
-        return Err(ApiError::BadRequest(format!("a standalone certificate for \"{domain}\" is already tracked")));
+        return Err(ApiError::BadRequest(format!(
+            "a standalone certificate for \"{domain}\" is already tracked"
+        )));
     }
     if let Some(id) = body.dns_credential_id {
-        if crate::db::get_dns_credential(state.db(), id).await?.is_none() {
-            return Err(ApiError::BadRequest("dns_credential_id does not reference an existing DNS credential".into()));
+        if crate::db::get_dns_credential(state.db(), id)
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::BadRequest(
+                "dns_credential_id does not reference an existing DNS credential".into(),
+            ));
         }
     }
 
@@ -1278,18 +1588,41 @@ async fn create_standalone_cert(State(state): State<AppState>, Json(body): Json<
     // configured default" shape used throughout this API. Whatever's
     // resolved here is what actually gets requested AND persisted, so a
     // later automatic renewal repeats the same Subject.
-    let organization = body.organization.or_else(|| state.acme().organization.clone());
-    let organizational_unit = body.organizational_unit.or_else(|| state.acme().organizational_unit.clone());
+    let organization = body
+        .organization
+        .or_else(|| state.acme().organization.clone());
+    let organizational_unit = body
+        .organizational_unit
+        .or_else(|| state.acme().organizational_unit.clone());
 
     let http = reqwest::Client::new();
-    let client = crate::acme::init_acme_client(&state).await.map_err(|e| ApiError::Internal(e.to_string()))?;
-    crate::acme::issue_standalone_dns01_certificate(&state, &client, &http, domain, body.dns_credential_id, organization.clone(), organizational_unit.clone())
+    let client = crate::acme::init_acme_client(&state)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    crate::acme::issue_standalone_dns01_certificate(
+        &state,
+        &client,
+        &http,
+        domain,
+        body.dns_credential_id,
+        organization.clone(),
+        organizational_unit.clone(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let id = Uuid::new_v4();
     let created_at = chrono::Utc::now();
-    crate::db::create_standalone_cert(state.db(), id, domain, body.dns_credential_id, created_at, organization.as_deref(), organizational_unit.as_deref()).await?;
+    crate::db::create_standalone_cert(
+        state.db(),
+        id,
+        domain,
+        body.dns_credential_id,
+        created_at,
+        organization.as_deref(),
+        organizational_unit.as_deref(),
+    )
+    .await?;
     Ok(Json(StandaloneCertSummary {
         id,
         domain: domain.to_string(),
@@ -1305,7 +1638,10 @@ async fn create_standalone_cert(State(state): State<AppState>, Json(body): Json<
 /// on-disk, same as `delete_cert`'s "domain no longer has a live
 /// ProxyHost" case; a host relying on it via the wildcard fallback must
 /// not lose TLS just because renewal tracking was removed.
-async fn delete_standalone_cert(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+async fn delete_standalone_cert(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
     let found = crate::db::delete_standalone_cert(state.db(), id).await?;
     if !found {
         return Err(ApiError::NotFound);
@@ -1318,7 +1654,10 @@ async fn delete_standalone_cert(State(state): State<AppState>, Path(id): Path<Uu
 /// comment for the same "None falls back only when there's exactly one"
 /// rule this mirrors, surfaced here as an immediate 400 instead of a
 /// renewal-time failure discovered hours later.
-async fn validate_dns_credential_choice(state: &AppState, host: &ProxyHost) -> Result<(), ApiError> {
+async fn validate_dns_credential_choice(
+    state: &AppState,
+    host: &ProxyHost,
+) -> Result<(), ApiError> {
     // A host with ACME disabled never attempts issuance at all, so it
     // has no use for a DNS credential regardless of what
     // acme_challenge_type/resolve_challenge_type would otherwise
@@ -1338,8 +1677,14 @@ async fn validate_dns_credential_choice(state: &AppState, host: &ProxyHost) -> R
         // exactly-one-credential-exists rule below even if that would
         // resolve unambiguously: an explicit choice that no longer
         // exists is a configuration error to surface, not paper over.
-        if crate::db::get_dns_credential(state.db(), id).await?.is_none() {
-            return Err(ApiError::BadRequest(format!("{} references a DNS credential that no longer exists", host.domain)));
+        if crate::db::get_dns_credential(state.db(), id)
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "{} references a DNS credential that no longer exists",
+                host.domain
+            )));
         }
         return Ok(());
     }
@@ -1395,7 +1740,9 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -1429,8 +1776,11 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
         };
-        cfg.validate().expect("valid: all three identity fields omitted together");
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        cfg.validate()
+            .expect("valid: all three identity fields omitted together");
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -1467,7 +1817,9 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -1501,7 +1853,9 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -1526,7 +1880,12 @@ mod tests {
     async fn unauthenticated_request_to_protected_route_is_rejected() {
         let router = build_router(test_state().await);
         let resp = router
-            .oneshot(Request::builder().uri("/api/dashboard").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -1541,7 +1900,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"admin","password":"wrong"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":"wrong"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1560,7 +1921,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"admin","password":"correct-password"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":"correct-password"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1591,7 +1954,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"admin","password":"correct-password"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":"correct-password"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1607,7 +1972,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(format!(r#"{{"username":"{username}","password":"{password}"}}"#)))
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"username":"{username}","password":"{password}"}}"#
+                    )))
                     .unwrap(),
             )
             .await
@@ -1619,7 +1986,12 @@ mod tests {
     async fn setup_status_reports_unconfigured_before_any_setup() {
         let router = build_router(unconfigured_test_state().await);
         let resp = router
-            .oneshot(Request::builder().uri("/api/setup-status").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/setup-status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1631,7 +2003,12 @@ mod tests {
     async fn setup_status_reports_configured_once_config_supplies_an_identity() {
         let router = build_router(test_state().await);
         let resp = router
-            .oneshot(Request::builder().uri("/api/setup-status").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/setup-status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let json = body_json(resp).await;
@@ -1642,7 +2019,12 @@ mod tests {
     async fn version_endpoint_is_unauthenticated_and_reports_the_crate_version() {
         let router = build_router(test_state().await);
         let resp = router
-            .oneshot(Request::builder().uri("/api/version").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/version")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1661,7 +2043,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/setup")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"admin","password":"a-real-password"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":"a-real-password"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1674,7 +2058,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"admin","password":"a-real-password"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":"a-real-password"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1694,7 +2080,9 @@ mod tests {
                         .method("POST")
                         .uri("/api/setup")
                         .header(header::CONTENT_TYPE, "application/json")
-                        .body(axum::body::Body::from(r#"{"username":"admin","password":"a-real-password"}"#))
+                        .body(axum::body::Body::from(
+                            r#"{"username":"admin","password":"a-real-password"}"#,
+                        ))
                         .unwrap(),
                 )
                 .await
@@ -1707,7 +2095,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/setup")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"attacker","password":"hijack"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"attacker","password":"hijack"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1724,7 +2114,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/setup")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"attacker","password":"hijack"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"attacker","password":"hijack"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1741,7 +2133,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/setup")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"admin","password":""}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":""}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1793,7 +2187,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/login")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(r#"{"username":"admin","password":"anything"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"admin","password":"anything"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1928,7 +2324,9 @@ mod tests {
                     .uri("/api/dns-credentials")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1936,7 +2334,10 @@ mod tests {
         assert_eq!(create_resp.status(), StatusCode::OK);
         let created = body_json(create_resp).await;
         assert_eq!(created["name"], "prod-hetzner");
-        assert!(created.get("token").is_none(), "the credential's secret token must never be returned, even on creation");
+        assert!(
+            created.get("token").is_none(),
+            "the credential's secret token must never be returned, even on creation"
+        );
 
         let list_resp = router
             .oneshot(
@@ -1968,7 +2369,9 @@ mod tests {
                         .uri("/api/dns-credentials")
                         .header(header::CONTENT_TYPE, "application/json")
                         .header(header::COOKIE, cookie.clone())
-                        .body(axum::body::Body::from(r#"{"name":"dup","provider":"hetzner","token":"tok"}"#))
+                        .body(axum::body::Body::from(
+                            r#"{"name":"dup","provider":"hetzner","token":"tok"}"#,
+                        ))
                         .unwrap(),
                 )
                 .await
@@ -2002,12 +2405,17 @@ mod tests {
                     .uri("/api/dns-credentials")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+        let id = body_json(create_resp).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let delete_resp = router
             .clone()
@@ -2050,12 +2458,17 @@ mod tests {
                     .uri("/api/dns-credentials")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"prod-hetzner","provider":"hetzner","token":"secret-token"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        let cred_id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+        let cred_id = body_json(create_resp).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let host_resp = router
             .clone()
@@ -2085,7 +2498,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(delete_resp.status(), StatusCode::CONFLICT, "a host still points at this credential by ID");
+        assert_eq!(
+            delete_resp.status(),
+            StatusCode::CONFLICT,
+            "a host still points at this credential by ID"
+        );
     }
 
     #[tokio::test]
@@ -2115,7 +2532,12 @@ mod tests {
     async fn dns_credential_endpoints_require_authentication() {
         let router = build_router(test_state().await);
         let resp = router
-            .oneshot(Request::builder().uri("/api/dns-credentials").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dns-credentials")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2156,7 +2578,9 @@ mod tests {
                     .uri("/api/dns-credentials")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"name":"only-one","provider":"hetzner","token":"tok"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"only-one","provider":"hetzner","token":"tok"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2193,7 +2617,9 @@ mod tests {
                         .uri("/api/dns-credentials")
                         .header(header::CONTENT_TYPE, "application/json")
                         .header(header::COOKIE, cookie.clone())
-                        .body(axum::body::Body::from(format!(r#"{{"name":"{name}","provider":"hetzner","token":"tok"}}"#)))
+                        .body(axum::body::Body::from(format!(
+                            r#"{{"name":"{name}","provider":"hetzner","token":"tok"}}"#
+                        )))
                         .unwrap(),
                 )
                 .await
@@ -2388,7 +2814,9 @@ mod tests {
                     .uri("/api/certs")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap()))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2461,7 +2889,9 @@ mod tests {
                     .uri("/api/certs")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap()))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2482,7 +2912,9 @@ mod tests {
                     .uri("/api/certs")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap()))
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&self_signed_cert_json("custom.example.com")).unwrap(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2595,7 +3027,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["name"], "ci pipeline");
-        assert!(json["token"].as_str().unwrap().starts_with(auth::API_TOKEN_PREFIX));
+        assert!(json["token"]
+            .as_str()
+            .unwrap()
+            .starts_with(auth::API_TOKEN_PREFIX));
     }
 
     #[tokio::test]
@@ -2616,7 +3051,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let token = body_json(create_resp).await["token"].as_str().unwrap().to_string();
+        let token = body_json(create_resp).await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let dash_resp = router
             .oneshot(
@@ -2744,7 +3182,9 @@ mod tests {
                     .uri("/api/acls")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2783,7 +3223,9 @@ mod tests {
                     .uri("/api/acls")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(r#"{"name":"single-ip","kind":"ip_allow","ip_entries":["203.0.113.5"]}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"single-ip","kind":"ip_allow","ip_entries":["203.0.113.5"]}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2795,7 +3237,12 @@ mod tests {
     async fn create_ip_allow_acl_accepts_ipv6_cidrs_and_bare_addresses() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
-        let acl_id = create_acl(&router, &cookie, r#"{"name":"v6-office","kind":"ip_allow","ip_entries":["2001:db8::/32"]}"#).await;
+        let acl_id = create_acl(
+            &router,
+            &cookie,
+            r#"{"name":"v6-office","kind":"ip_allow","ip_entries":["2001:db8::/32"]}"#,
+        )
+        .await;
 
         let resp = router
             .oneshot(
@@ -2811,7 +3258,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let added = body_json(resp).await;
-        assert_eq!(added["cidr"], "2001:db8::42/128", "a bare IPv6 address must be normalized to a /128, same as IPv4's /32");
+        assert_eq!(
+            added["cidr"], "2001:db8::42/128",
+            "a bare IPv6 address must be normalized to a /128, same as IPv4's /32"
+        );
     }
 
     #[tokio::test]
@@ -2826,7 +3276,9 @@ mod tests {
                     .uri("/api/acls")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(r#"{"name":"empty","kind":"ip_allow","ip_entries":[]}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"empty","kind":"ip_allow","ip_entries":[]}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2846,7 +3298,9 @@ mod tests {
                     .uri("/api/acls")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(r#"{"name":"bad","kind":"ip_allow","ip_entries":["not-a-cidr"]}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"bad","kind":"ip_allow","ip_entries":["not-a-cidr"]}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2876,7 +3330,10 @@ mod tests {
         assert_eq!(create_resp.status(), StatusCode::OK);
         let created = body_json(create_resp).await;
         assert_eq!(created["name"], "viewers");
-        assert!(created.get("credentials").is_none(), "credentials, including hashes, must never be returned");
+        assert!(
+            created.get("credentials").is_none(),
+            "credentials, including hashes, must never be returned"
+        );
     }
 
     #[tokio::test]
@@ -2891,7 +3348,9 @@ mod tests {
                     .uri("/api/acls")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(r#"{"name":"empty-login","kind":"login","credentials":[]}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"empty-login","kind":"login","credentials":[]}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2913,7 +3372,9 @@ mod tests {
                         .uri("/api/acls")
                         .header(header::CONTENT_TYPE, "application/json")
                         .header(header::COOKIE, cookie.clone())
-                        .body(axum::body::Body::from(r#"{"name":"dup","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                        .body(axum::body::Body::from(
+                            r#"{"name":"dup","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#,
+                        ))
                         .unwrap(),
                 )
                 .await
@@ -2947,12 +3408,17 @@ mod tests {
                     .uri("/api/acls")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        let id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+        let id = body_json(create_resp).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let delete_resp = router
             .clone()
@@ -2995,12 +3461,17 @@ mod tests {
                     .uri("/api/acls")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        let acl_id = body_json(create_resp).await["id"].as_str().unwrap().to_string();
+        let acl_id = body_json(create_resp).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         router
             .clone()
@@ -3037,7 +3508,12 @@ mod tests {
         let router = build_router(test_state().await);
 
         let resp = router
-            .oneshot(Request::builder().uri("/api/acls").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/acls")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -3065,7 +3541,12 @@ mod tests {
     async fn ip_entries_can_be_added_individually_to_an_existing_acl_and_appear_in_its_detail() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
-        let acl_id = create_acl(&router, &cookie, r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#).await;
+        let acl_id = create_acl(
+            &router,
+            &cookie,
+            r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#,
+        )
+        .await;
 
         let add_resp = router
             .clone()
@@ -3075,32 +3556,54 @@ mod tests {
                     .uri(format!("/api/acls/{acl_id}/ip-entries"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"cidr":"203.0.113.5","description":"remote office"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"cidr":"203.0.113.5","description":"remote office"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(add_resp.status(), StatusCode::OK);
         let added = body_json(add_resp).await;
-        assert_eq!(added["cidr"], "203.0.113.5/32", "a bare address must still be normalized to a /32, same as bulk creation");
+        assert_eq!(
+            added["cidr"], "203.0.113.5/32",
+            "a bare address must still be normalized to a /32, same as bulk creation"
+        );
         assert_eq!(added["description"], "remote office");
 
         let detail_resp = router
             .clone()
-            .oneshot(Request::builder().uri(format!("/api/acls/{acl_id}")).header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/acls/{acl_id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let detail = body_json(detail_resp).await;
         let entries = detail["ip_entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2, "the original bulk-created entry plus the individually-added one");
-        assert!(entries.iter().any(|e| e["cidr"] == "203.0.113.5/32" && e["description"] == "remote office"));
+        assert_eq!(
+            entries.len(),
+            2,
+            "the original bulk-created entry plus the individually-added one"
+        );
+        assert!(entries
+            .iter()
+            .any(|e| e["cidr"] == "203.0.113.5/32" && e["description"] == "remote office"));
     }
 
     #[tokio::test]
     async fn ip_entry_can_be_edited_and_deleted_individually() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
-        let acl_id = create_acl(&router, &cookie, r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#).await;
+        let acl_id = create_acl(
+            &router,
+            &cookie,
+            r#"{"name":"office","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#,
+        )
+        .await;
 
         let add_resp = router
             .clone()
@@ -3115,7 +3618,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let entry_id = body_json(add_resp).await["id"].as_str().unwrap().to_string();
+        let entry_id = body_json(add_resp).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let update_resp = router
             .clone()
@@ -3125,7 +3631,9 @@ mod tests {
                     .uri(format!("/api/acls/{acl_id}/ip-entries/{entry_id}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"cidr":"192.168.1.0/16","description":"widened"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"cidr":"192.168.1.0/16","description":"widened"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -3198,7 +3706,9 @@ mod tests {
                     .uri(format!("/api/acls/{acl_id}/credentials"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie.clone())
-                    .body(axum::body::Body::from(r#"{"username":"bob","password":"hunter2","description":"contractor"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"username":"bob","password":"hunter2","description":"contractor"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -3210,7 +3720,13 @@ mod tests {
         assert!(added.get("password").is_none() && added.get("password_hash").is_none());
 
         let detail_resp = router
-            .oneshot(Request::builder().uri(format!("/api/acls/{acl_id}")).header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/acls/{acl_id}"))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let detail = body_json(detail_resp).await;
@@ -3227,7 +3743,13 @@ mod tests {
 
         let detail_resp = router
             .clone()
-            .oneshot(Request::builder().uri(format!("/api/acls/{acl_id}")).header(header::COOKIE, cookie.clone()).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/acls/{acl_id}"))
+                    .header(header::COOKIE, cookie.clone())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let detail = body_json(detail_resp).await;
@@ -3269,7 +3791,13 @@ mod tests {
         let cookie = logged_in_cookie(&router).await;
 
         let resp = router
-            .oneshot(Request::builder().uri(format!("/api/acls/{}", Uuid::new_v4())).header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/acls/{}", Uuid::new_v4()))
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -3298,7 +3826,17 @@ mod tests {
     #[tokio::test]
     async fn create_standalone_cert_with_a_domain_already_tracked_is_rejected() {
         let state = test_state().await;
-        crate::db::create_standalone_cert(state.db(), Uuid::new_v4(), "*.example.com", None, chrono::Utc::now(), None, None).await.unwrap();
+        crate::db::create_standalone_cert(
+            state.db(),
+            Uuid::new_v4(),
+            "*.example.com",
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let router = build_router(state);
         let cookie = logged_in_cookie(&router).await;
 
@@ -3329,7 +3867,10 @@ mod tests {
                     .uri("/api/dns01-certs")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(format!(r#"{{"domain":"*.example.com","dns_credential_id":"{}"}}"#, Uuid::new_v4())))
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"domain":"*.example.com","dns_credential_id":"{}"}}"#,
+                        Uuid::new_v4()
+                    )))
                     .unwrap(),
             )
             .await
@@ -3338,7 +3879,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_standalone_cert_returns_an_error_and_persists_nothing_when_acme_is_unreachable() {
+    async fn create_standalone_cert_returns_an_error_and_persists_nothing_when_acme_is_unreachable()
+    {
         // test_state()'s directory_url ("https://example.invalid/directory")
         // is deliberately unreachable -- this exercises the real
         // init_acme_client/issuance failure path without needing a full
@@ -3375,14 +3917,27 @@ mod tests {
             .await
             .unwrap();
         let json = body_json(list_resp).await;
-        assert!(json.as_array().unwrap().is_empty(), "a failed issuance must not leave a tracking row behind");
+        assert!(
+            json.as_array().unwrap().is_empty(),
+            "a failed issuance must not leave a tracking row behind"
+        );
     }
 
     #[tokio::test]
     async fn list_and_delete_standalone_certs_round_trip() {
         let state = test_state().await;
         let id = Uuid::new_v4();
-        crate::db::create_standalone_cert(state.db(), id, "*.example.com", None, chrono::Utc::now(), None, None).await.unwrap();
+        crate::db::create_standalone_cert(
+            state.db(),
+            id,
+            "*.example.com",
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let router = build_router(state);
         let cookie = logged_in_cookie(&router).await;
 
@@ -3433,7 +3988,12 @@ mod tests {
         let router = build_router(test_state().await);
 
         let resp = router
-            .oneshot(Request::builder().uri("/api/dns01-certs").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dns01-certs")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -3445,7 +4005,13 @@ mod tests {
         let cookie = logged_in_cookie(&router).await;
 
         let resp = router
-            .oneshot(Request::builder().uri("/api/acme-settings").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/acme-settings")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let json = body_json(resp).await;
@@ -3459,7 +4025,13 @@ mod tests {
         let cookie = logged_in_cookie(&router).await;
 
         let resp = router
-            .oneshot(Request::builder().uri("/api/acme-settings").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/acme-settings")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let json = body_json(resp).await;
@@ -3480,16 +4052,28 @@ mod tests {
                     .uri("/api/acme-settings")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(r#"{"contact_email":"ops@example.com"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"contact_email":"ops@example.com"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(state.acme_contact_email().as_deref(), Some("ops@example.com"), "must take effect immediately, no restart needed");
+        assert_eq!(
+            state.acme_contact_email().as_deref(),
+            Some("ops@example.com"),
+            "must take effect immediately, no restart needed"
+        );
 
-        let reloaded = crate::db::load_acme_contact_email(state.db()).await.unwrap();
-        assert_eq!(reloaded.as_deref(), Some("ops@example.com"), "must actually persist to the DB, not just the in-memory ArcSwap");
+        let reloaded = crate::db::load_acme_contact_email(state.db())
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.as_deref(),
+            Some("ops@example.com"),
+            "must actually persist to the DB, not just the in-memory ArcSwap"
+        );
     }
 
     #[tokio::test]
@@ -3524,7 +4108,9 @@ mod tests {
                     .uri("/api/acme-settings")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::COOKIE, cookie)
-                    .body(axum::body::Body::from(r#"{"contact_email":"ops@example.com"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"contact_email":"ops@example.com"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -3536,7 +4122,15 @@ mod tests {
     async fn acme_settings_endpoints_require_authentication() {
         let router = build_router(test_state().await);
 
-        let resp = router.oneshot(Request::builder().uri("/api/acme-settings").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/acme-settings")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3546,7 +4140,13 @@ mod tests {
         let cookie = logged_in_cookie(&router).await;
 
         let resp = router
-            .oneshot(Request::builder().uri("/api/firewall-settings").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/firewall-settings")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let json = body_json(resp).await;
@@ -3573,10 +4173,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(!state.expose_admin_port(), "must take effect immediately, no restart needed");
+        assert!(
+            !state.expose_admin_port(),
+            "must take effect immediately, no restart needed"
+        );
 
         let reloaded = crate::db::load_expose_admin_port(state.db()).await.unwrap();
-        assert_eq!(reloaded, Some(false), "must actually persist to the DB, not just the in-memory ArcSwap");
+        assert_eq!(
+            reloaded,
+            Some(false),
+            "must actually persist to the DB, not just the in-memory ArcSwap"
+        );
     }
 
     #[tokio::test]
@@ -3603,7 +4210,15 @@ mod tests {
     async fn firewall_settings_endpoints_require_authentication() {
         let router = build_router(test_state().await);
 
-        let resp = router.oneshot(Request::builder().uri("/api/firewall-settings").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/firewall-settings")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3623,12 +4238,26 @@ mod tests {
 
         let session_resp = router
             .clone()
-            .oneshot(Request::builder().uri("/api/dashboard").header(header::COOKIE, cookie).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(session_resp.status(), StatusCode::OK);
 
-        let unauthenticated_resp = router.oneshot(Request::builder().uri("/api/dashboard").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        let unauthenticated_resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(unauthenticated_resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

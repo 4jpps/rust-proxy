@@ -18,7 +18,10 @@ use tokio::net::TcpListener;
 /// Accepts on `bind_addr`, dials `upstream` for every new connection, and
 /// copies bytes bidirectionally until either side closes. Runs until the
 /// listener itself errors (socket closed, etc).
-pub async fn run_tcp_passthrough(bind_addr: SocketAddr, upstream: SocketAddr) -> std::io::Result<()> {
+pub async fn run_tcp_passthrough(
+    bind_addr: SocketAddr,
+    upstream: SocketAddr,
+) -> std::io::Result<()> {
     let listener = crate::netbind::bind_tcp_listener(bind_addr)?;
     tracing::info!(%bind_addr, %upstream, "tcp passthrough listening");
     loop {
@@ -26,7 +29,9 @@ pub async fn run_tcp_passthrough(bind_addr: SocketAddr, upstream: SocketAddr) ->
         tokio::spawn(async move {
             match TcpStream::connect(upstream).await {
                 Ok(mut outbound) => {
-                    if let Err(err) = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
+                    if let Err(err) =
+                        tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await
+                    {
                         tracing::debug!(%peer, error = %err, "tcp passthrough session ended");
                     }
                 }
@@ -46,11 +51,15 @@ const UDP_BUF_SIZE: usize = 64 * 1024;
 /// spawns a dedicated upstream socket + a task relaying upstream ->
 /// client, and every subsequent datagram from that client just gets
 /// forwarded through the existing session. Idle sessions are reaped.
-pub async fn run_udp_passthrough(bind_addr: SocketAddr, upstream: SocketAddr) -> std::io::Result<()> {
+pub async fn run_udp_passthrough(
+    bind_addr: SocketAddr,
+    upstream: SocketAddr,
+) -> std::io::Result<()> {
     let socket = Arc::new(crate::netbind::bind_udp_socket(bind_addr)?);
     tracing::info!(%bind_addr, %upstream, "udp passthrough listening");
 
-    let sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; UDP_BUF_SIZE];
 
     loop {
@@ -64,7 +73,12 @@ pub async fn run_udp_passthrough(bind_addr: SocketAddr, upstream: SocketAddr) ->
                 let new_socket = Arc::new(UdpSocket::bind(("0.0.0.0", 0)).await?);
                 new_socket.connect(upstream).await?;
                 guard.insert(client_addr, new_socket.clone());
-                spawn_udp_return_path(new_socket.clone(), socket.clone(), client_addr, sessions.clone());
+                spawn_udp_return_path(
+                    new_socket.clone(),
+                    socket.clone(),
+                    client_addr,
+                    sessions.clone(),
+                );
                 new_socket
             }
         };
@@ -84,7 +98,9 @@ fn spawn_udp_return_path(
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_BUF_SIZE];
         loop {
-            let recv = tokio::time::timeout(UDP_SESSION_IDLE_TIMEOUT, upstream_socket.recv(&mut buf)).await;
+            let recv =
+                tokio::time::timeout(UDP_SESSION_IDLE_TIMEOUT, upstream_socket.recv(&mut buf))
+                    .await;
             match recv {
                 Ok(Ok(len)) => {
                     if let Err(err) = client_facing_socket.send_to(&buf[..len], client_addr).await {

@@ -60,7 +60,9 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(phc_hash) else {
         return false;
     };
-    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
@@ -105,7 +107,8 @@ pub fn verify_session(secret: &str, token: &str) -> Option<String> {
 }
 
 fn hmac_sign(secret: &str, data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -124,7 +127,10 @@ mod tests {
     #[test]
     fn session_token_round_trips_the_username() {
         let token = sign_session("secret-key", "admin");
-        assert_eq!(verify_session("secret-key", &token), Some("admin".to_string()));
+        assert_eq!(
+            verify_session("secret-key", &token),
+            Some("admin".to_string())
+        );
     }
 
     #[test]
@@ -155,9 +161,16 @@ mod tests {
         let (token_a, hash_a) = generate_api_token();
         let (token_b, hash_b) = generate_api_token();
         assert!(token_a.starts_with(API_TOKEN_PREFIX));
-        assert_ne!(token_a, token_b, "two generated tokens should never collide");
+        assert_ne!(
+            token_a, token_b,
+            "two generated tokens should never collide"
+        );
         assert_ne!(hash_a, hash_b);
-        assert_eq!(hash_api_token(&token_a), hash_a, "hashing the same plaintext twice must be deterministic");
+        assert_eq!(
+            hash_api_token(&token_a),
+            hash_a,
+            "hashing the same plaintext twice must be deterministic"
+        );
     }
 
     #[test]

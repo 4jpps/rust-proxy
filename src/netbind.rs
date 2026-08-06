@@ -40,7 +40,11 @@ pub fn bind_udp_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
 }
 
 fn new_socket(addr: SocketAddr, ty: Type, protocol: Option<Protocol>) -> io::Result<Socket> {
-    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let socket = Socket::new(domain, ty, protocol)?;
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
@@ -69,7 +73,10 @@ mod tests {
         let v6 = bind_tcp_listener("[::]:0".parse().unwrap()).unwrap();
         let port = v6.local_addr().unwrap().port();
         let v4 = bind_tcp_listener(format!("0.0.0.0:{port}").parse().unwrap());
-        assert!(v4.is_ok(), "binding 0.0.0.0 on the same port as an already-bound [::] must succeed: {v4:?}");
+        assert!(
+            v4.is_ok(),
+            "binding 0.0.0.0 on the same port as an already-bound [::] must succeed: {v4:?}"
+        );
     }
 
     #[tokio::test]
@@ -79,8 +86,15 @@ mod tests {
         // Connecting via a literal IPv4-mapped address to the v6-only
         // listener's port must fail to connect at all (nothing there,
         // since v6-only means no v4 traffic is accepted on this socket).
-        let connect = tokio::time::timeout(std::time::Duration::from_millis(300), tokio::net::TcpStream::connect(("127.0.0.1", port))).await;
-        assert!(connect.is_err() || connect.unwrap().is_err(), "a v6-only socket must not accept a v4 connection on the same port");
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await;
+        assert!(
+            connect.is_err() || connect.unwrap().is_err(),
+            "a v6-only socket must not accept a v4 connection on the same port"
+        );
     }
 
     #[tokio::test]

@@ -46,16 +46,24 @@ pub enum DnsCredentialError {
 /// single configured credential" only when it's genuinely unambiguous
 /// (exactly one row exists) -- zero or multiple rows with no explicit
 /// choice is a clear error rather than a silent wrong guess.
-pub async fn resolve_dns_credential(pool: &sqlx::SqlitePool, domain: &str, dns_credential_id: Option<uuid::Uuid>) -> Result<crate::db::DnsCredential, DnsCredentialError> {
+pub async fn resolve_dns_credential(
+    pool: &sqlx::SqlitePool,
+    domain: &str,
+    dns_credential_id: Option<uuid::Uuid>,
+) -> Result<crate::db::DnsCredential, DnsCredentialError> {
     match dns_credential_id {
-        Some(id) => crate::db::get_dns_credential(pool, id).await?.ok_or_else(|| DnsCredentialError::NotFound(domain.to_string())),
+        Some(id) => crate::db::get_dns_credential(pool, id)
+            .await?
+            .ok_or_else(|| DnsCredentialError::NotFound(domain.to_string())),
         None => {
             let metas = crate::db::list_dns_credentials(pool).await?;
             match metas.len() {
                 0 => Err(DnsCredentialError::NoneConfigured(domain.to_string())),
                 1 => Ok(crate::db::get_dns_credential(pool, metas[0].id)
                     .await?
-                    .expect("just listed this row, it cannot have vanished between the two queries")),
+                    .expect(
+                        "just listed this row, it cannot have vanished between the two queries",
+                    )),
                 _ => Err(DnsCredentialError::Ambiguous(domain.to_string())),
             }
         }
@@ -156,7 +164,12 @@ pub enum IssuanceError {
 /// map for SNI dispatch. Whichever challenge fulfillment was published
 /// (a DNS TXT record, or an in-memory http-01 token) is always cleaned
 /// up on the way out, success or failure.
-pub async fn issue_certificate(state: &AppState, client: &AcmeClient, http: &reqwest::Client, host: &ProxyHost) -> Result<(), IssuanceError> {
+pub async fn issue_certificate(
+    state: &AppState,
+    client: &AcmeClient,
+    http: &reqwest::Client,
+    host: &ProxyHost,
+) -> Result<(), IssuanceError> {
     let domain = &host.domain;
     let domains = domains_for_issuance(domain);
     let (order_url, order, authzs) = create_order_and_authzs(client, &domains).await?;
@@ -164,16 +177,36 @@ pub async fn issue_certificate(state: &AppState, client: &AcmeClient, http: &req
 
     let issued = match resolve_challenge_type(host) {
         ChallengeMethod::Dns01 => {
-            let credential = resolve_dns_credential(state.db(), domain, host.dns_credential_id).await?;
+            let credential =
+                resolve_dns_credential(state.db(), domain, host.dns_credential_id).await?;
             let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
-            issue_via_dns01(client, dns01.as_ref(), &domains, &authzs, &order_url, &order.finalize, identity).await?
+            issue_via_dns01(
+                client,
+                dns01.as_ref(),
+                &domains,
+                &authzs,
+                &order_url,
+                &order.finalize,
+                identity,
+            )
+            .await?
         }
         // Never wildcard here -- resolve_challenge_type always forces
         // Dns01 for a wildcard domain, so domains_for_issuance never
         // added a second SAN and authzs has exactly one entry.
         ChallengeMethod::Http01 => {
             let (authz_url, authz) = &authzs[0];
-            issue_via_http01(state, client, domain, authz, authz_url, &order_url, &order.finalize, identity).await?
+            issue_via_http01(
+                state,
+                client,
+                domain,
+                authz,
+                authz_url,
+                &order_url,
+                &order.finalize,
+                identity,
+            )
+            .await?
         }
     };
     publish_cert(state, &domains, &issued).await
@@ -237,8 +270,20 @@ pub async fn issue_standalone_dns01_certificate(
     let (order_url, order, authzs) = create_order_and_authzs(client, &domains).await?;
     let credential = resolve_dns_credential(state.db(), domain, dns_credential_id).await?;
     let dns01 = dns01::build_provider(credential.provider, http.clone(), credential.token);
-    let identity = CsrIdentity { organization, organizational_unit };
-    let issued = issue_via_dns01(client, dns01.as_ref(), &domains, &authzs, &order_url, &order.finalize, identity).await?;
+    let identity = CsrIdentity {
+        organization,
+        organizational_unit,
+    };
+    let issued = issue_via_dns01(
+        client,
+        dns01.as_ref(),
+        &domains,
+        &authzs,
+        &order_url,
+        &order.finalize,
+        identity,
+    )
+    .await?;
     publish_cert(state, &domains, &issued).await
 }
 
@@ -249,7 +294,10 @@ pub async fn issue_standalone_dns01_certificate(
 /// currently depends on it -- each authorization carries its own
 /// `identifier`/`wildcard` fields, which is what `issue_via_dns01` keys
 /// off of).
-async fn create_order_and_authzs(client: &AcmeClient, domains: &[String]) -> Result<(String, types::Order, Vec<(String, Authorization)>), IssuanceError> {
+async fn create_order_and_authzs(
+    client: &AcmeClient,
+    domains: &[String],
+) -> Result<(String, types::Order, Vec<(String, Authorization)>), IssuanceError> {
     let (order_url, order) = client.new_order(domains).await?;
     if order.authorizations.is_empty() {
         return Err(IssuanceError::NoAuthorization(domains.join(", ")));
@@ -298,7 +346,9 @@ async fn issue_via_dns01(
                 .ok_or_else(|| IssuanceError::NoDns01Challenge(authz.identifier.value.clone()))?;
             let txt_value = dns01_txt_value(&challenge.token, client.account_key());
             let record_name = acme_challenge_record_name(&authz.identifier.value);
-            let record_id = dns01.create_txt_record(&zone, &record_name, &txt_value).await?;
+            let record_id = dns01
+                .create_txt_record(&zone, &record_name, &txt_value)
+                .await?;
             record_ids.push(record_id);
             pending.push((authz_url.clone(), challenge.url.clone()));
         }
@@ -359,7 +409,15 @@ async fn issue_via_http01(
     // success or failure.
     let pending = vec![(authz_url.to_string(), challenge.url.clone())];
     let domains = vec![domain.to_string()];
-    let result = complete_order(client, &pending, order_url, finalize_url, &domains, identity).await;
+    let result = complete_order(
+        client,
+        &pending,
+        order_url,
+        finalize_url,
+        &domains,
+        identity,
+    )
+    .await;
     state.remove_http01_challenge(&challenge.token);
     result
 }
@@ -379,7 +437,14 @@ struct IssuedCert {
 /// `Location`, used for polling) are two distinct RFC 8555 endpoints --
 /// conflating them is a real interop risk even though some servers are
 /// lenient about it.
-async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order_url: &str, finalize_url: &str, domains: &[String], identity: CsrIdentity) -> Result<IssuedCert, IssuanceError> {
+async fn complete_order(
+    client: &AcmeClient,
+    pending: &[(String, String)],
+    order_url: &str,
+    finalize_url: &str,
+    domains: &[String],
+    identity: CsrIdentity,
+) -> Result<IssuedCert, IssuanceError> {
     for (_, challenge_url) in pending {
         client.notify_challenge_ready(challenge_url).await?;
     }
@@ -392,11 +457,18 @@ async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order
         )
         .await?;
         if authz.status != AuthorizationStatus::Valid {
-            return Err(IssuanceError::AuthorizationFailed(domains.join(", "), authz.status));
+            return Err(IssuanceError::AuthorizationFailed(
+                domains.join(", "),
+                authz.status,
+            ));
         }
     }
 
-    let csr = cert::generate_csr(domains, identity.organization.as_deref(), identity.organizational_unit.as_deref())?;
+    let csr = cert::generate_csr(
+        domains,
+        identity.organization.as_deref(),
+        identity.organizational_unit.as_deref(),
+    )?;
     let order = client.finalize(finalize_url, &csr.der).await?;
     let order = poll_until(
         || client.poll_order(order_url),
@@ -409,7 +481,9 @@ async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order
     if order.status != OrderStatus::Valid {
         return Err(IssuanceError::OrderNotFinalized(order.status));
     }
-    let cert_url = order.certificate.ok_or(IssuanceError::OrderNotFinalized(order.status))?;
+    let cert_url = order
+        .certificate
+        .ok_or(IssuanceError::OrderNotFinalized(order.status))?;
     let chain_pem = client.download_certificate(&cert_url).await?;
 
     Ok(IssuedCert {
@@ -430,10 +504,19 @@ async fn complete_order(client: &AcmeClient, pending: &[(String, String)], order
 /// certificate. Persisted to disk under each domain's own directory
 /// too, so `load_certs_from_disk` restores every entry after a restart
 /// the same way live issuance published them.
-async fn publish_cert(state: &AppState, domains: &[String], issued: &IssuedCert) -> Result<(), IssuanceError> {
+async fn publish_cert(
+    state: &AppState,
+    domains: &[String],
+    issued: &IssuedCert,
+) -> Result<(), IssuanceError> {
     let entry = cert::build_cert_entry(&issued.chain_pem, &issued.key_pem)?;
     for domain in domains {
-        persist_cert_files(&state.acme().cert_dir, domain, &issued.chain_pem, &issued.key_pem)?;
+        persist_cert_files(
+            &state.acme().cert_dir,
+            domain,
+            &issued.chain_pem,
+            &issued.key_pem,
+        )?;
         state.upsert_cert(domain.clone(), entry.clone());
     }
     tracing::info!(domains = %domains.join(", "), "certificate issued and published");
@@ -445,7 +528,12 @@ async fn publish_cert(state: &AppState, domains: &[String], issued: &IssuedCert)
 /// custom-cert upload (`api::routes::upload_cert`), since both need the
 /// exact same on-disk layout for `load_certs_from_disk` to find them
 /// again after a restart.
-pub(crate) fn persist_cert_files(cert_dir: &std::path::Path, domain: &str, chain_pem: &str, key_pem: &str) -> std::io::Result<()> {
+pub(crate) fn persist_cert_files(
+    cert_dir: &std::path::Path,
+    domain: &str,
+    chain_pem: &str,
+    key_pem: &str,
+) -> std::io::Result<()> {
     let dir = cert_dir.join(domain);
     std::fs::create_dir_all(&dir)?;
     write_secure(&dir.join("fullchain.pem"), chain_pem)?;
@@ -488,7 +576,10 @@ pub fn load_certs_from_disk(state: &AppState) -> std::io::Result<()> {
         }
         let domain = entry.file_name().to_string_lossy().into_owned();
         let dir = entry.path();
-        let (Ok(chain_pem), Ok(key_pem)) = (std::fs::read_to_string(dir.join("fullchain.pem")), std::fs::read_to_string(dir.join("privkey.pem"))) else {
+        let (Ok(chain_pem), Ok(key_pem)) = (
+            std::fs::read_to_string(dir.join("fullchain.pem")),
+            std::fs::read_to_string(dir.join("privkey.pem")),
+        ) else {
             continue;
         };
         match cert::build_cert_entry(&chain_pem, &key_pem) {
@@ -504,7 +595,11 @@ pub fn load_certs_from_disk(state: &AppState) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn poll_until<T, F, Fut, P>(mut fetch: F, done: P, what: &'static str) -> Result<T, IssuanceError>
+async fn poll_until<T, F, Fut, P>(
+    mut fetch: F,
+    done: P,
+    what: &'static str,
+) -> Result<T, IssuanceError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, AcmeError>>,
@@ -565,7 +660,11 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
 /// standalone cert (see `issue_standalone_dns01_certificate`) instead of
 /// a host's own domain -- these have no `ProxyHost.acme_enabled`/
 /// `enabled` gate to filter on, since there's no host at all.
-async fn renew_standalone_certs_if_needed(state: &AppState, client: &AcmeClient, http: &reqwest::Client) -> Result<(), IssuanceError> {
+async fn renew_standalone_certs_if_needed(
+    state: &AppState,
+    client: &AcmeClient,
+    http: &reqwest::Client,
+) -> Result<(), IssuanceError> {
     let renew_before = chrono::Duration::days(state.acme().renew_before_days);
     for standalone in crate::db::list_standalone_certs(state.db()).await? {
         let needs_issuance = match state.certs().get(&standalone.domain) {
@@ -606,7 +705,12 @@ pub async fn init_acme_client(state: &AppState) -> Result<AcmeClient, IssuanceEr
     Ok(client)
 }
 
-async fn renew_if_needed(state: &AppState, client: &AcmeClient, http: &reqwest::Client, host: &ProxyHost) -> Result<(), IssuanceError> {
+async fn renew_if_needed(
+    state: &AppState,
+    client: &AcmeClient,
+    http: &reqwest::Client,
+    host: &ProxyHost,
+) -> Result<(), IssuanceError> {
     let renew_before = chrono::Duration::days(state.acme().renew_before_days);
     let needs_issuance = match state.certs().get(&host.domain) {
         Some(entry) => entry.not_after - chrono::Utc::now() < renew_before,
@@ -646,6 +750,7 @@ mod tests {
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         }
     }
@@ -683,9 +788,21 @@ mod tests {
 
     #[test]
     fn port_80_is_needed_for_acme_only_when_http01_is_resolved() {
-        assert!(opens_port_80_for_acme(&host("example.com", false, AcmeChallengeType::Http01)));
-        assert!(!opens_port_80_for_acme(&host("example.com", false, AcmeChallengeType::Dns01)));
-        assert!(!opens_port_80_for_acme(&host("example.com", false, AcmeChallengeType::Auto)));
+        assert!(opens_port_80_for_acme(&host(
+            "example.com",
+            false,
+            AcmeChallengeType::Http01
+        )));
+        assert!(!opens_port_80_for_acme(&host(
+            "example.com",
+            false,
+            AcmeChallengeType::Dns01
+        )));
+        assert!(!opens_port_80_for_acme(&host(
+            "example.com",
+            false,
+            AcmeChallengeType::Auto
+        )));
     }
 
     #[test]
@@ -697,73 +814,138 @@ mod tests {
 
     #[test]
     fn domains_for_issuance_adds_the_bare_apex_for_a_wildcard_domain() {
-        assert_eq!(domains_for_issuance("*.example.com"), vec!["*.example.com".to_string(), "example.com".to_string()]);
+        assert_eq!(
+            domains_for_issuance("*.example.com"),
+            vec!["*.example.com".to_string(), "example.com".to_string()]
+        );
     }
 
     #[test]
     fn domains_for_issuance_is_unchanged_for_a_non_wildcard_domain() {
-        assert_eq!(domains_for_issuance("app.example.com"), vec!["app.example.com".to_string()]);
+        assert_eq!(
+            domains_for_issuance("app.example.com"),
+            vec!["app.example.com".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn resolve_dns_credential_uses_the_single_existing_credential_when_none_is_specified() {
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "only-one", DnsProviderKind::Hetzner, "tok", chrono::Utc::now())
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
             .unwrap();
+        crate::db::create_dns_credential(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "only-one",
+            DnsProviderKind::Hetzner,
+            "tok",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
-        let cred = resolve_dns_credential(&pool, "example.com", None).await.unwrap();
+        let cred = resolve_dns_credential(&pool, "example.com", None)
+            .await
+            .unwrap();
         assert_eq!(cred.name, "only-one");
     }
 
     #[tokio::test]
     async fn resolve_dns_credential_errors_when_none_exist_and_none_is_specified() {
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let err = resolve_dns_credential(&pool, "example.com", None).await.unwrap_err();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
+        let err = resolve_dns_credential(&pool, "example.com", None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DnsCredentialError::NoneConfigured(_)));
     }
 
     #[tokio::test]
     async fn resolve_dns_credential_errors_when_ambiguous_and_none_is_specified() {
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "one", DnsProviderKind::Hetzner, "tok1", chrono::Utc::now())
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
             .unwrap();
-        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "two", DnsProviderKind::Cloudflare, "tok2", chrono::Utc::now())
-            .await
-            .unwrap();
+        crate::db::create_dns_credential(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "one",
+            DnsProviderKind::Hetzner,
+            "tok1",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        crate::db::create_dns_credential(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "two",
+            DnsProviderKind::Cloudflare,
+            "tok2",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
-        let err = resolve_dns_credential(&pool, "example.com", None).await.unwrap_err();
+        let err = resolve_dns_credential(&pool, "example.com", None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DnsCredentialError::Ambiguous(_)));
     }
 
     #[tokio::test]
-    async fn resolve_dns_credential_uses_the_explicitly_specified_credential_even_when_others_exist() {
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+    async fn resolve_dns_credential_uses_the_explicitly_specified_credential_even_when_others_exist(
+    ) {
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         let wanted_id = uuid::Uuid::new_v4();
-        crate::db::create_dns_credential(&pool, wanted_id, "wanted", DnsProviderKind::Hetzner, "tok1", chrono::Utc::now())
-            .await
-            .unwrap();
-        crate::db::create_dns_credential(&pool, uuid::Uuid::new_v4(), "other", DnsProviderKind::Cloudflare, "tok2", chrono::Utc::now())
-            .await
-            .unwrap();
+        crate::db::create_dns_credential(
+            &pool,
+            wanted_id,
+            "wanted",
+            DnsProviderKind::Hetzner,
+            "tok1",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        crate::db::create_dns_credential(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "other",
+            DnsProviderKind::Cloudflare,
+            "tok2",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
-        let cred = resolve_dns_credential(&pool, "example.com", Some(wanted_id)).await.unwrap();
+        let cred = resolve_dns_credential(&pool, "example.com", Some(wanted_id))
+            .await
+            .unwrap();
         assert_eq!(cred.name, "wanted");
     }
 
     #[tokio::test]
     async fn resolve_dns_credential_errors_when_the_specified_id_does_not_exist() {
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
-        let err = resolve_dns_credential(&pool, "example.com", Some(uuid::Uuid::new_v4())).await.unwrap_err();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
+        let err = resolve_dns_credential(&pool, "example.com", Some(uuid::Uuid::new_v4()))
+            .await
+            .unwrap_err();
         assert!(matches!(err, DnsCredentialError::NotFound(_)));
     }
 
     async fn test_state(directory_url: String) -> AppState {
-        let tmp = std::env::temp_dir().join(format!("rust-proxy-acme-test-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("rust-proxy-acme-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg = Config {
-            network: NetworkConfig { bind_ranges: vec![] },
+            network: NetworkConfig {
+                bind_ranges: vec![],
+            },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
                 bind_ip_v6: None,
@@ -772,7 +954,9 @@ mod tests {
                 expose_admin_port: None,
                 session_secret: Some("test-secret".into()),
                 admin_username: Some("admin".into()),
-                admin_password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into()),
+                admin_password_hash: Some(
+                    "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
+                ),
                 db_path: PathBuf::from(":memory:"),
             },
             acme: AcmeConfig {
@@ -789,7 +973,9 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -823,7 +1009,10 @@ mod tests {
         // `try_join!`), this `timeout` would see the task finish
         // immediately instead of timing out.
         let result = tokio::time::timeout(Duration::from_millis(300), handle).await;
-        assert!(result.is_err(), "run_renewal_loop returned instead of retrying -- this would crash the whole daemon");
+        assert!(
+            result.is_err(),
+            "run_renewal_loop returned instead of retrying -- this would crash the whole daemon"
+        );
     }
 
     fn self_signed_pair(domain: &str) -> (String, String) {
@@ -838,7 +1027,10 @@ mod tests {
         let state = test_state("https://example.invalid/directory".to_string()).await;
         let (chain_pem, key_pem) = self_signed_pair("example.com");
         persist_cert_files(&state.acme().cert_dir, "example.com", &chain_pem, &key_pem).unwrap();
-        assert!(state.certs().is_empty(), "sanity check: nothing loaded into memory yet");
+        assert!(
+            state.certs().is_empty(),
+            "sanity check: nothing loaded into memory yet"
+        );
 
         load_certs_from_disk(&state).unwrap();
         assert!(state.certs().contains_key("example.com"));
@@ -858,7 +1050,11 @@ mod tests {
         let state = test_state("https://example.invalid/directory".to_string()).await;
         let dir = state.acme().cert_dir.join("partial.example.com");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("fullchain.pem"), "not-even-checked-since-privkey-is-missing").unwrap();
+        std::fs::write(
+            dir.join("fullchain.pem"),
+            "not-even-checked-since-privkey-is-missing",
+        )
+        .unwrap();
 
         load_certs_from_disk(&state).unwrap();
         assert!(state.certs().is_empty());

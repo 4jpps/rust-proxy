@@ -380,6 +380,27 @@ pub struct ProxyHost {
     /// fallback, content-type by extension).
     #[serde(default)]
     pub static_root: Option<PathBuf>,
+    /// `true` downgrades any `SameSite=None` attribute on a `Set-Cookie`
+    /// header coming back from `upstream` to `SameSite=Lax` before
+    /// returning the response to the client (`Secure`/`HttpOnly`/other
+    /// attributes untouched). Some applications hardcode `SameSite=None`
+    /// on their session cookie for historical reasons (a since-obsoleted
+    /// browser-compat workaround, or a genuine but no-longer-applicable
+    /// cross-site requirement) even when there's no real cross-site use
+    /// -- `SameSite=None` cookies are exactly the kind modern browsers'
+    /// privacy/tracking-protection features are increasingly willing to
+    /// silently drop, even in ordinary first-party same-site use, which
+    /// can break login entirely with no visible error beyond a generic
+    /// CSRF/session failure on the application side (confirmed live: a
+    /// real GitLab instance behind this proxy hit exactly this -- see
+    /// `proxy::http::rewrite_samesite_none_cookies`'s doc comment for the
+    /// full diagnosis). `false` (the default) leaves every `Set-Cookie`
+    /// header exactly as the upstream sent it -- this is opt-in, not a
+    /// blanket rewrite, since a host that genuinely needs `SameSite=None`
+    /// (a legitimately embeddable widget, a real cross-site OAuth flow)
+    /// would break if this were forced on unconditionally.
+    #[serde(default)]
+    pub rewrite_samesite_none_cookies: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -554,19 +575,27 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         if !path.exists() {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
             }
-            std::fs::write(path, DEFAULT_CONFIG_TOML).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+            std::fs::write(path, DEFAULT_CONFIG_TOML)
+                .map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
             tracing::info!(path = %path.display(), "no config file found -- wrote a default one with safe, working settings");
         }
-        let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
         let cfg: Config = toml::from_str(&raw)?;
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_dual_bind(&self.network.bind_ranges, self.admin.bind_ip_v4, self.admin.bind_ip_v6, "admin")?;
+        validate_dual_bind(
+            &self.network.bind_ranges,
+            self.admin.bind_ip_v4,
+            self.admin.bind_ip_v6,
+            "admin",
+        )?;
         let identity_fields_set = [
             self.admin.session_secret.is_some(),
             self.admin.admin_username.is_some(),
@@ -582,17 +611,23 @@ impl Config {
         }
         if let Some(secret) = &self.admin.session_secret {
             if secret.trim().is_empty() {
-                return Err(ConfigError::Validation("admin.session_secret must not be empty if set".into()));
+                return Err(ConfigError::Validation(
+                    "admin.session_secret must not be empty if set".into(),
+                ));
             }
         }
         if let Some(username) = &self.admin.admin_username {
             if username.trim().is_empty() {
-                return Err(ConfigError::Validation("admin.admin_username must not be empty if set".into()));
+                return Err(ConfigError::Validation(
+                    "admin.admin_username must not be empty if set".into(),
+                ));
             }
         }
         if let Some(hash) = &self.admin.admin_password_hash {
             if hash.trim().is_empty() {
-                return Err(ConfigError::Validation("admin.admin_password_hash must not be empty if set".into()));
+                return Err(ConfigError::Validation(
+                    "admin.admin_password_hash must not be empty if set".into(),
+                ));
             }
         }
 
@@ -606,7 +641,12 @@ impl Config {
         let mut seen_host_domains: Vec<(IpAddr, u16, String)> = Vec::new();
 
         for host in &self.hosts {
-            validate_dual_bind(&self.network.bind_ranges, host.bind_ip_v4, host.bind_ip_v6, "hosts")?;
+            validate_dual_bind(
+                &self.network.bind_ranges,
+                host.bind_ip_v4,
+                host.bind_ip_v6,
+                "hosts",
+            )?;
             validate_port(host.bind_port, "hosts.bind_port")?;
             validate_domain(&host.domain)?;
             match &host.redirect {
@@ -624,7 +664,10 @@ impl Config {
             for bind_ip in host_bind_ips(host) {
                 let domain_key = (bind_ip, host.bind_port, host.domain.to_ascii_lowercase());
                 if seen_host_domains.contains(&domain_key) {
-                    return Err(ConfigError::Validation(format!("duplicate host {} on {}:{}", host.domain, bind_ip, host.bind_port)));
+                    return Err(ConfigError::Validation(format!(
+                        "duplicate host {} on {}:{}",
+                        host.domain, bind_ip, host.bind_port
+                    )));
                 }
                 seen_host_domains.push(domain_key);
 
@@ -636,11 +679,19 @@ impl Config {
         }
 
         for rule in &self.port_rules {
-            validate_dual_bind(&self.network.bind_ranges, rule.bind_ip_v4, rule.bind_ip_v6, "port_rules")?;
+            validate_dual_bind(
+                &self.network.bind_ranges,
+                rule.bind_ip_v4,
+                rule.bind_ip_v6,
+                "port_rules",
+            )?;
             validate_port(rule.port_start, "port_rules.port_start")?;
             validate_port(rule.port_end, "port_rules.port_end")?;
             if rule.port_start > rule.port_end {
-                return Err(ConfigError::Validation(format!("port_rules entry has port_start {} > port_end {}", rule.port_start, rule.port_end)));
+                return Err(ConfigError::Validation(format!(
+                    "port_rules entry has port_start {} > port_end {}",
+                    rule.port_start, rule.port_end
+                )));
             }
             for bind_ip in port_rule_bind_ips(rule) {
                 for port in rule.port_start..=rule.port_end {
@@ -686,12 +737,16 @@ fn dual_bind_ips(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> Vec<IpAddr> {
 pub(crate) fn validate_domain(domain: &str) -> Result<(), ConfigError> {
     let trimmed = domain.trim();
     if trimmed.is_empty() {
-        return Err(ConfigError::Validation("hosts entry has an empty domain".into()));
+        return Err(ConfigError::Validation(
+            "hosts entry has an empty domain".into(),
+        ));
     }
     match trimmed.strip_prefix("*.") {
-        Some(rest) if rest.is_empty() || rest.contains('*') => Err(ConfigError::Validation(format!(
-            "invalid wildcard domain \"{domain}\" -- must be \"*.\" followed by a real domain"
-        ))),
+        Some(rest) if rest.is_empty() || rest.contains('*') => {
+            Err(ConfigError::Validation(format!(
+                "invalid wildcard domain \"{domain}\" -- must be \"*.\" followed by a real domain"
+            )))
+        }
         Some(_) => Ok(()),
         None if trimmed.contains('*') => Err(ConfigError::Validation(format!(
             "invalid domain \"{domain}\" -- \"*\" is only allowed as a single leading \"*.\" label"
@@ -714,7 +769,11 @@ pub(crate) fn validate_redirect_target(target: &str) -> Result<(), ConfigError> 
     Ok(())
 }
 
-pub(crate) fn validate_bind_ip(allowed: &[IpNet], ip: IpAddr, ctx: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_bind_ip(
+    allowed: &[IpNet],
+    ip: IpAddr,
+    ctx: &str,
+) -> Result<(), ConfigError> {
     if ip.is_unspecified() {
         // 0.0.0.0/:: means "every interface", not one specific address --
         // it's never meaningfully "outside" a configured bind_ranges
@@ -731,14 +790,23 @@ pub(crate) fn validate_bind_ip(allowed: &[IpNet], ip: IpAddr, ctx: &str) -> Resu
     // an operator who only configured v4 ranges shouldn't have that
     // silently reject every v6 bind as if it were an empty allowlist (or
     // the reverse).
-    let same_family: Vec<&IpNet> = allowed.iter().filter(|net| net.addr().is_ipv4() == ip.is_ipv4()).collect();
+    let same_family: Vec<&IpNet> = allowed
+        .iter()
+        .filter(|net| net.addr().is_ipv4() == ip.is_ipv4())
+        .collect();
     if same_family.is_empty() {
         // Unrestricted -- no configured ranges of this family to check against.
         return Ok(());
     }
     if !same_family.iter().any(|net| net.contains(&ip)) {
-        let ranges = same_family.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
-        return Err(ConfigError::Validation(format!("{ctx} bind_ip {ip} is not inside any of network.bind_ranges ({ranges})")));
+        let ranges = same_family
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ConfigError::Validation(format!(
+            "{ctx} bind_ip {ip} is not inside any of network.bind_ranges ({ranges})"
+        )));
     }
     Ok(())
 }
@@ -749,9 +817,16 @@ pub(crate) fn validate_bind_ip(allowed: &[IpNet], ip: IpAddr, ctx: &str) -> Resu
 /// certainly a mistake, not an intentionally-disabled bind -- there's no
 /// "enabled: false" story for a bind pair the way there is for
 /// `ProxyHost.enabled`).
-pub(crate) fn validate_dual_bind(allowed: &[IpNet], v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>, ctx: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_dual_bind(
+    allowed: &[IpNet],
+    v4: Option<Ipv4Addr>,
+    v6: Option<Ipv6Addr>,
+    ctx: &str,
+) -> Result<(), ConfigError> {
     if v4.is_none() && v6.is_none() {
-        return Err(ConfigError::Validation(format!("{ctx} must set at least one of bind_ip_v4/bind_ip_v6")));
+        return Err(ConfigError::Validation(format!(
+            "{ctx} must set at least one of bind_ip_v4/bind_ip_v6"
+        )));
     }
     if let Some(v4) = v4 {
         validate_bind_ip(allowed, IpAddr::V4(v4), ctx)?;
@@ -803,11 +878,17 @@ dns_api_token = "token-placeholder"
         assert!(!path.exists());
 
         let cfg = Config::load(&path).expect("should create a valid default and load it");
-        assert!(path.is_file(), "should have written the default config file");
+        assert!(
+            path.is_file(),
+            "should have written the default config file"
+        );
         assert_eq!(cfg.admin.bind_ip_v4, Some(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cfg.admin.bind_ip_v6, Some(Ipv6Addr::UNSPECIFIED));
         assert_eq!(cfg.admin.bind_port, 8084);
-        assert!(cfg.admin.session_secret.is_none(), "the default must not bake in a fixed admin identity");
+        assert!(
+            cfg.admin.session_secret.is_none(),
+            "the default must not bake in a fixed admin identity"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -820,7 +901,11 @@ dns_api_token = "token-placeholder"
         std::fs::write(&path, base_toml()).unwrap();
 
         let cfg = Config::load(&path).expect("should load the existing file as-is");
-        assert_eq!(cfg.admin.bind_ip_v4, Some("10.0.0.1".parse::<Ipv4Addr>().unwrap()), "must not have replaced the operator's own config");
+        assert_eq!(
+            cfg.admin.bind_ip_v4,
+            Some("10.0.0.1".parse::<Ipv4Addr>().unwrap()),
+            "must not have replaced the operator's own config"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -829,7 +914,10 @@ dns_api_token = "token-placeholder"
     fn parses_minimal_valid_config() {
         let cfg: Config = toml::from_str(&base_toml()).expect("should parse");
         assert!(cfg.validate().is_ok());
-        assert_eq!(cfg.acme.directory_url, "https://acme-v02.api.letsencrypt.org/directory");
+        assert_eq!(
+            cfg.acme.directory_url,
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
         assert_eq!(cfg.acme.renew_before_days, 30);
     }
 
@@ -857,7 +945,8 @@ dns_api_token = "token-placeholder"
         // from there. A config.toml that never mentions contact_email
         // at all must still parse and validate cleanly.
         let toml_str = base_toml().replace(r#"contact_email = "admin@example.com""#, "");
-        let cfg: Config = toml::from_str(&toml_str).expect("contact_email must be optional, not a required field");
+        let cfg: Config = toml::from_str(&toml_str)
+            .expect("contact_email must be optional, not a required field");
         assert_eq!(cfg.acme.contact_email, "");
         assert!(cfg.validate().is_ok());
     }
@@ -870,7 +959,10 @@ dns_api_token = "token-placeholder"
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert_eq!(cfg.admin.bind_ip_v4, Some(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cfg.admin.bind_port, 8084);
-        assert!(cfg.validate().is_ok(), "0.0.0.0 must not fail bind_ranges membership validation");
+        assert!(
+            cfg.validate().is_ok(),
+            "0.0.0.0 must not fail bind_ranges membership validation"
+        );
     }
 
     #[test]
@@ -879,7 +971,8 @@ dns_api_token = "token-placeholder"
         // 0.0.0.0 is never literally inside that range, but it means
         // "every interface", so it must not be rejected as if it were
         // one specific out-of-range address.
-        let toml_str = base_toml().replace(r#"bind_ip_v4 = "10.0.0.1""#, r#"bind_ip_v4 = "0.0.0.0""#);
+        let toml_str =
+            base_toml().replace(r#"bind_ip_v4 = "10.0.0.1""#, r#"bind_ip_v4 = "0.0.0.0""#);
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert!(cfg.validate().is_ok());
     }
@@ -889,7 +982,10 @@ dns_api_token = "token-placeholder"
         let toml_str = base_toml()
             .replace(r#"session_secret = "test-secret-do-not-use-in-prod""#, "")
             .replace(r#"admin_username = "admin""#, "")
-            .replace(r#"admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g""#, "");
+            .replace(
+                r#"admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g""#,
+                "",
+            );
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert!(cfg.admin.session_secret.is_none());
         assert!(cfg.validate().is_ok());
@@ -917,7 +1013,9 @@ dns_api_token = "token-placeholder"
         // The flexible default: no configured ranges at all means any
         // bind_ip is accepted, for environments that don't have (or
         // don't want to think about) a dedicated block up front.
-        let toml_str = base_toml().replace(r#"bind_ranges = ["10.0.0.0/29"]"#, "").replace("10.0.0.1", "203.0.113.7");
+        let toml_str = base_toml()
+            .replace(r#"bind_ranges = ["10.0.0.0/29"]"#, "")
+            .replace("10.0.0.1", "203.0.113.7");
         let mut cfg: Config = toml::from_str(&toml_str).expect("should parse");
         assert!(cfg.network.bind_ranges.is_empty());
         assert!(cfg.validate().is_ok());
@@ -941,6 +1039,7 @@ dns_api_token = "token-placeholder"
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -948,7 +1047,10 @@ dns_api_token = "token-placeholder"
 
     #[test]
     fn bind_ranges_may_be_multiple_disjoint_ranges() {
-        let toml_str = base_toml().replace(r#"bind_ranges = ["10.0.0.0/29"]"#, r#"bind_ranges = ["10.0.0.0/29", "192.168.1.0/24"]"#);
+        let toml_str = base_toml().replace(
+            r#"bind_ranges = ["10.0.0.0/29"]"#,
+            r#"bind_ranges = ["10.0.0.0/29", "192.168.1.0/24"]"#,
+        );
         let mut cfg: Config = toml::from_str(&toml_str).expect("should parse");
         cfg.hosts.push(ProxyHost {
             id: Uuid::new_v4(),
@@ -969,9 +1071,13 @@ dns_api_token = "token-placeholder"
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
-        assert!(cfg.validate().is_ok(), "bind_ip in the second range should be accepted");
+        assert!(
+            cfg.validate().is_ok(),
+            "bind_ip in the second range should be accepted"
+        );
     }
 
     #[test]
@@ -996,6 +1102,7 @@ dns_api_token = "token-placeholder"
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1023,6 +1130,7 @@ dns_api_token = "token-placeholder"
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1054,6 +1162,7 @@ dns_api_token = "token-placeholder"
             }),
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -1085,6 +1194,7 @@ dns_api_token = "token-placeholder"
             }),
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1179,6 +1289,7 @@ dns_api_token = "token-placeholder"
                 redirect: None,
                 path_rewrite: None,
                 static_root: None,
+                rewrite_samesite_none_cookies: false,
                 enabled: true,
             });
         }
@@ -1211,6 +1322,7 @@ dns_api_token = "token-placeholder"
                 redirect: None,
                 path_rewrite: None,
                 static_root: None,
+                rewrite_samesite_none_cookies: false,
                 enabled: true,
             });
         }
@@ -1239,6 +1351,7 @@ dns_api_token = "token-placeholder"
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -1278,6 +1391,7 @@ dns_api_token = "token-placeholder"
             redirect: None,
             path_rewrite: None,
             static_root: None,
+            rewrite_samesite_none_cookies: false,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
