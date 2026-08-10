@@ -8,12 +8,19 @@
 //! that a configured host or port rule actually uses -- nothing else in
 //! the /29 is reachable, EXCEPT for a small, fixed set of ports this
 //! module always keeps open regardless of configuration (see
-//! `write_always_open_rules`): SSH, HTTP, HTTPS, and the admin UI. A
-//! default-DROP firewall that can also lock an operator out of SSH, or
-//! out of the admin UI needed to fix the firewall itself, is a bricked
-//! box waiting to happen -- these are a deliberate safety net, not
-//! something a host/port-rule config omission should ever be able to
-//! close.
+//! `write_always_open_rules`): HTTP and HTTPS unconditionally (the
+//! proxy's whole job is serving the public internet on those), SSH
+//! scoped to the internal `172.16.0.0/16` network only (2026-08-10:
+//! previously unconditional too, but a config-only ACL on a port-22
+//! `PortRule` can never actually restrict it -- see
+//! `ssh_stays_open_even_when_a_real_port_rule_also_claims_port_22` --
+//! so real lockdown requires this fixed carve-out to be edited here,
+//! not through the API), and the admin UI. A default-DROP firewall
+//! that can also lock an operator out of SSH from the internal
+//! network, or out of the admin UI needed to fix the firewall itself,
+//! is a bricked box waiting to happen -- these are a deliberate safety
+//! net, not something a host/port-rule config omission should ever be
+//! able to close.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -156,7 +163,12 @@ fn write_always_open_rules(out: &mut String) {
         out,
         "        # always reachable -- see this module's own doc comment"
     );
-    let _ = writeln!(out, "        tcp dport 22 accept");
+    // SSH is scoped to the internal network only, not the whole
+    // internet -- unlike HTTP/HTTPS below, nothing needs SSH reachable
+    // from an arbitrary public source, so the "never brick yourself"
+    // safety net only needs to cover the network an operator actually
+    // administers this box from.
+    let _ = writeln!(out, "        tcp dport 22 ip saddr 172.16.0.0/16 accept");
     let _ = writeln!(out, "        tcp dport 80 accept");
     let _ = writeln!(out, "        tcp dport 443 accept");
     let _ = writeln!(out);
@@ -481,18 +493,29 @@ mod tests {
     }
 
     #[test]
-    fn ssh_http_and_https_are_always_accepted_unconditionally() {
+    fn http_and_https_are_always_accepted_unconditionally() {
         let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new());
-        assert!(out.contains("tcp dport 22 accept"));
         assert!(out.contains("tcp dport 80 accept"));
         assert!(out.contains("tcp dport 443 accept"));
     }
 
     #[test]
-    fn ssh_stays_open_even_when_a_real_port_rule_also_claims_port_22() {
+    fn ssh_is_always_accepted_from_the_internal_network_only() {
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new());
+        assert!(out.contains("tcp dport 22 ip saddr 172.16.0.0/16 accept"));
+        // Not a bare, unconditional accept -- that's the whole point of
+        // scoping it (2026-08-10: a real production request to lock
+        // port 22 down from the public internet while keeping it
+        // reachable from the internal network).
+        assert!(!out.contains("tcp dport 22 accept\n"));
+    }
+
+    #[test]
+    fn ssh_stays_open_from_the_internal_network_even_when_a_real_port_rule_also_claims_port_22() {
         // Proves the always-open rule isn't merely "there happens to be
-        // no conflicting config yet" -- it's unconditional even alongside
-        // a real, unrelated rule that also targets port 22.
+        // no conflicting config yet" -- it's unconditional (within its
+        // 172.16.0.0/16 scope) even alongside a real, unrelated rule
+        // that also targets port 22.
         let rule = port_rule(
             "10.0.0.3",
             22,
@@ -501,7 +524,7 @@ mod tests {
             "some other ssh-like service",
         );
         let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new());
-        assert!(out.contains("tcp dport 22 accept"));
+        assert!(out.contains("tcp dport 22 ip saddr 172.16.0.0/16 accept"));
     }
 
     #[test]
