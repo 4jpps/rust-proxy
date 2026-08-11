@@ -270,6 +270,18 @@ impl AppState {
         self.0.config_dirty.notified().await;
     }
 
+    /// Wakes the same waiters `set_hosts`/`set_port_rules` do, without
+    /// actually replacing either list -- for a change that isn't a
+    /// host/port-rule edit itself but still needs `nftables::sync_once`
+    /// to re-run, e.g. editing the IP entries of an `AclList` a port
+    /// rule has selected. `sync_once` re-resolves `acl_ids` from the DB
+    /// on every run, so the only piece missing without this is the
+    /// prompt wakeup -- without it, the edit still applies, but only
+    /// after the 5-minute `FALLBACK_RESYNC_INTERVAL` catches up.
+    pub fn notify_config_change(&self) {
+        self.0.config_dirty.notify_waiters();
+    }
+
     pub fn certs(&self) -> Arc<HashMap<String, CertEntry>> {
         self.0.certs.load_full()
     }
@@ -599,5 +611,33 @@ mod tests {
             Some("admin@example.com"),
             "config.toml's contact_email must still win"
         );
+    }
+
+    /// Regression test for a real bug: editing an `AclList`'s IP entries
+    /// (via the admin API's add/update/delete-entry endpoints) didn't
+    /// wake `nftables::run_sync_loop`, which only re-runs on
+    /// `set_hosts`/`set_port_rules` or the 5-minute fallback timer --
+    /// even though a port rule's firewall enforcement of that ACL's IPs
+    /// is resolved fresh from the DB on every sync. An operator adding
+    /// an IP to an ACL a port rule (e.g. SSH) already selects would be
+    /// locked out until the fallback timer happened to catch up.
+    /// `notify_config_change` is the fix -- the routes that mutate an
+    /// ACL's IP entries call it after a successful write.
+    #[tokio::test]
+    async fn notify_config_change_wakes_a_pending_wait_for_change() {
+        let state = test_state().await;
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            async move { state.wait_for_change().await }
+        });
+        // Give the spawned task a chance to actually reach `.notified().await`
+        // before we fire -- Notify only wakes waiters registered before the
+        // call, same as any other tokio::sync::Notify usage.
+        tokio::task::yield_now().await;
+        state.notify_config_change();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("notify_config_change must wake a pending wait_for_change")
+            .unwrap();
     }
 }

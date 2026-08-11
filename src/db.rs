@@ -858,7 +858,8 @@ pub async fn list_acl_ip_entries(
     .bind(acl_list_id.to_string())
     .fetch_all(pool)
     .await?;
-    rows.into_iter()
+    let mut entries = rows
+        .into_iter()
         .map(|row| {
             Ok(AclIpEntry {
                 id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
@@ -866,7 +867,26 @@ pub async fn list_acl_ip_entries(
                 description: row.get("description"),
             })
         })
-        .collect()
+        .collect::<Result<Vec<AclIpEntry>, sqlx::Error>>()?;
+    // Sorted by parsed address rather than the raw CIDR string -- plain
+    // text sort puts "10.0.0.0/24" before "2.2.2.2/32" (lexicographic:
+    // '1' < '2'), which reads as broken to an operator scanning the
+    // list. A CIDR that fails to parse (shouldn't happen -- every entry
+    // is validated by `normalize_cidr` before insert) sorts last rather
+    // than panicking or dropping the row -- `Option::Some(_) < None`
+    // reads backwards, so the comparator flips it explicitly instead of
+    // relying on `Option`'s own default (`None` first) ordering.
+    entries.sort_by(|a, b| {
+        let a = a.cidr.parse::<ipnet::IpNet>().ok();
+        let b = b.cidr.parse::<ipnet::IpNet>().ok();
+        match (a, b) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    Ok(entries)
 }
 
 /// Returns the new entry's id -- the API layer echoes it straight back so
@@ -2192,6 +2212,43 @@ mod tests {
         assert!(
             !delete_acl_ip_entry(&pool, id2).await.unwrap(),
             "deleting an already-deleted entry must report false, not error"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_ip_entries_list_sorted_by_address_not_insertion_order_or_cidr_text() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
+        // Inserted out of order, and deliberately including a pair
+        // ("10.0.0.0/24" vs "2.2.2.2/32") where plain text sort and
+        // numeric address sort disagree -- '1' < '2' puts "10." first
+        // lexicographically, but 2.2.2.2 is numerically the lower address.
+        add_acl_ip_entry(&pool, acl_id, "204.52.221.6/32", None)
+            .await
+            .unwrap();
+        add_acl_ip_entry(&pool, acl_id, "10.0.0.0/24", None)
+            .await
+            .unwrap();
+        add_acl_ip_entry(&pool, acl_id, "2.2.2.2/32", None)
+            .await
+            .unwrap();
+        add_acl_ip_entry(&pool, acl_id, "2001:db8::/32", None)
+            .await
+            .unwrap();
+
+        let entries = list_acl_ip_entries(&pool, acl_id).await.unwrap();
+        let cidrs: Vec<&str> = entries.iter().map(|e| e.cidr.as_str()).collect();
+        assert_eq!(
+            cidrs,
+            vec![
+                "2.2.2.2/32",
+                "10.0.0.0/24",
+                "204.52.221.6/32",
+                "2001:db8::/32",
+            ]
         );
     }
 

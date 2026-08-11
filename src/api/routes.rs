@@ -853,6 +853,7 @@ async fn add_acl_ip_entry(
     let description = normalize_description(body.description);
     let entry_id =
         crate::db::add_acl_ip_entry(state.db(), id, &cidr, description.as_deref()).await?;
+    state.notify_config_change();
     Ok(Json(crate::db::AclIpEntry {
         id: entry_id,
         cidr,
@@ -880,6 +881,7 @@ async fn update_acl_ip_entry(
     if !found {
         return Err(ApiError::NotFound);
     }
+    state.notify_config_change();
     Ok(Json(crate::db::AclIpEntry {
         id: entry_id,
         cidr,
@@ -895,6 +897,7 @@ async fn delete_acl_ip_entry(
     if !found {
         return Err(ApiError::NotFound);
     }
+    state.notify_config_change();
     Ok(StatusCode::NO_CONTENT)
 }
 

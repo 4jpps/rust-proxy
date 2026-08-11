@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **Fixed a real production bug: adding/editing/removing an IP entry
+  on an `AclList` didn't take effect for a port rule enforcing it at
+  the firewall until the 5-minute fallback resync caught up.** A
+  host's HTTP-level access check resolves `acl_ids` live from the DB
+  on every request, so that path updated instantly -- but a raw
+  TCP/UDP port rule's IP allow list is enforced by the generated
+  nftables ruleset, which only regenerates when `state.set_hosts`/
+  `set_port_rules` fires (or the periodic fallback timer). Editing an
+  ACL's IP entries does neither, so a port rule (e.g. SSH, gated by a
+  "Default IP ACL") kept enforcing the *old* address list until the
+  next fallback resync, up to 5 minutes later -- confirmed as a real
+  incident: adding a new IP to an in-use ACL didn't grant access,
+  requiring a fallback to an already-allowed address in the meantime.
+  Added `AppState::notify_config_change`, called by the
+  add/update/delete-IP-entry admin routes after a successful write, so
+  `nftables::run_sync_loop` wakes and re-syncs immediately, the same
+  way it already does for a host or port-rule edit.
+- **An ACL's IP entries now list sorted by parsed address, not
+  insertion order or raw CIDR text.** Plain text sort put e.g.
+  `10.0.0.0/24` before `2.2.2.2/32` (`'1' < '2'` lexicographically),
+  which read as broken to an operator scanning the list for a specific
+  address. `db::list_acl_ip_entries` now sorts by the parsed
+  `ipnet::IpNet` value (IPv4 before IPv6, ascending within each); a
+  CIDR that somehow fails to parse sorts last instead of panicking.
 - **Fixed a real production bug: HTTP/2-split `Cookie` headers were
   forwarded to the upstream as multiple separate `Cookie:` lines
   instead of being merged into one.** RFC 7540 §8.1.2.5 permits an
