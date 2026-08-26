@@ -9,6 +9,14 @@ User=rust-proxy
 Group=rust-proxy
 WorkingDirectory=/var/lib/rust-proxy
 StateDirectory=rust-proxy
+# Auto-creates /var/log/rust-proxy (correct ownership) and grants it
+# write access under ProtectSystem=strict below -- no manual
+# ReadWritePaths entry needed, same mechanism StateDirectory already
+# provides for /var/lib/rust-proxy. Used when admin.log_dir is set to
+# this path in config.toml (see config.rs/main.rs); harmless and
+# unused otherwise, since log_dir defaults to None (same directory as
+# the state DB, the original behavior).
+LogsDirectory=rust-proxy
 
 # Runs as a non-root user (created by the packaging postinst, same
 # pattern as jpps-store/mlvpn-rs) but still needs to bind privileged
