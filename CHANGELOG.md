@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **Fixed a real production incident: the HTTPS/redirect accept loops
+  could busy-spin for hours on a transient `accept()` error, pegging a
+  CPU core and flooding the log.** Root-caused from a real 15G,
+  126M-line `proxy.log` on `sites.tech.lan`'s instance: 125.9M of
+  those lines were `https listener accept failed error=Too many open
+  files (os error 24)`, continuously from 00:53 to 09:17 one day — the
+  loop retried `accept()` immediately on every failure with no
+  backoff, so once the process hit its file-descriptor limit (no
+  `LimitNOFILE` was set, so it ran under systemd's own default,
+  commonly 1024), every subsequent iteration failed immediately too,
+  as fast as the runtime could spin. Two-part fix: `accept_error_backoff()`
+  (a 100ms sleep before retrying on any accept error, both the HTTPS
+  and plain-HTTP redirect listeners) caps a stuck condition at ~10
+  retries/sec instead of a tight spin, and `LimitNOFILE=65536` in the
+  systemd unit makes actually hitting the fd limit under real load
+  much less likely in the first place.
 - **Added `admin.log_dir` config option** to split `proxy.log`/
   `access.log`/`server.log` out from the state directory (previously
   hardcoded to the same directory as `admin.db_path`, e.g.
@@ -11,10 +27,7 @@
   existing install with no config edit sees no change. Deployed on
   `sites.tech.lan`'s instance to relocate logs to a dedicated
   `/var/log/rust-proxy`, after noticing `/var/lib/rust-proxy` had
-  grown to 15G — almost entirely one day's `proxy.log` (2026-08-24,
-  ~126M lines of `debug`-level per-request routing-decision logging,
-  ~100x every other day's volume) sitting alongside the sqlite state
-  DB in the same `StateDirectory`.
+  grown to 15G from the incident above.
 
 - **Fixed a real production bug: adding/editing/removing an IP entry
   on an `AclList` didn't take effect for a port rule enforcing it at

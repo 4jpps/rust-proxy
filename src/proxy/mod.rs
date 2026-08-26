@@ -100,6 +100,17 @@ fn reconcile_map<K: std::hash::Hash + Eq + Copy, F: Fn(&K) -> JoinHandle<()>>(
     }
 }
 
+/// Backoff after a transient `listener.accept()` error (EMFILE/ENFILE
+/// under fd-exhaustion, the case that actually bit production -- see
+/// the call sites' comments) before the accept loop retries. 100ms is
+/// short enough not to visibly delay recovery once fd pressure clears,
+/// but caps a stuck condition at ~10 retries/sec instead of a tight
+/// spin -- the difference between a few hundred log lines and hours of
+/// runaway logging/CPU if the underlying cause takes a while to clear.
+async fn accept_error_backoff() {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
 fn passthrough_keys(port_rules: &[crate::config::PortRule]) -> Vec<(IpAddr, u16, Protocol)> {
     let mut keys = Vec::new();
     for rule in port_rules
@@ -136,6 +147,20 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 Ok(pair) => pair,
                 Err(err) => {
                     tracing::warn!(error = %err, "https listener accept failed");
+                    // A transient accept() error (most commonly EMFILE/
+                    // "too many open files" under a real connection spike)
+                    // doesn't clear itself between one loop iteration and
+                    // the next -- retrying with no backoff spins this loop
+                    // as fast as the runtime allows, burning a full CPU
+                    // core and flooding this log at whatever rate that
+                    // achieves. Confirmed as a real incident: a single
+                    // ~8-hour EMFILE spell logged 125M+ of these lines
+                    // (15G compressed down to under 500M once cleaned up)
+                    // and kept a core pegged the whole time. A short sleep
+                    // gives fd pressure a chance to actually ease before
+                    // trying again, the standard fix for this exact
+                    // accept-loop shape.
+                    accept_error_backoff().await;
                     continue;
                 }
             };
@@ -518,6 +543,9 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
                 Ok(pair) => pair,
                 Err(err) => {
                     tracing::warn!(error = %err, "redirect listener accept failed");
+                    // Same reasoning as the HTTPS listener's identical
+                    // accept-error handling above -- see that comment.
+                    accept_error_backoff().await;
                     continue;
                 }
             };

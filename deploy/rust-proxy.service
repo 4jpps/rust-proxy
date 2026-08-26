@@ -5,6 +5,16 @@ After=network.target
 [Service]
 ExecStart=/usr/bin/rust-proxy --config /etc/rust-proxy/config.toml
 Restart=on-failure
+# No explicit limit here meant this ran under systemd's own default
+# (commonly 1024 on Debian) -- confirmed as the real cause of a
+# production incident: a connection spike exhausted that limit, and
+# every accept() failure past that point hit EMFILE. A raised limit
+# doesn't replace the accept-loop backoff fix (proxy/mod.rs's
+# accept_error_backoff) -- both matter: this makes hitting the
+# condition at all less likely under real load, the backoff makes it
+# harmless (a few retries/sec, not a busy-loop) on the rare occasion
+# the limit is still reached.
+LimitNOFILE=65536
 User=rust-proxy
 Group=rust-proxy
 WorkingDirectory=/var/lib/rust-proxy
