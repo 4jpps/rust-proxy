@@ -1728,6 +1728,7 @@ mod tests {
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
                 db_path: PathBuf::from(":memory:"),
+                log_dir: None,
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -1764,6 +1765,7 @@ mod tests {
                 admin_username: None,
                 admin_password_hash: None,
                 db_path: PathBuf::from(":memory:"),
+                log_dir: None,
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -1805,6 +1807,7 @@ mod tests {
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
                 db_path: PathBuf::from(":memory:"),
+                log_dir: None,
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -1841,6 +1844,7 @@ mod tests {
                 admin_username: Some("admin".into()),
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
                 db_path: PathBuf::from(":memory:"),
+                log_dir: None,
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),

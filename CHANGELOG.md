@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+- **Added `admin.log_dir` config option** to split `proxy.log`/
+  `access.log`/`server.log` out from the state directory (previously
+  hardcoded to the same directory as `admin.db_path`, e.g.
+  `/var/lib/rust-proxy` on a systemd-packaged install, no way to
+  change it without touching `db_path` too). `None` (the default,
+  unset in config.toml) keeps the original behavior exactly, so an
+  existing install with no config edit sees no change. Deployed on
+  `sites.tech.lan`'s instance to relocate logs to a dedicated
+  `/var/log/rust-proxy`, after noticing `/var/lib/rust-proxy` had
+  grown to 15G — almost entirely one day's `proxy.log` (2026-08-24,
+  ~126M lines of `debug`-level per-request routing-decision logging,
+  ~100x every other day's volume) sitting alongside the sqlite state
+  DB in the same `StateDirectory`.
+
 - **Fixed a real production bug: adding/editing/removing an IP entry
   on an `AclList` didn't take effect for a port rule enforcing it at
   the firewall until the 5-minute fallback resync caught up.** A

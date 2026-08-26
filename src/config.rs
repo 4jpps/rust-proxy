@@ -125,6 +125,15 @@ pub struct AdminConfig {
     pub admin_password_hash: Option<String>,
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
+    /// Where `proxy.log`/`access.log`/`server.log` are written (see
+    /// `logging.rs`). `None` (the default) keeps the original
+    /// behavior: same directory as `db_path`, so an existing install
+    /// with no config.toml edit at all sees no change. Set this to
+    /// split logs out from the state directory -- e.g. onto a
+    /// dedicated `/var/log/rust-proxy`, matching where most other
+    /// daemons on a box keep their logs, separate from `StateDirectory`.
+    #[serde(default)]
+    pub log_dir: Option<PathBuf>,
 }
 
 fn default_db_path() -> PathBuf {
@@ -963,6 +972,26 @@ dns_api_token = "token-placeholder"
             cfg.validate().is_ok(),
             "0.0.0.0 must not fail bind_ranges membership validation"
         );
+    }
+
+    #[test]
+    fn admin_log_dir_defaults_to_none_when_omitted() {
+        let cfg: Config = toml::from_str(&base_toml()).expect("should parse");
+        assert_eq!(cfg.admin.log_dir, None);
+    }
+
+    #[test]
+    fn admin_log_dir_parses_when_set() {
+        // log_dir belongs under [admin] -- insert it into base_toml()'s
+        // own [admin] table rather than appending after the whole
+        // document, which would land the key outside any table.
+        let toml_str = base_toml().replacen(
+            "[admin]",
+            "[admin]\nlog_dir = \"/var/log/rust-proxy\"",
+            1,
+        );
+        let cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        assert_eq!(cfg.admin.log_dir, Some(std::path::PathBuf::from("/var/log/rust-proxy")));
     }
 
     #[test]

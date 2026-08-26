@@ -79,18 +79,24 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Split into proxy.log/access.log/server.log under the same
-    // directory as the sqlite DB (already read-write for this daemon,
-    // no new config surface or packaging change needed) -- see
-    // logging.rs's own doc comment for the split's rationale. `_guards`
-    // must stay alive for the whole process; dropping it early would
-    // silently stop these files from being written to.
-    let log_dir = cfg
-        .admin
-        .db_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Split into proxy.log/access.log/server.log -- see logging.rs's
+    // own doc comment for the split's rationale. `_guards` must stay
+    // alive for the whole process; dropping it early would silently
+    // stop these files from being written to.
+    //
+    // `admin.log_dir` (config.toml), when set, wins outright -- lets a
+    // deployment keep logs somewhere other than the state directory
+    // (e.g. a dedicated /var/log/rust-proxy) without disturbing the DB
+    // path. Unset (the default) falls back to the DB's own parent
+    // directory, the original behavior, so an existing install with no
+    // config.toml edit at all sees no change.
+    let log_dir = cfg.admin.log_dir.clone().unwrap_or_else(|| {
+        cfg.admin
+            .db_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    });
     let _log_guards = logging::init(&log_dir)?;
 
     tracing::info!(config = %args.config.display(), "starting rust-proxy");

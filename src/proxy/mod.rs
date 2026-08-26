@@ -848,6 +848,7 @@ mod tests {
                     "$argon2id$v=19$m=19456,t=2,p=1$dGVzdHNhbHQ$dGVzdGhhc2g".into(),
                 ),
                 db_path: PathBuf::from(":memory:"),
+                log_dir: None,
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
