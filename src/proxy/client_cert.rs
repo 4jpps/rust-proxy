@@ -34,18 +34,34 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
 
 const TRUSTBRIDGE_ROOT_PEM: &str = include_str!("trustbridge_root.crt");
+// Trusted directly (not just chained through the root) so that a
+// client presenting only its leaf cert -- no intermediate in the
+// handshake -- still validates. Real, hit-in-practice gap: iOS's own
+// PKCS#12 import doesn't reliably keep a bundled intermediate
+// associated with an identity for TLS presentation, and every OS's
+// plain `openssl s_client`-style client auth only ever sends what's
+// actually in the identity/keystore it was given -- requiring every
+// client to always assemble and present a full chain is fragile in a
+// way trusting the intermediate as its own anchor here isn't. A leaf
+// cert genuinely issued by TrustBridge's intermediate still has to
+// pass full chain/expiry validation either way; this only removes the
+// client's burden of also sending the intermediate along with it.
+const TRUSTBRIDGE_INTERMEDIATE_PEM: &str = include_str!("trustbridge_intermediate.crt");
 
-/// Builds the optional client-cert verifier, trusting only TrustBridge's
-/// root. Called once at startup (see `build_https_server_config`) --
-/// the embedded PEM is fixed at compile time, so this can't fail at
-/// runtime from a missing/misconfigured file the way a path-based
-/// config option could.
+/// Builds the optional client-cert verifier, trusting TrustBridge's
+/// root and intermediate (see `TRUSTBRIDGE_INTERMEDIATE_PEM`'s doc
+/// comment for why both). Called once at startup (see
+/// `build_https_server_config`) -- the embedded PEMs are fixed at
+/// compile time, so this can't fail at runtime from a missing/
+/// misconfigured file the way a path-based config option could.
 pub fn build_optional_client_cert_verifier() -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
     let mut roots = RootCertStore::empty();
-    let mut reader = std::io::Cursor::new(TRUSTBRIDGE_ROOT_PEM.as_bytes());
-    for cert in rustls_pemfile::certs(&mut reader) {
-        let cert = cert.expect("embedded trustbridge_root.crt must parse as valid PEM/DER");
-        roots.add(cert).expect("embedded TrustBridge root must be a valid trust anchor");
+    for pem in [TRUSTBRIDGE_ROOT_PEM, TRUSTBRIDGE_INTERMEDIATE_PEM] {
+        let mut reader = std::io::Cursor::new(pem.as_bytes());
+        for cert in rustls_pemfile::certs(&mut reader) {
+            let cert = cert.expect("embedded TrustBridge root/intermediate PEM must parse as valid PEM/DER");
+            roots.add(cert).expect("embedded TrustBridge root/intermediate must be a valid trust anchor");
+        }
     }
     WebPkiClientVerifier::builder(Arc::new(roots))
         .allow_unauthenticated()
