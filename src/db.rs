@@ -250,6 +250,18 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE acl_credentials ADD COLUMN description TEXT")
         .execute(pool)
         .await;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS acl_client_cert_entries (
+            id TEXT PRIMARY KEY,
+            acl_list_id TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            description TEXT
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         r#"
@@ -818,6 +830,26 @@ pub async fn add_acl_credentials(
     Ok(())
 }
 
+/// `subjects` is `(subject, description)` pairs -- bulk-insert path used
+/// only by `create_acl_list`, same relationship `add_acl_ip_entries`/
+/// `add_acl_credentials` have to their own single-entry counterparts.
+pub async fn add_acl_client_cert_entries(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+    subjects: &[(String, Option<String>)],
+) -> Result<(), sqlx::Error> {
+    for (subject, description) in subjects {
+        sqlx::query("INSERT INTO acl_client_cert_entries (id, acl_list_id, subject, description) VALUES (?, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(acl_list_id.to_string())
+            .bind(subject)
+            .bind(description.as_deref())
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 /// A single `AclKind::IpAllow` entry, as returned to the admin UI for
 /// per-item display/edit/delete -- unlike the bulk-creation path above,
 /// this is used once a list already exists.
@@ -835,6 +867,20 @@ pub struct AclIpEntry {
 pub struct AclCredentialSummary {
     pub id: Uuid,
     pub username: String,
+    pub description: Option<String>,
+}
+
+/// A single `AclKind::ClientCert` allowed-subject entry -- the exact
+/// TLS client-cert Subject CN (as `client_cert::client_cert_subject`
+/// extracts it) that must match for a presented cert to satisfy this
+/// ACL. See `AclKind::ClientCert`'s doc comment: a list with zero of
+/// these still accepts any valid TrustBridge-issued cert (unchanged,
+/// permissive default); adding entries narrows that down to only the
+/// subjects listed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AclClientCertEntry {
+    pub id: Uuid,
+    pub subject: String,
     pub description: Option<String>,
 }
 
@@ -1021,6 +1067,67 @@ pub async fn delete_acl_credential(
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn list_acl_client_cert_entries(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+) -> Result<Vec<AclClientCertEntry>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, subject, description FROM acl_client_cert_entries WHERE acl_list_id = ? ORDER BY rowid ASC",
+    )
+    .bind(acl_list_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(AclClientCertEntry {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap_or_else(|_| Uuid::new_v4()),
+                subject: row.get("subject"),
+                description: row.get("description"),
+            })
+        })
+        .collect()
+}
+
+pub async fn add_acl_client_cert_entry(
+    pool: &SqlitePool,
+    acl_list_id: Uuid,
+    subject: &str,
+    description: Option<&str>,
+) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO acl_client_cert_entries (id, acl_list_id, subject, description) VALUES (?, ?, ?, ?)")
+        .bind(id.to_string())
+        .bind(acl_list_id.to_string())
+        .bind(subject)
+        .bind(description)
+        .execute(pool)
+        .await?;
+    Ok(id)
+}
+
+pub async fn update_acl_client_cert_entry(
+    pool: &SqlitePool,
+    entry_id: Uuid,
+    subject: &str,
+    description: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE acl_client_cert_entries SET subject = ?, description = ? WHERE id = ?")
+        .bind(subject)
+        .bind(description)
+        .bind(entry_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn delete_acl_client_cert_entry(pool: &SqlitePool, entry_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM acl_client_cert_entries WHERE id = ?")
+        .bind(entry_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Error> {
     let rows =
         sqlx::query("SELECT id, name, kind, created_at FROM acl_lists ORDER BY created_at ASC")
@@ -1092,11 +1199,16 @@ pub struct ResolvedAcls {
     pub credentials: Vec<HostAuth>,
     pub has_ip_allow_acl: bool,
     pub has_login_acl: bool,
-    /// A `ClientCert`-kind list has no entries of its own (see
-    /// `config::AclKind::ClientCert`) -- selecting one is a pure
-    /// boolean toggle, so there's nothing to accumulate here beyond
-    /// this flag.
+    /// Set once any selected `ClientCert`-kind list exists, regardless
+    /// of whether it has entries -- see `config::AclKind::ClientCert`'s
+    /// doc comment.
     pub has_client_cert_acl: bool,
+    /// Every subject entry across every selected `ClientCert`-kind
+    /// list. Empty means "no restriction" -- a presented cert's subject
+    /// doesn't need to appear here for `has_client_cert_acl` to grant
+    /// access (the original, still-supported "any valid cert" mode).
+    /// Non-empty means the presented subject must be one of these.
+    pub allowed_client_cert_subjects: Vec<String>,
 }
 
 pub async fn resolve_acl_ids(
@@ -1146,6 +1258,11 @@ pub async fn resolve_acl_ids(
             }
             AclKind::ClientCert => {
                 resolved.has_client_cert_acl = true;
+                let rows = sqlx::query("SELECT subject FROM acl_client_cert_entries WHERE acl_list_id = ?")
+                    .bind(acl_id.to_string())
+                    .fetch_all(pool)
+                    .await?;
+                resolved.allowed_client_cert_subjects.extend(rows.into_iter().map(|r| r.get::<String, _>("subject")));
             }
         }
     }

@@ -350,8 +350,16 @@ async fn handle_https_request(
     // by the time client_cert_subject is `Some`, rustls has already
     // verified the cert chains to TrustBridge's root (see
     // client_cert.rs's module doc); this only checks whether the host
-    // actually opted into treating that as sufficient.
-    let client_cert_ok = resolved_acls.has_client_cert_acl && client_cert_subject.is_some();
+    // actually opted into treating that as sufficient. When the
+    // selected ClientCert ACL(s) have zero subject entries, any
+    // verified cert passes (the original, still-supported behavior);
+    // once entries exist, the presented subject must be one of them --
+    // see `db::ResolvedAcls::allowed_client_cert_subjects`'s doc
+    // comment.
+    let client_cert_ok = resolved_acls.has_client_cert_acl
+        && client_cert_subject
+            .as_deref()
+            .is_some_and(|subject| resolved_acls.allowed_client_cert_subjects.is_empty() || resolved_acls.allowed_client_cert_subjects.iter().any(|s| s == subject));
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
     if !(client_cert_ok || (resolved_acls.has_ip_allow_acl && ip_allowed)) {
         if resolved_acls.has_login_acl {
@@ -1523,6 +1531,57 @@ mod tests {
         // use -- a BAD_GATEWAY here means it got past both ACL checks
         // and tried to actually proxy the request.
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    /// Same host, but the ClientCert ACL now has one subject entry --
+    /// Jeff's follow-up ask ("I need the ability to specify which certs
+    /// to accept"). A cert whose subject matches the entry still
+    /// bypasses the login gate.
+    #[tokio::test]
+    async fn a_client_cert_matching_an_allowed_subject_entry_bypasses_the_login_gate() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        let cert_acl_id = host.acl_ids[0];
+        crate::db::add_acl_client_cert_entry(state.db(), cert_acl_id, "Jeffs MacBook", None)
+            .await
+            .unwrap();
+        state.set_hosts(vec![host]);
+
+        let resp = send_test_request_with_cert(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            Some("Jeffs MacBook".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    /// A cert whose subject does NOT match any allowed entry falls back
+    /// to the Login ACL instead of being treated as sufficient -- a
+    /// valid TrustBridge cert alone is no longer enough once the
+    /// operator has scoped the ACL down to specific subjects.
+    #[tokio::test]
+    async fn a_client_cert_not_matching_any_allowed_subject_entry_falls_through_to_the_login_gate() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        let cert_acl_id = host.acl_ids[0];
+        crate::db::add_acl_client_cert_entry(state.db(), cert_acl_id, "Jeffs MacBook", None)
+            .await
+            .unwrap();
+        state.set_hosts(vec![host]);
+
+        let resp = send_test_request_with_cert(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            Some("Someone Else's Phone".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        let body = response_text(resp).await;
+        assert!(
+            body.contains("Sign in to example.com"),
+            "a cert not on the allow-list must fall back to the login page, not bypass it"
+        );
     }
 
     /// The fallback half of the same spec: no cert presented falls

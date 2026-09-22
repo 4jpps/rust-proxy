@@ -373,8 +373,10 @@
     <p class="hint">Reusable, named lists a host can select none, one, or several of (see the host
       form's "Access control" section). An <b>IP allow</b> list restricts by source IP/CIDR; a
       <b>Login</b> list gates behind a real sign-in page and can hold multiple username/password pairs; a
-      <b>Client cert</b> list has no entries of its own -- it means any valid TrustBridge-issued client
-      certificate satisfies this host's login gate, falling back to a selected Login list if none was presented.</p>
+      <b>Client cert</b> list means a valid TrustBridge-issued client certificate satisfies this host's
+      login gate (falling back to a selected Login list if none was presented) -- with zero subject
+      entries, ANY valid cert qualifies; add entries via "Manage entries" to restrict it to specific
+      certificates only.</p>
     <table id="acls-table"><thead><tr><th>Name</th><th>Kind</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
     <form id="acl-form">
       <div class="field-grid">
@@ -387,7 +389,7 @@
           </select>
         </label>
       </div>
-      <p id="acl-client-cert-hint" class="hint" style="display:none">No entries to add -- a host that selects this ACL treats any valid TrustBridge-issued client certificate as sufficient to pass its login gate. Issue certificates from the TrustBridge portal (pki.jpps.us).</p>
+      <p id="acl-client-cert-hint" class="hint" style="display:none">Created empty by default -- any valid TrustBridge-issued client certificate will satisfy this ACL. Use "Manage entries" after creating it to restrict acceptance to specific certificate Subject CNs. Issue certificates from the TrustBridge portal (pki.jpps.us).</p>
       <div id="acl-ip-fields">
         <p class="hint">Add each allowed source IP/CIDR one at a time -- an optional description helps tell
           entries apart later (e.g. "HQ subnet").</p>
@@ -1187,6 +1189,10 @@ function renderAclManageAddFields() {
       <label><span>Username</span><input type="text" id="acl-manage-add-username" required></label>
       <label><span>Password</span><input type="password" id="acl-manage-add-password" required></label>
       <label class="wide"><span>Description (optional)</span><input type="text" id="acl-manage-add-description"></label>`;
+  } else if (aclManageState.kind === 'client_cert') {
+    container.innerHTML = `
+      <label><span>Subject CN</span><input type="text" id="acl-manage-add-subject" placeholder="Jeffs MacBook" required></label>
+      <label class="wide"><span>Description (optional)</span><input type="text" id="acl-manage-add-description"></label>`;
   } else {
     container.innerHTML = `
       <label><span>IP/CIDR</span><input type="text" id="acl-manage-add-cidr" placeholder="10.0.0.0/24" required></label>
@@ -1199,6 +1205,8 @@ async function openAclManage(acl) {
   document.getElementById('acl-manage-title').textContent = `Manage "${acl.name}"`;
   document.getElementById('acl-manage-hint').textContent = acl.kind === 'login'
     ? 'Each row is one username/password pair a login can use.'
+    : acl.kind === 'client_cert'
+    ? 'Each row is one allowed cert Subject CN (issued from pki.jpps.us). With zero rows, ANY valid TrustBridge-issued client cert satisfies this ACL -- add rows to restrict it to specific certificates only.'
     : 'Each row is one allowed source IP/CIDR.';
   document.getElementById('acl-manage-error').textContent = '';
   renderAclManageAddFields();
@@ -1219,10 +1227,42 @@ async function loadAclManageEntries() {
   if (aclManageState.kind === 'login') {
     thead.innerHTML = '<th>Username</th><th>Description</th><th colspan="2"></th>';
     for (const c of detail.credentials) tbody.appendChild(buildAclCredentialRow(c));
+  } else if (aclManageState.kind === 'client_cert') {
+    thead.innerHTML = '<th>Subject CN</th><th>Description</th><th colspan="2"></th>';
+    for (const entry of detail.client_cert_entries) tbody.appendChild(buildAclClientCertEntryRow(entry));
   } else {
     thead.innerHTML = '<th>CIDR</th><th>Description</th><th colspan="2"></th>';
     for (const entry of detail.ip_entries) tbody.appendChild(buildAclIpEntryRow(entry));
   }
+}
+
+function buildAclClientCertEntryRow(entry) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${esc(entry.subject)}</td><td>${esc(entry.description || '')}</td>
+    <td><button class="acl-manage-edit">Edit</button></td>
+    <td><button class="danger acl-manage-delete">Delete</button></td>`;
+  tr.querySelector('.acl-manage-edit').addEventListener('click', () => {
+    tr.innerHTML = `<td colspan="4"><div class="row-fields">
+      <label><span>Subject CN</span><input type="text" class="acl-edit-subject" value="${esc(entry.subject)}"></label>
+      <label><span>Description</span><input type="text" class="acl-edit-description" value="${esc(entry.description || '')}"></label>
+      <button type="button" class="acl-edit-save">Save</button>
+      <button type="button" class="acl-edit-cancel">Cancel</button>
+    </div></td>`;
+    tr.querySelector('.acl-edit-save').addEventListener('click', async () => {
+      const body = { subject: tr.querySelector('.acl-edit-subject').value, description: tr.querySelector('.acl-edit-description').value || null };
+      const r = await api(`/api/acls/${aclManageState.id}/client-cert-entries/${entry.id}`, { method: 'PUT', body: JSON.stringify(body) });
+      if (r.ok) loadAclManageEntries();
+      else document.getElementById('acl-manage-error').textContent = (await r.json()).error || 'failed';
+    });
+    tr.querySelector('.acl-edit-cancel').addEventListener('click', loadAclManageEntries);
+  });
+  tr.querySelector('.acl-manage-delete').addEventListener('click', async () => {
+    if (!confirm(`Delete entry "${entry.subject}"?`)) return;
+    const r = await api(`/api/acls/${aclManageState.id}/client-cert-entries/${entry.id}`, { method: 'DELETE' });
+    if (r.ok) loadAclManageEntries();
+    else document.getElementById('acl-manage-error').textContent = (await r.json()).error || 'failed';
+  });
+  return tr;
 }
 
 function buildAclIpEntryRow(entry) {
@@ -1296,6 +1336,12 @@ document.getElementById('acl-manage-add-form').addEventListener('submit', async 
       description: document.getElementById('acl-manage-add-description').value || null,
     };
     path = `/api/acls/${aclManageState.id}/credentials`;
+  } else if (aclManageState.kind === 'client_cert') {
+    body = {
+      subject: document.getElementById('acl-manage-add-subject').value,
+      description: document.getElementById('acl-manage-add-description').value || null,
+    };
+    path = `/api/acls/${aclManageState.id}/client-cert-entries`;
   } else {
     body = {
       cidr: document.getElementById('acl-manage-add-cidr').value,

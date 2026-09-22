@@ -67,6 +67,14 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::put(update_acl_credential).delete(delete_acl_credential),
         )
         .route(
+            "/api/acls/:id/client-cert-entries",
+            post(add_acl_client_cert_entry),
+        )
+        .route(
+            "/api/acls/:id/client-cert-entries/:entry_id",
+            axum::routing::put(update_acl_client_cert_entry).delete(delete_acl_client_cert_entry),
+        )
+        .route(
             "/api/dns01-certs",
             get(list_standalone_certs).post(create_standalone_cert),
         )
@@ -678,6 +686,13 @@ struct AclCredentialRequest {
 }
 
 #[derive(Deserialize)]
+struct AclClientCertEntryRequest {
+    subject: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct CreateAclListRequest {
     name: String,
     kind: crate::config::AclKind,
@@ -685,6 +700,12 @@ struct CreateAclListRequest {
     ip_entries: Vec<String>,
     #[serde(default)]
     credentials: Vec<AclCredentialRequest>,
+    /// Optional even for a `ClientCert`-kind list -- unlike IpAllow/
+    /// Login, an empty `ClientCert` list is a real, meaningful,
+    /// still-supported configuration ("any valid TrustBridge cert"),
+    /// not a useless one, so this is never required to be non-empty.
+    #[serde(default)]
+    client_cert_entries: Vec<AclClientCertEntryRequest>,
 }
 
 async fn list_acls(State(state): State<AppState>) -> Result<Json<Vec<AclListSummary>>, ApiError> {
@@ -760,9 +781,22 @@ async fn create_acl_list(
             crate::db::add_acl_credentials(state.db(), id, &hashed).await?;
         }
         crate::config::AclKind::ClientCert => {
-            // No entries to validate or store -- see AclKind::ClientCert's
-            // doc comment, selecting one is a pure boolean toggle.
+            // Entries are optional -- see AclKind::ClientCert's doc
+            // comment: zero entries is a real, meaningful "any valid
+            // TrustBridge cert" configuration, not an incomplete one.
+            let subjects: Vec<(String, Option<String>)> = body
+                .client_cert_entries
+                .iter()
+                .map(|e| {
+                    let subject = e.subject.trim();
+                    if subject.is_empty() {
+                        return Err(ApiError::BadRequest("subject must not be empty".into()));
+                    }
+                    Ok((subject.to_string(), normalize_description(e.description.clone())))
+                })
+                .collect::<Result<_, ApiError>>()?;
             crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
+            crate::db::add_acl_client_cert_entries(state.db(), id, &subjects).await?;
         }
     }
 
@@ -803,6 +837,7 @@ struct AclListDetail {
     created_at: chrono::DateTime<chrono::Utc>,
     ip_entries: Vec<crate::db::AclIpEntry>,
     credentials: Vec<crate::db::AclCredentialSummary>,
+    client_cert_entries: Vec<crate::db::AclClientCertEntry>,
 }
 
 /// Full detail for a single existing ACL, including its individual
@@ -818,6 +853,7 @@ async fn get_acl_list_detail(
         .ok_or(ApiError::NotFound)?;
     let ip_entries = crate::db::list_acl_ip_entries(state.db(), id).await?;
     let credentials = crate::db::list_acl_credentials(state.db(), id).await?;
+    let client_cert_entries = crate::db::list_acl_client_cert_entries(state.db(), id).await?;
     Ok(Json(AclListDetail {
         id: list.id,
         name: list.name,
@@ -825,6 +861,7 @@ async fn get_acl_list_detail(
         created_at: list.created_at,
         ip_entries,
         credentials,
+        client_cert_entries,
     }))
 }
 
@@ -1012,6 +1049,77 @@ async fn delete_acl_credential(
     if !found {
         return Err(ApiError::NotFound);
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn add_acl_client_cert_entry(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AclClientCertEntryRequest>,
+) -> Result<Json<crate::db::AclClientCertEntry>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::ClientCert {
+        return Err(ApiError::BadRequest(
+            "this ACL is not a client-cert list".into(),
+        ));
+    }
+    let subject = body.subject.trim();
+    if subject.is_empty() {
+        return Err(ApiError::BadRequest("subject must not be empty".into()));
+    }
+    let description = normalize_description(body.description);
+    let entry_id =
+        crate::db::add_acl_client_cert_entry(state.db(), id, subject, description.as_deref()).await?;
+    state.notify_config_change();
+    Ok(Json(crate::db::AclClientCertEntry {
+        id: entry_id,
+        subject: subject.to_string(),
+        description,
+    }))
+}
+
+async fn update_acl_client_cert_entry(
+    State(state): State<AppState>,
+    Path((id, entry_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<AclClientCertEntryRequest>,
+) -> Result<Json<crate::db::AclClientCertEntry>, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::ClientCert {
+        return Err(ApiError::BadRequest(
+            "this ACL is not a client-cert list".into(),
+        ));
+    }
+    let subject = body.subject.trim();
+    if subject.is_empty() {
+        return Err(ApiError::BadRequest("subject must not be empty".into()));
+    }
+    let description = normalize_description(body.description);
+    let found =
+        crate::db::update_acl_client_cert_entry(state.db(), entry_id, subject, description.as_deref()).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    state.notify_config_change();
+    Ok(Json(crate::db::AclClientCertEntry {
+        id: entry_id,
+        subject: subject.to_string(),
+        description,
+    }))
+}
+
+async fn delete_acl_client_cert_entry(
+    State(state): State<AppState>,
+    Path((_id, entry_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let found = crate::db::delete_acl_client_cert_entry(state.db(), entry_id).await?;
+    if !found {
+        return Err(ApiError::NotFound);
+    }
+    state.notify_config_change();
     Ok(StatusCode::NO_CONTENT)
 }
 
