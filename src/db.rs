@@ -172,6 +172,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN rewrite_samesite_none_cookies INTEGER NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN pass_client_cert_header INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
     // copied above) and `access_allow_ips`/`access_login_username`/
     // `access_login_password_hash` (superseded by the acl_lists/
@@ -749,12 +752,14 @@ fn acl_kind_to_str(kind: AclKind) -> &'static str {
     match kind {
         AclKind::IpAllow => "ip_allow",
         AclKind::Login => "login",
+        AclKind::ClientCert => "client_cert",
     }
 }
 
 fn acl_kind_from_str(s: &str) -> AclKind {
     match s {
         "login" => AclKind::Login,
+        "client_cert" => AclKind::ClientCert,
         _ => AclKind::IpAllow,
     }
 }
@@ -1087,6 +1092,11 @@ pub struct ResolvedAcls {
     pub credentials: Vec<HostAuth>,
     pub has_ip_allow_acl: bool,
     pub has_login_acl: bool,
+    /// A `ClientCert`-kind list has no entries of its own (see
+    /// `config::AclKind::ClientCert`) -- selecting one is a pure
+    /// boolean toggle, so there's nothing to accumulate here beyond
+    /// this flag.
+    pub has_client_cert_acl: bool,
 }
 
 pub async fn resolve_acl_ids(
@@ -1133,6 +1143,9 @@ pub async fn resolve_acl_ids(
                         username: r.get("username"),
                         password_hash: r.get("password_hash"),
                     }));
+            }
+            AclKind::ClientCert => {
+                resolved.has_client_cert_acl = true;
             }
         }
     }
@@ -1227,7 +1240,7 @@ pub async fn set_expose_admin_port(pool: &SqlitePool, value: bool) -> Result<(),
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -1294,6 +1307,7 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                     .get::<Option<String>, _>("static_root")
                     .map(std::path::PathBuf::from),
                 rewrite_samesite_none_cookies: row.get::<i64, _>("rewrite_samesite_none_cookies") != 0,
+                pass_client_cert_header: row.get::<i64, _>("pass_client_cert_header") != 0,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1332,8 +1346,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -1357,6 +1371,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(path_rewrite_replacement)
         .bind(h.static_root.as_ref().map(|p| p.to_string_lossy().to_string()))
         .bind(h.rewrite_samesite_none_cookies as i64)
+        .bind(h.pass_client_cert_header as i64)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -1467,6 +1482,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         }
     }

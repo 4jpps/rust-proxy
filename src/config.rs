@@ -323,6 +323,19 @@ pub struct ProxyHost {
     /// `proxy::mod::resolve_host_acls`, not stored inline here.
     #[serde(default)]
     pub acl_ids: Vec<Uuid>,
+    /// `false` (the default) strips any inbound `X-Client-Cert-Subject`
+    /// header before forwarding (so a client can't spoof one), and adds
+    /// nothing of its own. `true` forwards the verified TrustBridge
+    /// client cert's Subject CN as `X-Client-Cert-Subject` whenever the
+    /// connection presented one (see `proxy::client_cert`) -- for an
+    /// upstream app (store, wiki, ...) with its own admin login to
+    /// trust as a bypass, the same way this proxy's own `ClientCert`
+    /// ACL kind bypasses its login gate. The upstream is responsible
+    /// for deciding what to do with the header; this only guarantees
+    /// it's genuine, not spoofable by the client, and only present when
+    /// this flag is on.
+    #[serde(default)]
+    pub pass_client_cert_header: bool,
     /// Which named `dns_credentials` DB row (see `db::create_dns_credential`)
     /// to use for this host's dns-01 issuance. `None` means either this
     /// host never needs dns-01 (http-01, or ACME disabled), or -- when it
@@ -495,6 +508,15 @@ pub enum AclKind {
     /// A list of username/password_hash pairs; a login succeeds if it
     /// matches any entry across every `Login` list a host has selected.
     Login,
+    /// No entries of its own (unlike the other two kinds) -- selecting
+    /// a `ClientCert`-kind list means "a TrustBridge-issued client
+    /// certificate satisfies this host's login gate," checked against
+    /// the connection-level client cert `proxy::client_cert` already
+    /// verified (or didn't -- absence just means this ACL doesn't
+    /// match, same as a non-matching IP). See `proxy::mod::
+    /// handle_https_request`'s ACL-gate logic for exactly how this
+    /// combines with `IpAllow`/`Login` lists on the same host.
+    ClientCert,
 }
 
 fn default_https_port() -> u16 {
@@ -1069,6 +1091,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -1101,6 +1124,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         assert!(
@@ -1132,6 +1156,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1160,6 +1185,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1192,6 +1218,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());
@@ -1224,6 +1251,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         assert!(cfg.validate().is_err());
@@ -1319,6 +1347,7 @@ dns_api_token = "token-placeholder"
                 path_rewrite: None,
                 static_root: None,
                 rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
                 enabled: true,
             });
         }
@@ -1352,6 +1381,7 @@ dns_api_token = "token-placeholder"
                 path_rewrite: None,
                 static_root: None,
                 rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
                 enabled: true,
             });
         }
@@ -1381,6 +1411,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         cfg.port_rules.push(PortRule {
@@ -1421,6 +1452,7 @@ dns_api_token = "token-placeholder"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         });
         assert!(cfg.validate().is_ok());

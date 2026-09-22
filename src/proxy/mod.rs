@@ -11,6 +11,7 @@
 //! never dropped.
 
 pub mod access;
+pub mod client_cert;
 pub mod http;
 pub mod login;
 pub mod passthrough;
@@ -176,12 +177,14 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                     }
                 };
                 let sni = tls_stream.get_ref().1.server_name().map(|s| s.to_string());
+                let client_cert_subject = client_cert::client_cert_subject(tls_stream.get_ref().1.peer_certificates());
                 let io = TokioIo::new(tls_stream);
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let sni = sni.clone();
+                    let client_cert_subject = client_cert_subject.clone();
                     async move {
-                        handle_https_request(state, bind_ip, bind_port, peer_ip, sni, req).await
+                        handle_https_request(state, bind_ip, bind_port, peer_ip, sni, client_cert_subject, req).await
                     }
                 });
                 // `auto::Builder` sniffs the connection preface to pick
@@ -215,8 +218,15 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
 /// HTTP/2 multiplexing -- the same split Nginx itself makes.
 fn build_https_server_config(state: AppState) -> rustls::ServerConfig {
     let resolver = Arc::new(tls::CertResolver::new(state));
+    // Client-cert presentation is always optional at the TLS layer --
+    // see client_cert.rs's module doc for why this is safe to enable
+    // globally rather than gating it per-host at this level (only
+    // clients holding a cert whose issuer matches TrustBridge's root,
+    // which this verifier is the only thing that advertises, will ever
+    // offer one at all).
+    let client_cert_verifier = client_cert::build_optional_client_cert_verifier();
     let mut server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_cert_verifier)
         .with_cert_resolver(resolver);
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     server_config
@@ -228,6 +238,7 @@ async fn handle_https_request(
     bind_port: u16,
     peer_ip: IpAddr,
     sni: Option<String>,
+    client_cert_subject: Option<String>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     // Real HTTP/2 clients (every modern browser) send the target host
@@ -301,6 +312,15 @@ async fn handle_https_request(
         return Ok(not_found());
     };
 
+    // Never let a client set this header itself -- only ever set below,
+    // from a TLS-layer-verified cert, once we know whether this host
+    // actually wants it forwarded. Stripped unconditionally (even for
+    // hosts that never forward it) so a client can't probe the
+    // difference between "stripped" and "never set" to tell whether an
+    // upstream is watching for it.
+    let mut req = req;
+    req.headers_mut().remove("x-client-cert-subject");
+
     let resolved_acls = if host.acl_ids.is_empty() {
         crate::db::ResolvedAcls::default()
     } else {
@@ -324,8 +344,15 @@ async fn handle_https_request(
     // valid login credentials for it, must still be able to sign in).
     // Only a host with an IP-allow ACL and NO login ACL at all still
     // 403s outright on a non-matching IP, same as it always has.
+    // A verified TrustBridge client cert is a third way to satisfy this
+    // gate, same OR-not-AND relationship as IP-allow-over-login above --
+    // by the time client_cert_subject is `Some`, rustls has already
+    // verified the cert chains to TrustBridge's root (see
+    // client_cert.rs's module doc); this only checks whether the host
+    // actually opted into treating that as sufficient.
+    let client_cert_ok = resolved_acls.has_client_cert_acl && client_cert_subject.is_some();
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
-    if !(resolved_acls.has_ip_allow_acl && ip_allowed) {
+    if !(client_cert_ok || (resolved_acls.has_ip_allow_acl && ip_allowed)) {
         if resolved_acls.has_login_acl {
             let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
                 .zip(state.admin_identity())
@@ -355,7 +382,14 @@ async fn handle_https_request(
         return Ok(http::serve_static_response(&req, static_root).await);
     }
 
-    let mut req = req;
+    if host.pass_client_cert_header {
+        if let Some(subject) = &client_cert_subject {
+            if let Ok(value) = hyper::header::HeaderValue::from_str(subject) {
+                req.headers_mut().insert("x-client-cert-subject", value);
+            }
+        }
+    }
+
     if let Some(path_rewrite) = &host.path_rewrite {
         apply_path_rewrite(&mut req, path_rewrite);
     }
@@ -986,6 +1020,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         }
     }
@@ -1019,7 +1054,7 @@ mod tests {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let state = state.clone();
                 let sni = sni.clone();
-                async move { handle_https_request(state, bind_ip, bind_port, peer_ip, sni, req).await }
+                async move { handle_https_request(state, bind_ip, bind_port, peer_ip, sni, None, req).await }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -1044,6 +1079,56 @@ mod tests {
         };
         let req = builder
             .body(http_body_util::Full::new(Bytes::from(body_bytes)))
+            .unwrap();
+        sender.send_request(req).await.unwrap()
+    }
+
+    /// Same shape as `send_test_request`, but drives a connection that
+    /// claims to have presented the given client-cert subject -- a
+    /// dedicated helper rather than adding a parameter to
+    /// `send_test_request` itself, since that would touch every one of
+    /// its many existing call sites for a variant only the ClientCert
+    /// ACL tests below need. Bypasses real TLS entirely (this crate's
+    /// existing test suite already proves the TLS-level cert extraction
+    /// separately in `client_cert.rs`) -- what's under test here is
+    /// purely "does the gate logic in handle_https_request do the right
+    /// thing with a given client_cert_subject value."
+    async fn send_test_request_with_cert(
+        state: AppState,
+        peer_ip: IpAddr,
+        client_cert_subject: Option<String>,
+    ) -> Response<Incoming> {
+        let bind_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let bind_port = 443;
+        let sni = Some("example.com".to_string());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let state = state.clone();
+                let sni = sni.clone();
+                let client_cert_subject = client_cert_subject.clone();
+                async move {
+                    handle_https_request(state, bind_ip, bind_port, peer_ip, sni, client_cert_subject, req).await
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(http_body_util::Full::new(Bytes::new()))
             .unwrap();
         sender.send_request(req).await.unwrap()
     }
@@ -1109,6 +1194,7 @@ mod tests {
                         bind_port,
                         "203.0.113.7".parse().unwrap(),
                         sni,
+                        None,
                         req,
                     )
                     .await
@@ -1198,6 +1284,7 @@ mod tests {
                         bind_port,
                         "203.0.113.7".parse().unwrap(),
                         sni,
+                        None,
                         req,
                     )
                     .await
@@ -1349,6 +1436,100 @@ mod tests {
         }
     }
 
+    /// A host with a `ClientCert`-kind ACL selected, plus (matching
+    /// Jeff's own spec: "#2 but fallback with user/pass as is now") a
+    /// `Login`-kind ACL as the fallback for a connection that didn't
+    /// present a cert.
+    async fn client_cert_host_with_login_fallback(pool: &sqlx::SqlitePool, domain: &str) -> ProxyHost {
+        let cert_acl_id = Uuid::new_v4();
+        crate::db::create_acl_list(
+            pool,
+            cert_acl_id,
+            "test client cert",
+            crate::config::AclKind::ClientCert,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let login_acl_id = Uuid::new_v4();
+        crate::db::create_acl_list(
+            pool,
+            login_acl_id,
+            "test login fallback",
+            crate::config::AclKind::Login,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let auth = viewer_auth();
+        crate::db::add_acl_credentials(pool, login_acl_id, &[(auth.username, auth.password_hash)])
+            .await
+            .unwrap();
+        ProxyHost {
+            id: Uuid::new_v4(),
+            domain: domain.into(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
+            bind_port: 443,
+            upstream: "127.0.0.1:1".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
+            websockets: false,
+            force_https: false,
+            acme_enabled: false,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            acl_ids: vec![cert_acl_id, login_acl_id],
+            dns_credential_id: None,
+            redirect: None,
+            path_rewrite: None,
+            static_root: None,
+            rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
+            enabled: true,
+        }
+    }
+
+    /// The core of Jeff's ask: a valid client cert (verified at the TLS
+    /// layer before this handler ever runs -- see client_cert.rs) skips
+    /// the login gate entirely, even though a Login ACL is also
+    /// selected on this host.
+    #[tokio::test]
+    async fn a_presented_client_cert_bypasses_the_login_gate_when_a_client_cert_acl_is_selected() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        state.set_hosts(vec![host]);
+
+        let resp = send_test_request_with_cert(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            Some("Jeffs MacBook".to_string()),
+        )
+        .await;
+        // Upstream is unreachable (127.0.0.1:1), same "proves the gate
+        // let it through" signal send_test_request's own IP-allow tests
+        // use -- a BAD_GATEWAY here means it got past both ACL checks
+        // and tried to actually proxy the request.
+        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    /// The fallback half of the same spec: no cert presented falls
+    /// through to the Login ACL exactly as today, not a hard block.
+    #[tokio::test]
+    async fn no_client_cert_falls_through_to_the_login_gate_fallback() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        state.set_hosts(vec![host]);
+
+        let resp = send_test_request_with_cert(state, "203.0.113.7".parse().unwrap(), None).await;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        let body = response_text(resp).await;
+        assert!(
+            body.contains("Sign in to example.com"),
+            "no client cert presented must fall back to the login page, not a bypass or a hard block"
+        );
+    }
+
     #[tokio::test]
     async fn a_request_without_a_session_gets_the_login_page_instead_of_the_upstream() {
         let state = test_state_with_access("example.com", vec![], Some(viewer_auth())).await;
@@ -1469,6 +1650,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         }
     }

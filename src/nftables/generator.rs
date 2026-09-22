@@ -331,6 +331,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
             enabled: true,
         }
     }

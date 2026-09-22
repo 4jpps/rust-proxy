@@ -148,6 +148,10 @@
           <label class="chk"><input type="checkbox" name="rewrite_samesite_none_cookies"> Downgrade SameSite=None cookies from upstream to SameSite=Lax</label>
         </div>
         <p class="hint">Some applications hardcode <code>SameSite=None</code> on their session cookie even with no real cross-site need -- modern browsers' privacy/tracking-protection features can silently drop exactly that kind of cookie, breaking login with no clear error. Only enable this if you're seeing unexplained login/session failures with a specific upstream; a host that genuinely needs <code>SameSite=None</code> (an embeddable widget, a real cross-site OAuth flow) would break if this were on unconditionally.</p>
+        <div class="checks">
+          <label class="chk"><input type="checkbox" name="pass_client_cert_header"> Forward verified client-cert subject to upstream as X-Client-Cert-Subject</label>
+        </div>
+        <p class="hint">When a connection presents a client certificate that chains to TrustBridge's root, forward its Subject CN in this header so the upstream app (if it's been set up to check for it) can trust it as an admin-login bypass. The header is always stripped from what a client sends directly, so this can never be spoofed by the request itself.</p>
         <p class="hint" id="host-existing-cert-hint" style="display:none"></p>
       </fieldset>
 
@@ -368,7 +372,9 @@
     <h2>Access control lists</h2>
     <p class="hint">Reusable, named lists a host can select none, one, or several of (see the host
       form's "Access control" section). An <b>IP allow</b> list restricts by source IP/CIDR; a
-      <b>Login</b> list gates behind a real sign-in page and can hold multiple username/password pairs.</p>
+      <b>Login</b> list gates behind a real sign-in page and can hold multiple username/password pairs; a
+      <b>Client cert</b> list has no entries of its own -- it means any valid TrustBridge-issued client
+      certificate satisfies this host's login gate, falling back to a selected Login list if none was presented.</p>
     <table id="acls-table"><thead><tr><th>Name</th><th>Kind</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
     <form id="acl-form">
       <div class="field-grid">
@@ -377,9 +383,11 @@
           <select name="kind" id="acl-kind-select">
             <option value="ip_allow">IP allow list</option>
             <option value="login">Login (username/password)</option>
+            <option value="client_cert">Client certificate (TrustBridge)</option>
           </select>
         </label>
       </div>
+      <p id="acl-client-cert-hint" class="hint" style="display:none">No entries to add -- a host that selects this ACL treats any valid TrustBridge-issued client certificate as sufficient to pass its login gate. Issue certificates from the TrustBridge portal (pki.jpps.us).</p>
       <div id="acl-ip-fields">
         <p class="hint">Add each allowed source IP/CIDR one at a time -- an optional description helps tell
           entries apart later (e.g. "HQ subnet").</p>
@@ -634,6 +642,7 @@ function setHostFormMode(host) {
   form.websockets.checked = host.websockets;
   form.force_https.checked = host.force_https;
   form.rewrite_samesite_none_cookies.checked = host.rewrite_samesite_none_cookies;
+  form.pass_client_cert_header.checked = host.pass_client_cert_header;
   form.enabled.checked = host.enabled;
   form.acme_enabled.checked = host.acme_enabled;
   form.acme_challenge_type.value = host.acme_challenge_type;
@@ -771,6 +780,7 @@ document.getElementById('host-form').addEventListener('submit', async (e) => {
     upstream_tls_verify: fd.get('upstream_tls_verify') === 'on',
     upstream_preserve_host: fd.get('upstream_preserve_host') === 'on',
     rewrite_samesite_none_cookies: fd.get('rewrite_samesite_none_cookies') === 'on',
+    pass_client_cert_header: fd.get('pass_client_cert_header') === 'on',
     websockets: fd.get('websockets') === 'on',
     force_https: fd.get('force_https') === 'on', acme_enabled: fd.get('acme_enabled') === 'on',
     acme_challenge_type: fd.get('acme_challenge_type'),
@@ -1055,8 +1065,10 @@ let aclsById = {};
 
 document.getElementById('acl-kind-select').addEventListener('change', (e) => {
   const isLogin = e.target.value === 'login';
-  document.getElementById('acl-ip-fields').style.display = isLogin ? 'none' : 'block';
+  const isClientCert = e.target.value === 'client_cert';
+  document.getElementById('acl-ip-fields').style.display = (isLogin || isClientCert) ? 'none' : 'block';
   document.getElementById('acl-login-fields').style.display = isLogin ? 'block' : 'none';
+  document.getElementById('acl-client-cert-hint').style.display = isClientCert ? 'block' : 'none';
 });
 
 function addAclCredentialRow() {
@@ -1094,9 +1106,14 @@ async function refreshAcls() {
 
   const tbody = document.querySelector('#acls-table tbody');
   tbody.innerHTML = '';
+  function aclKindLabel(kind) {
+    if (kind === 'login') return 'Login';
+    if (kind === 'client_cert') return 'Client cert';
+    return 'IP allow';
+  }
   for (const a of acls) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${esc(a.name)}</td><td>${a.kind === 'login' ? 'Login' : 'IP allow'}</td>
+    tr.innerHTML = `<td>${esc(a.name)}</td><td>${aclKindLabel(a.kind)}</td>
       <td>${new Date(a.created_at).toLocaleString()}</td>
       <td><button class="acl-manage-open" data-id="${a.id}">Manage entries</button>
       <button class="danger" data-id="${a.id}">Delete</button></td>`;
@@ -1112,7 +1129,7 @@ async function refreshAcls() {
 
   const select = document.querySelector('#host-form select[name=acl_ids]');
   const selected = new Set(Array.from(select.selectedOptions).map((o) => o.value));
-  select.innerHTML = acls.map((a) => `<option value="${esc(a.id)}">${esc(a.name)} (${a.kind === 'login' ? 'login' : 'IP allow'})</option>`).join('');
+  select.innerHTML = acls.map((a) => `<option value="${esc(a.id)}">${esc(a.name)} (${aclKindLabel(a.kind)})</option>`).join('');
   for (const opt of select.options) opt.selected = selected.has(opt.value);
 
   // Port rules only ever enforce IP-allow ACLs at the firewall layer --
@@ -1135,9 +1152,10 @@ document.getElementById('acl-form').addEventListener('submit', async (e) => {
       username: row.querySelector('.acl-cred-username').value,
       password: row.querySelector('.acl-cred-password').value,
     })).filter((c) => c.username || c.password);
-  } else {
+  } else if (kind === 'ip_allow') {
     body.ip_entries = Array.from(document.querySelectorAll('#acl-ip-rows .acl-ip-cidr')).map((i) => i.value.trim()).filter(Boolean);
   }
+  // client_cert has no entries of its own -- neither field is sent.
   const resp = await api('/api/acls', { method: 'POST', body: JSON.stringify(body) });
   if (resp.ok) {
     e.target.reset();

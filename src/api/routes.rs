@@ -576,6 +576,9 @@ struct HostRequest {
     /// See `config::ProxyHost::rewrite_samesite_none_cookies`'s doc comment.
     #[serde(default)]
     rewrite_samesite_none_cookies: bool,
+    /// See `config::ProxyHost::pass_client_cert_header`'s doc comment.
+    #[serde(default)]
+    pass_client_cert_header: bool,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -755,6 +758,11 @@ async fn create_acl_list(
             }
             crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
             crate::db::add_acl_credentials(state.db(), id, &hashed).await?;
+        }
+        crate::config::AclKind::ClientCert => {
+            // No entries to validate or store -- see AclKind::ClientCert's
+            // doc comment, selecting one is a pure boolean toggle.
+            crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
         }
     }
 
@@ -1033,6 +1041,7 @@ async fn create_host(
         path_rewrite: body.path_rewrite,
         static_root: body.static_root,
         rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
+        pass_client_cert_header: body.pass_client_cert_header,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -1072,6 +1081,7 @@ async fn update_host(
         path_rewrite: body.path_rewrite,
         static_root: body.static_root,
         rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
+        pass_client_cert_header: body.pass_client_cert_header,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;
