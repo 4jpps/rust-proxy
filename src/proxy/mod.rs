@@ -32,6 +32,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 #[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+#[cfg(test)]
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::Protocol;
@@ -141,7 +142,8 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
         };
         tracing::info!(%addr, "https listener started");
 
-        let acceptor = TlsAcceptor::from(Arc::new(build_https_server_config(state.clone())));
+        let config_with_client_auth = Arc::new(build_https_server_config(state.clone()));
+        let config_no_client_auth = Arc::new(build_https_server_config_no_client_auth(state.clone()));
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -166,17 +168,34 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 }
             };
             let peer_ip = peer.ip();
-            let acceptor = acceptor.clone();
+            let config_with_client_auth = config_with_client_auth.clone();
+            let config_no_client_auth = config_no_client_auth.clone();
             let state = state.clone();
             tokio::spawn(async move {
-                let tls_stream = match acceptor.accept(stream).await {
+                // Two-phase accept: read just far enough to see the
+                // ClientHello (which carries SNI) before committing to a
+                // `ServerConfig`, so the choice of whether to solicit a
+                // client cert can depend on which host this connection is
+                // actually for -- see `should_request_client_cert`'s doc
+                // comment for why this replaced a single config shared by
+                // every connection on this listener.
+                let start = match tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "tls clienthello read failed");
+                        return;
+                    }
+                };
+                let sni = start.client_hello().server_name().map(|s| s.to_string());
+                let want_client_cert = should_request_client_cert(&state, bind_ip, bind_port, peer_ip, sni.as_deref()).await;
+                let config = if want_client_cert { config_with_client_auth } else { config_no_client_auth };
+                let tls_stream = match start.into_stream(config).await {
                     Ok(s) => s,
                     Err(err) => {
                         tracing::debug!(error = %err, "tls handshake failed");
                         return;
                     }
                 };
-                let sni = tls_stream.get_ref().1.server_name().map(|s| s.to_string());
                 let client_cert_subject = client_cert::client_cert_subject(tls_stream.get_ref().1.peer_certificates());
                 let io = TokioIo::new(tls_stream);
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
@@ -218,18 +237,101 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
 /// HTTP/2 multiplexing -- the same split Nginx itself makes.
 fn build_https_server_config(state: AppState) -> rustls::ServerConfig {
     let resolver = Arc::new(tls::CertResolver::new(state));
-    // Client-cert presentation is always optional at the TLS layer --
-    // see client_cert.rs's module doc for why this is safe to enable
-    // globally rather than gating it per-host at this level (only
+    // Client-cert presentation is optional at the TLS layer (only
     // clients holding a cert whose issuer matches TrustBridge's root,
     // which this verifier is the only thing that advertises, will ever
-    // offer one at all).
+    // offer one at all) -- but *soliciting* one at all (sending a TLS
+    // CertificateRequest) is a per-connection choice made by
+    // `should_request_client_cert` below, not applied to every
+    // connection unconditionally. This function builds the config used
+    // when that decision comes back true; see
+    // `build_https_server_config_no_client_auth` for the other half.
     let client_cert_verifier = client_cert::build_optional_client_cert_verifier();
     let mut server_config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_cert_verifier)
         .with_cert_resolver(resolver);
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     server_config
+}
+
+/// The other half of the pair above -- no CertificateRequest is ever
+/// sent on a connection accepted with this config, so a browser never
+/// shows its cert-picker prompt for it. Used for the overwhelming
+/// majority of connections (every domain that doesn't actually use
+/// client-cert login), which is the whole point of choosing between
+/// the two per-connection instead of applying
+/// `build_https_server_config` globally the way this used to work.
+fn build_https_server_config_no_client_auth(state: AppState) -> rustls::ServerConfig {
+    let resolver = Arc::new(tls::CertResolver::new(state));
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    server_config
+}
+
+/// Decides, from the SNI alone (all that's available before the TLS
+/// handshake completes -- the HTTP request path isn't visible yet),
+/// whether this connection should solicit a client cert at all.
+///
+/// True when either:
+/// - the matched host forwards the verified subject to its upstream
+///   (`pass_client_cert_header`) -- store/wiki/pki's admin-login
+///   bypass all work this way, with no rust-proxy-level ACL selected
+///   at all (the upstream app decides what to do with the header);
+/// - the matched host has a `ClientCert`-kind ACL selected, unless it
+///   *also* has an `IpAllow` ACL that this connection's peer IP
+///   already satisfies -- Jeff's own spec: "should only be [requested]
+///   on a login page, unless it's IP locked and I'm not on one of the
+///   authorized IPs." A peer already let in by IP doesn't need to be
+///   asked for a cert too.
+///
+/// **Known limitation, same one `tls::CertResolver`'s per-SNI cert
+/// selection already has**: this is a one-time, connection-scoped
+/// decision made from SNI alone. A single TLS connection can end up
+/// carrying requests for a *different* host than its SNI named (HTTP/2
+/// connection coalescing under a shared wildcard/SAN cert -- see
+/// `handle_https_request`'s doc comment on `uri_host`/`host_header`
+/// winning over `sni` for *routing*) -- if that happens, whether a
+/// cert was solicited is fixed by the *first* host's setting, not the
+/// coalesced request's own. Not worth solving: none of the domains
+/// that actually use `pass_client_cert_header`/`ClientCert` ACLs today
+/// share a wildcard cert with domains that don't, and getting this
+/// exactly right in the general case needs re-running TLS negotiation
+/// mid-connection, which TLS doesn't support.
+async fn should_request_client_cert(
+    state: &AppState,
+    bind_ip: IpAddr,
+    bind_port: u16,
+    peer_ip: IpAddr,
+    sni: Option<&str>,
+) -> bool {
+    let Some(sni) = sni else {
+        return false;
+    };
+    let hosts = state.hosts();
+    let Some(host) = router::match_host(&hosts, bind_ip, bind_port, sni) else {
+        return false;
+    };
+    if host.pass_client_cert_header {
+        return true;
+    }
+    if host.acl_ids.is_empty() {
+        return false;
+    }
+    let acl_ids = host.acl_ids.clone();
+    let resolved = match crate::db::resolve_acl_ids(state.db(), &acl_ids).await {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            tracing::error!(%sni, error = %err, "failed to resolve host ACLs while deciding whether to solicit a client cert");
+            return false;
+        }
+    };
+    if !resolved.has_client_cert_acl {
+        return false;
+    }
+    let already_ip_allowed = resolved.has_ip_allow_acl && access::ip_allowed(&resolved.allow_ips, peer_ip);
+    !already_ip_allowed
 }
 
 async fn handle_https_request(
@@ -1508,6 +1610,146 @@ mod tests {
             pass_client_cert_header: false,
             enabled: true,
         }
+    }
+
+    /// A host with a `ClientCert`-kind ACL *and* an `IpAllow`-kind ACL
+    /// both selected -- for exercising Jeff's "unless it's IP locked
+    /// and I'm not on one of the authorized IPs" exception in
+    /// `should_request_client_cert`.
+    async fn client_cert_host_with_ip_allow(pool: &sqlx::SqlitePool, domain: &str, allowed_cidr: &str) -> ProxyHost {
+        let cert_acl_id = Uuid::new_v4();
+        crate::db::create_acl_list(pool, cert_acl_id, "test client cert 2", crate::config::AclKind::ClientCert, chrono::Utc::now())
+            .await
+            .unwrap();
+        let ip_acl_id = Uuid::new_v4();
+        crate::db::create_acl_list(pool, ip_acl_id, "test ip allow 2", crate::config::AclKind::IpAllow, chrono::Utc::now())
+            .await
+            .unwrap();
+        crate::db::add_acl_ip_entries(pool, ip_acl_id, &[allowed_cidr.to_string()]).await.unwrap();
+        ProxyHost {
+            id: Uuid::new_v4(),
+            domain: domain.into(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
+            bind_port: 443,
+            upstream: "127.0.0.1:1".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
+            websockets: false,
+            force_https: false,
+            acme_enabled: false,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            acl_ids: vec![cert_acl_id, ip_acl_id],
+            dns_credential_id: None,
+            redirect: None,
+            path_rewrite: None,
+            static_root: None,
+            rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: false,
+            enabled: true,
+        }
+    }
+
+    fn pass_header_host(domain: &str) -> ProxyHost {
+        ProxyHost {
+            id: Uuid::new_v4(),
+            domain: domain.into(),
+            bind_ip_v4: Some("10.0.0.2".parse().unwrap()),
+            bind_ip_v6: None,
+            bind_port: 443,
+            upstream: "127.0.0.1:1".into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+            upstream_preserve_host: true,
+            websockets: false,
+            force_https: false,
+            acme_enabled: false,
+            acme_challenge_type: crate::config::AcmeChallengeType::Auto,
+            acl_ids: vec![],
+            dns_credential_id: None,
+            redirect: None,
+            path_rewrite: None,
+            static_root: None,
+            rewrite_samesite_none_cookies: false,
+            pass_client_cert_header: true,
+            enabled: true,
+        }
+    }
+
+    const TEST_BIND_IP: &str = "10.0.0.2";
+    const TEST_BIND_PORT: u16 = 443;
+
+    /// Jeff's own ask, unit-tested directly against the decision
+    /// function rather than through a real TLS handshake -- there's no
+    /// way to construct a client cert that actually chains to
+    /// TrustBridge's real embedded root in a test (its private key is
+    /// deliberately offline, see `[[trustbridge_ca_portal]]`), so every
+    /// other client-cert test in this file already works this way (see
+    /// `send_test_request_with_cert`'s own doc comment on the same
+    /// constraint) -- `should_request_client_cert` itself doesn't touch
+    /// any cert material at all, only ACL/host config, so it's fully
+    /// testable without one.
+    #[tokio::test]
+    async fn store_style_host_with_pass_client_cert_header_always_wants_a_cert_requested() {
+        let state = test_state_with_cert("example.com").await;
+        state.set_hosts(vec![pass_header_host("example.com")]);
+        assert!(should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_client_cert_feature_enabled_never_wants_a_cert_requested() {
+        let state = test_state_with_cert("example.com").await;
+        state.set_hosts(vec![redirect_host(
+            "example.com",
+            crate::config::RedirectTarget { target: "https://a.example.com".into(), preserve_path: false, status: crate::config::RedirectStatus::Permanent },
+        )]);
+        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+    }
+
+    #[tokio::test]
+    async fn a_client_cert_acl_host_with_no_ip_allow_acl_always_wants_a_cert_requested() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        state.set_hosts(vec![host]);
+        assert!(should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+    }
+
+    /// The exception clause: an IP already covered by the host's own
+    /// IpAllow ACL doesn't need to be asked for a cert too.
+    #[tokio::test]
+    async fn a_client_cert_acl_host_skips_the_cert_request_for_an_already_ip_allowed_peer() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_ip_allow(state.db(), "example.com", "10.0.0.0/24").await;
+        state.set_hosts(vec![host]);
+        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "10.0.0.42".parse().unwrap(), Some("example.com")).await);
+    }
+
+    /// Same host, but a peer IP outside the allow list -- back to
+    /// wanting a cert requested, same as if there were no IpAllow ACL
+    /// at all.
+    #[tokio::test]
+    async fn a_client_cert_acl_host_still_wants_a_cert_requested_for_a_peer_outside_the_ip_allow_list() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_ip_allow(state.db(), "example.com", "10.0.0.0/24").await;
+        state.set_hosts(vec![host]);
+        assert!(should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+    }
+
+    #[tokio::test]
+    async fn no_sni_never_wants_a_cert_requested() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        state.set_hosts(vec![host]);
+        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), None).await);
+    }
+
+    #[tokio::test]
+    async fn sni_matching_no_host_never_wants_a_cert_requested() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        state.set_hosts(vec![host]);
+        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("unrelated.example.net")).await);
     }
 
     /// The core of Jeff's ask: a valid client cert (verified at the TLS
