@@ -320,6 +320,7 @@ async fn handle_https_request(
     // upstream is watching for it.
     let mut req = req;
     req.headers_mut().remove("x-client-cert-subject");
+    req.headers_mut().remove("x-rustproxy-client-cert-token");
 
     let resolved_acls = if host.acl_ids.is_empty() {
         crate::db::ResolvedAcls::default()
@@ -382,10 +383,20 @@ async fn handle_https_request(
         return Ok(http::serve_static_response(&req, static_root).await);
     }
 
+    // Both headers or neither -- the subject alone is not proof the
+    // request came through this proxy (see Config::
+    // client_cert_forward_token's doc comment for the real threat this
+    // closes: a co-located process reaching the upstream directly could
+    // otherwise forge the subject header itself). No configured token
+    // means this feature is silently inert regardless of any host's
+    // pass_client_cert_header setting.
     if host.pass_client_cert_header {
-        if let Some(subject) = &client_cert_subject {
-            if let Ok(value) = hyper::header::HeaderValue::from_str(subject) {
-                req.headers_mut().insert("x-client-cert-subject", value);
+        if let (Some(subject), Some(token)) = (&client_cert_subject, state.client_cert_forward_token()) {
+            if let (Ok(subject_value), Ok(token_value)) =
+                (hyper::header::HeaderValue::from_str(subject), hyper::header::HeaderValue::from_str(token))
+            {
+                req.headers_mut().insert("x-client-cert-subject", subject_value);
+                req.headers_mut().insert("x-rustproxy-client-cert-token", token_value);
             }
         }
     }
@@ -925,6 +936,7 @@ mod tests {
             },
             hosts: vec![],
             port_rules: vec![],
+            client_cert_forward_token: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await

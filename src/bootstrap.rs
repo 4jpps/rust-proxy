@@ -142,6 +142,7 @@ mod tests {
             },
             hosts: vec![],
             port_rules: vec![],
+            client_cert_forward_token: None,
         }
     }
 

@@ -1753,6 +1753,7 @@ mod tests {
             },
             hosts: vec![],
             port_rules: vec![],
+            client_cert_forward_token: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
@@ -1790,6 +1791,7 @@ mod tests {
             },
             hosts: vec![],
             port_rules: vec![],
+            client_cert_forward_token: None,
         };
         cfg.validate()
             .expect("valid: all three identity fields omitted together");
@@ -1832,6 +1834,7 @@ mod tests {
             },
             hosts: vec![],
             port_rules: vec![],
+            client_cert_forward_token: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
@@ -1869,6 +1872,7 @@ mod tests {
             },
             hosts: vec![],
             port_rules: vec![],
+            client_cert_forward_token: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await

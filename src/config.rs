@@ -30,6 +30,23 @@ pub struct Config {
     pub hosts: Vec<ProxyHost>,
     #[serde(default)]
     pub port_rules: Vec<PortRule>,
+    /// A shared secret sent as `X-RustProxy-Client-Cert-Token` alongside
+    /// `X-Client-Cert-Subject` on every host with
+    /// `pass_client_cert_header` set -- the upstream is expected to
+    /// verify this token matches before trusting the subject header at
+    /// all. Exists because the subject header alone is only ever
+    /// *stripped* from what an external client sends (see proxy/mod.rs)
+    /// -- that's not proof the request actually came through this
+    /// proxy, since anything co-located on the same host as an
+    /// upstream (another container, a compromised neighbor process)
+    /// could still reach it directly on its loopback/internal address
+    /// and forge the header itself. `None` (the default) means the
+    /// header is never sent at all, regardless of any host's
+    /// `pass_client_cert_header` setting -- this feature is opt-in at
+    /// the daemon level, not just per-host, specifically so it can't be
+    /// half-configured into looking safe when it isn't.
+    #[serde(default)]
+    pub client_cert_forward_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

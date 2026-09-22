@@ -52,6 +52,12 @@ struct Inner {
     network: NetworkConfig,
     admin: AdminConfig,
     acme: AcmeConfig,
+    /// See `config::Config::client_cert_forward_token`'s doc comment --
+    /// config.toml-only (not exposed to the admin API/UI), since this
+    /// is the actual secret an upstream verifies against, not something
+    /// that should be settable through the same surface a compromised
+    /// admin session could reach.
+    client_cert_forward_token: Option<String>,
     hosts: ArcSwap<Vec<ProxyHost>>,
     port_rules: ArcSwap<Vec<PortRule>>,
     certs: ArcSwap<HashMap<String, CertEntry>>,
@@ -120,6 +126,7 @@ impl AppState {
             network: cfg.network,
             admin: cfg.admin,
             acme: cfg.acme,
+            client_cert_forward_token: cfg.client_cert_forward_token,
             hosts: ArcSwap::from_pointee(hosts),
             port_rules: ArcSwap::from_pointee(port_rules),
             certs: ArcSwap::from_pointee(HashMap::new()),
@@ -152,6 +159,10 @@ impl AppState {
 
     pub fn admin(&self) -> &AdminConfig {
         &self.0.admin
+    }
+
+    pub fn client_cert_forward_token(&self) -> Option<&str> {
+        self.0.client_cert_forward_token.as_deref()
     }
 
     /// Resolves the admin login identity: config.toml wins outright
@@ -364,6 +375,7 @@ mod tests {
             },
             hosts: vec![],
             port_rules: vec![],
+            client_cert_forward_token: None,
         }
     }
 

@@ -6,6 +6,19 @@
 # hosts/port_rules below only matter on first boot, to seed an empty
 # database -- after that, manage them from the admin UI at
 # http://<admin.bind_ip>:<admin.bind_port>/, not by re-editing this file.
+#
+# client_cert_forward_token: config.toml-only (not settable from the
+# admin UI), required for any host's "Forward verified client-cert
+# subject to upstream" toggle to actually do anything -- omitting it
+# means that toggle is silently inert everywhere, regardless of any
+# per-host setting. When set, generate with `openssl rand -hex 32` and
+# put the exact same value in whatever upstream app(s) you're wiring up
+# to trust the X-Client-Cert-Subject header this sends alongside it as
+# X-RustProxy-Client-Cert-Token -- the upstream must verify both
+# headers match before trusting the subject at all, or a co-located
+# process reaching it directly (bypassing this proxy) could forge the
+# subject header itself.
+# client_cert_forward_token = "generate with: openssl rand -hex 32"
 
 [network]
 # Optional, empty by default -- unrestricted, bind to whatever address
