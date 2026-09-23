@@ -960,6 +960,7 @@ mod tests {
                 ),
                 db_path: PathBuf::from(":memory:"),
                 log_dir: None,
+                client_cert_subjects: vec![],
             },
             acme: AcmeConfig {
                 directory_url,

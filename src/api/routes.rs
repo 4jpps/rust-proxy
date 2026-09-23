@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tower_cookies::cookie::SameSite;
 use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 use uuid::Uuid;
@@ -176,6 +177,35 @@ async fn require_admin(
     let Some(identity) = state.admin_identity() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+
+    // Client-cert bypass, same trust model as jpps/store's
+    // require_admin_session: only trusted when a shared-secret token
+    // (proving the subject header came from this daemon's own
+    // TLS-verified mTLS handshake, not a forged loopback request) is
+    // both configured and matches, AND the presented subject is one of
+    // `admin.client_cert_subjects`. This daemon has no per-account
+    // mapping (single admin identity), so it's a plain subject
+    // allow-list rather than a subject->account lookup.
+    if let Some(expected_token) = state.client_cert_forward_token() {
+        let token_ok = req
+            .headers()
+            .get("x-rustproxy-client-cert-token")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|presented| bool::from(presented.as_bytes().ct_eq(expected_token.as_bytes())));
+        if token_ok {
+            let subject_ok = req
+                .headers()
+                .get("x-client-cert-subject")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|subject| state.admin().client_cert_subjects.iter().any(|s| s == subject));
+            if subject_ok {
+                let mut resp = next.run(req).await;
+                resp.extensions_mut().insert(AuthenticatedVia("client_cert"));
+                return resp;
+            }
+        }
+    }
+
     let session_ok = cookies
         .get(auth::SESSION_COOKIE)
         .map(|c| c.value().to_string())
@@ -1847,6 +1877,7 @@ mod tests {
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
                 db_path: PathBuf::from(":memory:"),
                 log_dir: None,
+                client_cert_subjects: vec![],
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -1885,6 +1916,7 @@ mod tests {
                 admin_password_hash: None,
                 db_path: PathBuf::from(":memory:"),
                 log_dir: None,
+                client_cert_subjects: vec![],
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -1928,6 +1960,7 @@ mod tests {
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
                 db_path: PathBuf::from(":memory:"),
                 log_dir: None,
+                client_cert_subjects: vec![],
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -1966,6 +1999,7 @@ mod tests {
                 admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
                 db_path: PathBuf::from(":memory:"),
                 log_dir: None,
+                client_cert_subjects: vec![],
             },
             acme: AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),
@@ -2073,6 +2107,130 @@ mod tests {
         assert_eq!(dash_resp.status(), StatusCode::OK);
         let json = body_json(dash_resp).await;
         assert_eq!(json["host_count"], 0);
+    }
+
+    async fn test_state_with_client_cert(subjects: Vec<String>, forward_token: Option<String>) -> AppState {
+        let cfg = Config {
+            network: NetworkConfig {
+                bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
+            },
+            admin: AdminConfig {
+                bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
+                bind_port: 8080,
+                allowed_ips: vec![],
+                expose_admin_port: None,
+                session_secret: Some("test-secret-key".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
+                db_path: PathBuf::from(":memory:"),
+                log_dir: None,
+                client_cert_subjects: subjects,
+            },
+            acme: AcmeConfig {
+                directory_url: "https://example.invalid/directory".into(),
+                contact_email: "admin@example.com".into(),
+                dns_provider: crate::config::DnsProviderKind::Cloudflare,
+                dns_api_token: "token".into(),
+                cert_dir: PathBuf::from("/tmp/certs"),
+                account_key_path: PathBuf::from("/tmp/account.key"),
+                renew_before_days: 30,
+                organization: None,
+                organizational_unit: None,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+            client_cert_forward_token: forward_token,
+        };
+        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
+    }
+
+    /// The `proxy.jpps.us` self-admin bypass: a request carrying a
+    /// verified client-cert subject + matching forward token reaches
+    /// `/api/dashboard` with no session cookie or bearer token at all.
+    #[tokio::test]
+    async fn client_cert_subject_with_valid_token_authenticates_without_a_session() {
+        let state = test_state_with_client_cert(vec!["Jeff Parrish".into()], Some("shared-secret-token".into())).await;
+        let router = build_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header("x-client-cert-subject", "Jeff Parrish")
+                    .header("x-rustproxy-client-cert-token", "shared-secret-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A subject not on the allow-list must not authenticate, even with
+    /// a correctly-matching token.
+    #[tokio::test]
+    async fn client_cert_subject_not_on_the_allow_list_is_rejected() {
+        let state = test_state_with_client_cert(vec!["Jeff Parrish".into()], Some("shared-secret-token".into())).await;
+        let router = build_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header("x-client-cert-subject", "Someone Else")
+                    .header("x-rustproxy-client-cert-token", "shared-secret-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A correct subject with a wrong (or missing) token must not
+    /// authenticate -- proves a forged loopback request (real subject
+    /// name, no way to know the token) still gets rejected.
+    #[tokio::test]
+    async fn client_cert_subject_with_wrong_token_is_rejected() {
+        let state = test_state_with_client_cert(vec!["Jeff Parrish".into()], Some("shared-secret-token".into())).await;
+        let router = build_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header("x-client-cert-subject", "Jeff Parrish")
+                    .header("x-rustproxy-client-cert-token", "wrong-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// No forward token configured at all disables the bypass outright
+    /// -- even a subject that would otherwise be on the allow-list, and
+    /// a header claiming to match, must not authenticate.
+    #[tokio::test]
+    async fn client_cert_bypass_is_disabled_entirely_when_no_forward_token_is_configured() {
+        let state = test_state_with_client_cert(vec!["Jeff Parrish".into()], None).await;
+        let router = build_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard")
+                    .header("x-client-cert-subject", "Jeff Parrish")
+                    .header("x-rustproxy-client-cert-token", "anything")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     async fn logged_in_cookie(router: &Router) -> String {

@@ -128,6 +128,7 @@ mod tests {
                 admin_password_hash: None,
                 db_path: PathBuf::from(":memory:"),
                 log_dir: None,
+                client_cert_subjects: vec![],
             },
             acme: crate::config::AcmeConfig {
                 directory_url: "https://example.invalid/directory".into(),

@@ -140,6 +140,18 @@ pub struct AdminConfig {
     /// password -- generate with `rust-proxy hash-password` (see main.rs).
     #[serde(default)]
     pub admin_password_hash: Option<String>,
+    /// TrustBridge client-cert Subject CN(s) that log in as this
+    /// daemon's own admin identity -- no accounts table for the admin
+    /// UI (single-admin model), so this is just a trusted-subjects
+    /// list rather than a per-account mapping like jpps/store's. Empty
+    /// (the default) disables the bypass entirely; config.toml-only,
+    /// same as `client_cert_forward_token` below -- not settable from
+    /// the admin UI, since this is itself an authentication bypass for
+    /// that UI. Only takes effect on a host that also has
+    /// `pass_client_cert_header` enabled and is proxied back to this
+    /// daemon's own admin API (see `proxy.jpps.us`'s config).
+    #[serde(default)]
+    pub client_cert_subjects: Vec<String>,
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
     /// Where `proxy.log`/`access.log`/`server.log` are written (see

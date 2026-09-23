@@ -307,6 +307,7 @@ mod tests {
             ),
             db_path: std::path::PathBuf::from(":memory:"),
             log_dir: None,
+                client_cert_subjects: vec![],
         }
     }
 
