@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2021"
 description = "Lightweight L7 reverse proxy daemon with native ACME, dynamic nftables orchestration, and a web admin UI"
 license = "MIT"
-authors = ["Jeff Parrish PC Services <https://www.jpps.us>"]
+authors = ["Jeff Parrish PC Services LLC <https://www.jpps.us>"]
 repository = "https://gitlab.jpps.us/jpps/rust-proxy"
 
 [[bin]]
@@ -71,8 +71,8 @@ tokio-test = "0.4"
 wiremock = "0.6"
 
 [package.metadata.deb]
-maintainer = "Jeff Parrish PC Services <https://www.jpps.us>"
-copyright = "2026, Jeff Parrish PC Services"
+maintainer = "Jeff Parrish PC Services LLC <https://www.jpps.us>"
+copyright = "2026, Jeff Parrish PC Services LLC"
 section = "net"
 priority = "optional"
 extended-description = """\
