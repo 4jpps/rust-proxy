@@ -11,6 +11,56 @@ nftables firewall orchestration, arbitrary TCP/UDP port passthrough,
 and a small embedded web admin UI. Runs on anything from a single
 dedicated IP to a full subnet block -- see Configuration below.
 
+**On this page**
+
+- [Quick start](#quick-start)
+- [Building and testing](#building-and-testing)
+- [Configuration](#configuration)
+- [DNS providers](#dns-providers)
+- [Firewall](#firewall)
+- [Logging](#logging)
+- [API](#api)
+- [Architecture](#architecture)
+- [Deployment](#deployment)
+- [Installing the .deb](#installing-the-deb)
+- [Support](#support)
+- [Status](#status)
+- [License](#license)
+
+> **Lock down the admin port.** On a fresh install the admin UI listens on
+> `0.0.0.0:8084`, and the firewall leaves that port open to any source, so
+> the setup wizard works with no config edits. Until you have created the
+> admin account, anyone who can reach the port can claim it. Set
+> `admin.allowed_ips` in `/etc/rust-proxy/config.toml` to your management
+> network as soon as you know it, or turn off "Expose the admin port via
+> the firewall" in the admin UI and reach it through an SSH tunnel.
+
+## Quick start
+
+1. **Install the .deb** from the signed JPPS apt repo (full commands under
+   [Installing the .deb](#installing-the-deb)):
+
+   ```sh
+   sudo apt update
+   sudo apt install rust-proxy
+   ```
+
+2. **Start the service.** The package starts it for you. Check with
+   `systemctl status rust-proxy`; if it isn't running,
+   `sudo systemctl enable --now rust-proxy`.
+3. **Open the admin UI** at `http://<this-host's-ip>:8084/`. The first-launch
+   wizard asks you to create the admin account.
+4. **Add a DNS credential** (skip this if you will use http-01, which needs
+   no DNS credentials). The wizard offers it as an optional step. You can
+   also add one later under "DNS credentials" in the admin UI. See
+   [DNS providers](#dns-providers) for what each provider needs.
+5. **Create a host.** On the Hosts tab, under "Add a host", enter the
+   domain (for example `app.example.com`), the upstream as `host:port`
+   (for example `127.0.0.1:8000`), and leave "Issue/renew a certificate
+   automatically" checked. Pick a challenge type and, for dns-01, the
+   credential from step 4, then click "Add host". The certificate is
+   requested and renewed for you.
+
 ## Building and testing
 
 ```sh
@@ -28,10 +78,10 @@ persistence tests run against an in-memory sqlite database.
 configured path automatically if nothing exists there yet (see
 `config::DEFAULT_CONFIG_TOML`) -- there's genuinely no config file
 dependency, even outside the `.deb`'s `postinst` step (`cargo run`, a
-manually-copied binary, a container with no provisioning step of its
-own all just work). Its `[admin]`/`[acme]` sections are safe to run
-as-is (admin UI on `0.0.0.0:8084`, reachable from the network out of
-the box; no admin account or DNS credential set), since the admin
+manually-copied binary with no provisioning step of its own all just
+work). Its `[admin]`/`[acme]` sections are safe to run
+as-is (admin UI on `0.0.0.0:8084`, see the warning at the top; no admin
+account or DNS credential set), since the admin
 identity and any number of named DNS-01 credentials are normally
 created and managed from the admin UI (or the first-launch setup
 wizard it serves when unconfigured) and stored in sqlite, not
@@ -39,12 +89,9 @@ wizard it serves when unconfigured) and stored in sqlite, not
 host with `acme_enabled` and a dns-01 challenge type picks a named
 credential via `dns_credential_id` (falls back to the sole configured
 credential if there's exactly one and the host doesn't set it
-explicitly). Supported providers: `cloudflare`, `digitalocean`,
-`hetzner`, `duckdns`, `godaddy`, `namecheap`, and `route53` -- see the
-"DNS credentials" section of the admin UI for what each provider's
-credential string needs (most are a single bearer/header API token;
-Namecheap and Route53 pack multiple colon-delimited fields into that
-same string, documented there). Adding another provider means one new
+explicitly). Supported providers (see [DNS providers](#dns-providers)
+for what each needs): `cloudflare`, `digitalocean`, `hetzner`, `duckdns`,
+`godaddy`, `namecheap`, and `route53`. Adding another provider means one new
 file under `src/acme/dns01/` implementing the `DnsProvider` trait
 (`find_zone`/`create_txt_record`/`delete_txt_record`) plus a new
 `DnsProviderKind` variant -- PRs for more providers welcome.
@@ -160,6 +207,24 @@ Redirection Hosts, a redirect host still gets its own ACME cert and its
 own ACL selection -- domain matching, TLS, and access control are
 identical to a proxy host, only the final response differs.
 
+### DNS providers
+
+Pick the provider when you add a credential in the admin UI. The UI shows
+one box per field below and packs them into the single credential string
+the backend stores. If you set a credential in `config.toml` instead
+(`acme.dns_provider` / `acme.dns_api_token`), Namecheap and Route53 take
+their fields joined with colons in the order shown.
+
+| Provider | `dns_provider` | What you enter |
+|----------|----------------|----------------|
+| Cloudflare | `cloudflare` | One API token with Zone:DNS:Edit on the zone (sent as a Bearer token). |
+| DigitalOcean | `digitalocean` | One personal access token with write scope (Bearer token). |
+| Hetzner | `hetzner` | One token from the Hetzner DNS Console (sent in the `Auth-API-Token` header). |
+| DuckDNS | `duckdns` | One token from your DuckDNS account page. The domain must be a DuckDNS subdomain. |
+| GoDaddy | `godaddy` | One Personal Access Token, sent as a Bearer token. The older `sso-key` key and secret scheme is not supported. |
+| Namecheap | `namecheap` | Three fields: API user, API key, and the client IP you have allowlisted in Namecheap's API settings. Stored as `user:key:clientip`. |
+| Route53 (AWS) | `route53` | Two fields: access key ID and secret access key. Stored as `access_key_id:secret_access_key`, signed for us-east-1. |
+
 ### Firewall
 
 `nftables::generator` builds a default-DROP `inet` table from scratch
@@ -177,20 +242,16 @@ regardless of what's configured (or not configured) yet:
   carve-outs on top of these, but a host that hasn't been created (or
   fully configured) yet must not leave 80/443 unreachable network-wide.
 - **The admin port** (`admin.bind_port`, 8084 by default) -- open to
-  any source until `admin.allowed_ips` is set, matching
-  `admin.bind_ip`'s own 0.0.0.0 default: the first-launch setup wizard
-  needs to be reachable from the network with zero config.toml edits.
-  Set `admin.allowed_ips` once you know your real management
-  network/IP to narrow this down at the firewall layer, not just the
-  application layer.
+  any source until `admin.allowed_ips` is set (see the warning at the
+  top).
 
 `nft` itself is validated once at startup (`nftables::validate_environment`)
 -- a missing/broken `nft` binary logs one clear, actionable error
 immediately rather than only showing up buried in repeating `nftables
 sync failed` lines. This is deliberately non-fatal: proxying/ACME/the
 admin API all work regardless of whether the firewall layer is healthy,
-so a missing `nft` (e.g. a container relying on an external firewall
-instead of `CAP_NET_ADMIN`) logs loudly but doesn't crash startup.
+so a missing `nft` (e.g. a host whose firewall is managed elsewhere
+instead of via `CAP_NET_ADMIN`) logs loudly but doesn't crash startup.
 
 A host doesn't have to use ACME at all -- set `acme_enabled = false` and
 upload a cert manually via `POST /api/certs` (an internal CA's cert, a
@@ -400,9 +461,7 @@ README for the full setup, including how to add both the `stable` and
 
 `postinst` creates the `rust-proxy` system user, installs a working
 default `/etc/rust-proxy/config.toml` on first install (admin UI on
-`0.0.0.0:8084` -- reachable from the network out of the box, not just
-loopback; see [Configuration](#configuration) below for the firewall
-side of that -- no admin account or DNS credential yet), and starts the
+`0.0.0.0:8084`, see the warning at the top -- no admin account or DNS credential yet), and starts the
 service. Visit the admin UI once (`http://<this-host's-ip>:8084/`, or
 wherever you've pointed `admin.bind_ip`/`admin.bind_port` after editing
 the config) to finish setup -- it walks you through creating the admin account and,
@@ -431,6 +490,17 @@ sudo install -m 644 deploy/rust-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rust-proxy
 ```
+
+## Support
+
+- **Bugs and questions:** open an issue at
+  [gitlab.jpps.us/jpps/rust-proxy/-/issues](https://gitlab.jpps.us/jpps/rust-proxy/-/issues).
+- **Chip in:** rust-proxy is free and MIT licensed. If it saves you time,
+  you can [buy me a coffee](https://buymeacoffee.com/kb9gxk).
+- **No Docker:** rust-proxy is not distributed as a Docker image, and
+  Docker support is not planned. It manages the host's nftables rules
+  (`CAP_NET_ADMIN`) and is built to run as a normal systemd service,
+  installed from the `.deb`.
 
 ## Status
 
