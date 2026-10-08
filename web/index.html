@@ -160,7 +160,7 @@
         <div class="field-grid">
           <label><span>Challenge type</span>
             <select name="acme_challenge_type" title="ACME challenge type">
-              <option value="auto" selected>auto (http-01 if HTTPS redirect is on, else dns-01)</option>
+              <option value="auto" selected>auto (dns-01, falls back to http-01 if that fails)</option>
               <option value="http01">http-01 -- needs port 80 reachable, no DNS credentials</option>
               <option value="dns01">dns-01 -- needs a configured DNS credential below</option>
             </select>

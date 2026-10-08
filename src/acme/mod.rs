@@ -97,10 +97,11 @@ pub fn resolve_challenge_type(host: &ProxyHost) -> ChallengeMethod {
         // authorization failed outright, fast, with nothing on this
         // end to show why). dns-01 only depends on a working DNS
         // provider credential, already required for any wildcard host
-        // anyway. Auto now always prefers dns-01; explicit `http01`
-        // remains available for anyone who genuinely wants it (no DNS
-        // provider credentials needed at all, at the cost of requiring
-        // port 80 to actually be reachable).
+        // anyway. Auto prefers dns-01 and `issue_certificate` falls back
+        // to http-01 if that fails (`http01_fallback_allowed`); explicit
+        // `http01` remains available for anyone who genuinely wants it
+        // (no DNS provider credentials needed at all, at the cost of
+        // requiring port 80 to actually be reachable).
         AcmeChallengeType::Auto => ChallengeMethod::Dns01,
     }
 }
@@ -110,7 +111,19 @@ pub fn resolve_challenge_type(host: &ProxyHost) -> ChallengeMethod {
 /// host -- independent of `force_https`, which already opens port 80 for
 /// its own, unrelated reason (the redirect).
 pub fn opens_port_80_for_acme(host: &ProxyHost) -> bool {
-    host.acme_enabled && resolve_challenge_type(host) == ChallengeMethod::Http01
+    host.acme_enabled
+        && (resolve_challenge_type(host) == ChallengeMethod::Http01
+            || http01_fallback_allowed(host))
+}
+
+/// `auto` tries dns-01 first and, if that issuance attempt fails for any
+/// reason (no usable DNS credential, provider error, validation failure),
+/// retries once with http-01. Never for a wildcard (CAs refuse http-01 for
+/// one) and never for an explicit `dns01`/`http01` choice.
+pub fn http01_fallback_allowed(host: &ProxyHost) -> bool {
+    host.acme_enabled
+        && host.acme_challenge_type == AcmeChallengeType::Auto
+        && !crate::config::is_wildcard_domain(&host.domain)
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -170,12 +183,33 @@ pub async fn issue_certificate(
     http: &reqwest::Client,
     host: &ProxyHost,
 ) -> Result<(), IssuanceError> {
+    let method = resolve_challenge_type(host);
+    match issue_certificate_with(state, client, http, host, method).await {
+        Err(e) if method == ChallengeMethod::Dns01 && http01_fallback_allowed(host) => {
+            tracing::warn!(
+                domain = %host.domain,
+                error = %e,
+                "dns-01 issuance failed, falling back to http-01"
+            );
+            issue_certificate_with(state, client, http, host, ChallengeMethod::Http01).await
+        }
+        result => result,
+    }
+}
+
+async fn issue_certificate_with(
+    state: &AppState,
+    client: &AcmeClient,
+    http: &reqwest::Client,
+    host: &ProxyHost,
+    method: ChallengeMethod,
+) -> Result<(), IssuanceError> {
     let domain = &host.domain;
     let domains = domains_for_issuance(domain);
     let (order_url, order, authzs) = create_order_and_authzs(client, &domains).await?;
     let identity = csr_identity(state);
 
-    let issued = match resolve_challenge_type(host) {
+    let issued = match method {
         ChallengeMethod::Dns01 => {
             let credential =
                 resolve_dns_credential(state.db(), domain, host.dns_credential_id).await?;
@@ -799,8 +833,38 @@ mod tests {
             false,
             AcmeChallengeType::Dns01
         )));
-        assert!(!opens_port_80_for_acme(&host(
+        // Auto falls back to http-01 if dns-01 fails, so it needs port 80 too.
+        assert!(opens_port_80_for_acme(&host(
             "example.com",
+            false,
+            AcmeChallengeType::Auto
+        )));
+        assert!(!opens_port_80_for_acme(&host(
+            "*.example.com",
+            false,
+            AcmeChallengeType::Auto
+        )));
+    }
+
+    #[test]
+    fn http01_fallback_only_applies_to_auto_non_wildcard_hosts() {
+        assert!(http01_fallback_allowed(&host(
+            "example.com",
+            false,
+            AcmeChallengeType::Auto
+        )));
+        assert!(!http01_fallback_allowed(&host(
+            "example.com",
+            false,
+            AcmeChallengeType::Dns01
+        )));
+        assert!(!http01_fallback_allowed(&host(
+            "example.com",
+            false,
+            AcmeChallengeType::Http01
+        )));
+        assert!(!http01_fallback_allowed(&host(
+            "*.example.com",
             false,
             AcmeChallengeType::Auto
         )));

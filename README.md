@@ -130,15 +130,17 @@ backend needs to see its own `host:port` instead of the public-facing
 domain this proxy answers for.
 
 Each host picks its own ACME challenge type via `acme_challenge_type`:
-`auto` (the default) always prefers dns-01 -- it only depends on a
+`auto` (the default) tries dns-01 first -- it only depends on a
 working DNS provider credential, not on this daemon's own port 80
 actually being publicly reachable for the exact domain (NAT, a
 firewall, or the domain's own DNS not routing here yet can all silently
-break http-01 in ways invisible from this end); `http01` and `dns01`
-force one or the other explicitly. A wildcard domain
+break http-01 in ways invisible from this end) -- and if that fails for
+any reason, retries once with http-01, so port 80 is kept open for
+`auto` hosts; `http01` and `dns01` force one or the other explicitly
+(no fallback). A wildcard domain
 (`*.example.com`) always uses dns-01 regardless of this setting -- CAs
 never offer http-01 for a wildcard identifier. Choosing `http01`
-without `force_https` still opens a port-80 listener/firewall rule for
+(or leaving `auto`) without `force_https` still opens a port-80 listener/firewall rule for
 that host, just to answer the challenge. A wildcard's own bare apex
 (`example.com`) is automatically requested as a second SAN in the same
 certificate -- a wildcard alone never covers its own apex (standard

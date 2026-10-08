@@ -307,7 +307,7 @@ mod tests {
             ),
             db_path: std::path::PathBuf::from(":memory:"),
             log_dir: None,
-                client_cert_subjects: vec![],
+            client_cert_subjects: vec![],
         }
     }
 
@@ -444,7 +444,8 @@ mod tests {
 
     #[test]
     fn host_without_force_https_does_not_open_port_80() {
-        let h = host("example.com", "10.0.0.2", 443, false);
+        let mut h = host("example.com", "10.0.0.2", 443, false);
+        h.acme_challenge_type = crate::config::AcmeChallengeType::Dns01;
         let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new());
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(!out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));

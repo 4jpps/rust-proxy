@@ -222,10 +222,9 @@ mod tests {
 
     #[test]
     fn redirect_listener_keys_only_include_force_https_hosts() {
-        let hosts = vec![
-            host("a.example.com", "10.0.0.2", 443, true, true),
-            host("b.example.com", "10.0.0.3", 443, false, true),
-        ];
+        let mut b = host("b.example.com", "10.0.0.3", 443, false, true);
+        b.acme_challenge_type = crate::config::AcmeChallengeType::Dns01;
+        let hosts = vec![host("a.example.com", "10.0.0.2", 443, true, true), b];
         let keys = redirect_listener_keys(&hosts);
         assert_eq!(keys, vec![("10.0.0.2".parse().unwrap(), 80)]);
     }
