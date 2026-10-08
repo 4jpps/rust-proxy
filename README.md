@@ -434,11 +434,7 @@ sudo systemctl enable --now rust-proxy
 
 ## Status
 
-Scaffolded per the initial spec's implementation checklist; TLS
-listener behavior end-to-end (real handshake, SNI dispatch, a real
-Let's Encrypt issuance against a live DNS provider) has not been
-verified against a real deployment yet -- only unit/mock/loopback-
-integration tested. See git log for what's been built in what order.
+In production use: rust-proxy fronts all of JPPS's public `*.jpps.us` sites, handling TLS termination, SNI dispatch, Let's Encrypt issuance over DNS-01 and dynamic firewalling. It is still pre-1.0, so expect configuration and API details to change between releases; see `CHANGELOG.md` for what has changed.
 
 ## License
 
