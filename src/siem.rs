@@ -503,7 +503,9 @@ fn cef_key(key: &str) -> &str {
         "method" => "requestMethod",
         "path" => "request",
         "user" => "suser",
-        "status" => "outcome",
+        "status" | "http_status" => "outcome",
+        "user_agent" => "requestClientApplication",
+        "bytes" => "out",
         other => other,
     }
 }

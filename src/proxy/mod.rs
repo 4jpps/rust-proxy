@@ -397,6 +397,13 @@ async fn handle_https_request(
         })
         .or_else(|| sni.clone())
         .unwrap_or_else(|| "-".into());
+    let query_present = if req.uri().query().is_some() { "1" } else { "0" };
+    let user_agent: String = req
+        .headers()
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(200).collect())
+        .unwrap_or_else(|| "-".into());
     let start = std::time::Instant::now();
     let result = route_https_request(
         state,
@@ -409,6 +416,12 @@ async fn handle_https_request(
     )
     .await;
     if let Ok(resp) = &result {
+        let bytes = resp
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
         let status = resp.status().as_u16().to_string();
         let elapsed = start.elapsed().as_millis().to_string();
         let client_ip = peer_ip.to_string();
@@ -422,8 +435,11 @@ async fn handle_https_request(
                 ("domain", domain.as_str()),
                 ("method", method.as_str()),
                 ("path", path.as_str()),
-                ("status", status.as_str()),
+                ("http_status", status.as_str()),
                 ("elapsed_ms", elapsed.as_str()),
+                ("user_agent", user_agent.as_str()),
+                ("bytes", bytes.as_str()),
+                ("has_query", query_present),
             ],
         );
     }

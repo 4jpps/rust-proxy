@@ -322,7 +322,8 @@ Event categories and what they emit:
 
 Every event carries `event`, `category`, `severity` and `message` plus
 event-specific fields (`client_ip`, `domain`, `method`, `path`,
-`status`, ...). Query strings are never logged, any field whose name
+`http_status`, ...; `access` events also carry `user_agent`, `bytes` and
+`has_query`). Query strings are never logged, any field whose name
 suggests a secret (password, token, cookie, authorization, ...) is
 replaced with `[redacted]`, passwords and tokens are never read into
 events, control characters are stripped so a request cannot forge extra
@@ -344,8 +345,11 @@ be lost before the reconnect.
 add a `<remote>` with `<connection>syslog</connection>`, the chosen port
 and `<allowed-ips>` set to the proxy's address, and install
 `deploy/wazuh/rustproxy_decoders.xml` and `rustproxy_rules.xml`
-(rule IDs 100300-100399, including brute-force and repeated-denial
-frequency rules) into `/var/ossec/etc/decoders` and `/rules`.
+(rule IDs 100300-100399: brute-force, repeated-denial, scanner/probe,
+exploit-path, 5xx-burst, unknown-host and request-rate rules with MITRE
+mappings; normal `access` traffic stays at level 2 so it is archived
+but not alerted; edit the hostname suffix list in rule 100371 to match
+your own domains; `install-retention.sh` adds an optional log-retention cron) into `/var/ossec/etc/decoders` and `/rules`.
 
 ## API
 

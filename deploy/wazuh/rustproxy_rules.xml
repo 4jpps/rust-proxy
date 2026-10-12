@@ -29,6 +29,9 @@
     <field name="event">^admin_auth_failure$</field>
     <description>rust-proxy: admin API authentication failure.</description>
     <group>authentication_failed,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
   <rule id="100311" level="10" frequency="5" timeframe="120">
@@ -36,6 +39,9 @@
     <same_field>client_ip</same_field>
     <description>rust-proxy: multiple admin API authentication failures from the same source.</description>
     <group>authentication_failures,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
   <rule id="100312" level="3">
@@ -50,6 +56,9 @@
     <field name="event">^admin_change$</field>
     <description>rust-proxy: admin API configuration change.</description>
     <group>configuration_change,</group>
+    <mitre>
+      <id>T1565</id>
+    </mitre>
   </rule>
 
   <rule id="100314" level="7">
@@ -72,6 +81,9 @@
     <field name="event">^host_login_failure$</field>
     <description>rust-proxy: protected-site login failed.</description>
     <group>authentication_failed,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
   <rule id="100322" level="10" frequency="5" timeframe="120">
@@ -79,6 +91,9 @@
     <same_field>client_ip</same_field>
     <description>rust-proxy: multiple protected-site login failures from the same source.</description>
     <group>authentication_failures,</group>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
   </rule>
 
   <!-- Access control -->
@@ -94,6 +109,9 @@
     <same_field>client_ip</same_field>
     <description>rust-proxy: repeated IP access-list denials from the same source.</description>
     <group>access_denied,</group>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
   </rule>
 
   <!-- Certificates -->
@@ -107,5 +125,127 @@
     <if_sid>100300</if_sid>
     <field name="event">^cert_issue_failed$</field>
     <description>rust-proxy: certificate issuance or renewal failed.</description>
+  </rule>
+  <!--
+    Access (HTTPS request) events. Enable the "access" category on rust-proxy.
+    Normal traffic stays below the alert threshold (level 2), so it is kept in the
+    archives (searchable as wazuh-archives-*) but does not become an alert.
+    Event fields: client_ip, domain, method, path, http_status, elapsed_ms,
+    user_agent, bytes, has_query.
+  -->
+  <rule id="100350" level="2">
+    <if_sid>100303</if_sid>
+    <field name="http_status">^4\d\d$</field>
+    <description>rust-proxy: client error response (4xx).</description>
+  </rule>
+
+  <rule id="100351" level="8" frequency="15" timeframe="60" ignore="300">
+    <if_matched_sid>100350</if_matched_sid>
+    <same_field>client_ip</same_field>
+    <description>rust-proxy: many 4xx responses to one client (scanning or probing).</description>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+    <group>web_scan,</group>
+  </rule>
+
+  <rule id="100352" level="6">
+    <if_sid>100303</if_sid>
+    <field name="path" type="pcre2">(?i)(/\.env|/\.git(/|$)|/\.aws|/\.ssh|/\.svn|/\.DS_Store|wp-login|wp-admin|wp-content|xmlrpc\.php|phpmyadmin|/pma/|/cgi-bin/|/vendor/phpunit|/actuator|/etc/passwd|/boot\.ini|/\.htpasswd|/server-status|/solr/|/manager/html|/console/|/HNAP1|/owa/auth|/remote/login)</field>
+    <description>rust-proxy: request for a commonly probed or sensitive path.</description>
+    <mitre>
+      <id>T1595.002</id>
+    </mitre>
+    <group>web_scan,attack,</group>
+  </rule>
+
+  <rule id="100353" level="10">
+    <if_sid>100352</if_sid>
+    <field name="http_status">^2\d\d$</field>
+    <description>rust-proxy: commonly probed or sensitive path returned success (possible exposure).</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>web_scan,attack,</group>
+  </rule>
+
+  <rule id="100354" level="7">
+    <if_sid>100303</if_sid>
+    <field name="path" type="pcre2">(?i)(\.\.(/|%2f|%5c)|%2e%2e|%252e|etc/passwd|&lt;script|%3cscript|union(%20|\+|\s)+select|\$\{jndi|/bin/(ba)?sh|cmd\.exe|\bphp://|\bdata://)</field>
+    <description>rust-proxy: request path contains a traversal or injection pattern.</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>web_attack,attack,</group>
+  </rule>
+
+  <rule id="100355" level="10" frequency="5" timeframe="120" ignore="300">
+    <if_matched_group>attack</if_matched_group>
+    <same_field>client_ip</same_field>
+    <description>rust-proxy: repeated exploit probes from the same client.</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>web_attack,</group>
+  </rule>
+
+  <rule id="100360" level="3">
+    <if_sid>100303</if_sid>
+    <field name="http_status">^5\d\d$</field>
+    <description>rust-proxy: server error response (5xx).</description>
+  </rule>
+
+  <rule id="100361" level="8" frequency="10" timeframe="60" ignore="300">
+    <if_matched_sid>100360</if_matched_sid>
+    <same_field>domain</same_field>
+    <description>rust-proxy: burst of 5xx responses for one site (upstream failing?).</description>
+    <group>availability,</group>
+  </rule>
+
+  <rule id="100365" level="4">
+    <if_sid>100303</if_sid>
+    <field name="http_status">^401$</field>
+    <description>rust-proxy: unauthorized response (401).</description>
+    <group>authentication_failed,</group>
+  </rule>
+
+  <rule id="100366" level="9" frequency="10" timeframe="120" ignore="300">
+    <if_matched_sid>100365</if_matched_sid>
+    <same_field>client_ip</same_field>
+    <description>rust-proxy: repeated 401 responses to one client (possible password guessing).</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+    <group>authentication_failures,</group>
+  </rule>
+
+  <!-- Request addressed to a raw IP or a name this proxy does not serve. Keep the suffix list in step with the proxy's hosts. -->
+  <rule id="100370" level="5">
+    <if_sid>100303</if_sid>
+    <field name="domain" type="pcre2">^\d{1,3}(\.\d{1,3}){3}(:\d+)?$</field>
+    <description>rust-proxy: request addressed to a raw IP address instead of a hostname.</description>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+    <group>web_scan,</group>
+  </rule>
+
+  <rule id="100371" level="4">
+    <if_sid>100303</if_sid>
+    <field name="domain" negate="yes" type="pcre2">(?i)(^|\.)(jpps\.us|kb9gxk\.net|omnibridgevid\.cc|mycloudhost\.work|us\.to)(:\d+)?$|^\d{1,3}(\.\d{1,3}){3}(:\d+)?$|^-$</field>
+    <description>rust-proxy: request for a hostname this proxy does not serve.</description>
+    <group>web_scan,</group>
+  </rule>
+
+  <!-- A single external client sending a very high request rate. Private ranges (runners, internal services) are excluded. -->
+  <rule id="100375" level="6" frequency="300" timeframe="60" ignore="300">
+    <if_matched_sid>100303</if_matched_sid>
+    <same_field>client_ip</same_field>
+    <field name="client_ip" negate="yes" type="pcre2">^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.)</field>
+    <description>rust-proxy: very high request rate from one external client.</description>
+    <mitre>
+      <id>T1498</id>
+    </mitre>
+    <group>web_dos,</group>
   </rule>
 </group>
