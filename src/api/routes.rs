@@ -91,6 +91,11 @@ pub fn build_router(state: AppState) -> Router {
             "/api/firewall-settings",
             get(get_firewall_settings).put(update_firewall_settings),
         )
+        .route(
+            "/api/siem",
+            get(get_siem_settings).put(update_siem_settings),
+        )
+        .route("/api/siem/test", post(send_siem_test))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -131,6 +136,7 @@ struct AuthenticatedVia(&'static str);
 async fn access_log(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let client_ip = admin_client_ip(&req);
     let start = std::time::Instant::now();
     let resp = next.run(req).await;
     let auth = resp
@@ -138,16 +144,100 @@ async fn access_log(req: Request, next: Next) -> Response {
         .get::<AuthenticatedVia>()
         .map(|a| a.0)
         .unwrap_or("unauthenticated");
+    let status = resp.status().as_u16();
     tracing::info!(
         target: "rust_proxy::access",
         %method,
         path,
-        status = resp.status().as_u16(),
+        status,
         elapsed_ms = start.elapsed().as_millis() as u64,
         auth,
         "admin api request"
     );
+    siem_admin_event(&method, &path, status, auth, client_ip.as_deref());
     resp
+}
+
+/// The peer address of an admin API request. When the peer is loopback
+/// the request came through this daemon's own proxy listener, which
+/// appends the real client to `X-Forwarded-For` -- the last entry is the
+/// one the proxy itself observed, so it is the trustworthy one.
+fn admin_client_ip(req: &Request) -> Option<String> {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()?
+        .0
+        .ip();
+    if peer.is_loopback() {
+        if let Some(last) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .map(str::trim)
+            .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
+        {
+            return Some(last.to_string());
+        }
+    }
+    Some(peer.to_string())
+}
+
+/// Forwards the security-relevant slice of admin API traffic: failed
+/// authentication (any 401, including a bad `/api/login`), successful
+/// logins, and every state-changing request. Authenticated reads are
+/// skipped -- the web UI polls constantly and they carry no signal.
+fn siem_admin_event(
+    method: &axum::http::Method,
+    path: &str,
+    status: u16,
+    auth: &str,
+    client_ip: Option<&str>,
+) {
+    use crate::siem::{emit, wants, Category, Severity};
+    if !wants(Category::Admin) {
+        return;
+    }
+    let status_s = status.to_string();
+    let mut fields = vec![
+        ("method", method.as_str()),
+        ("path", path),
+        ("status", status_s.as_str()),
+        ("auth", auth),
+    ];
+    if let Some(ip) = client_ip {
+        fields.push(("client_ip", ip));
+    }
+    if status == 401 {
+        emit(
+            Category::Admin,
+            Severity::Warning,
+            "admin_auth_failure",
+            "admin API authentication failed",
+            &fields,
+        );
+    } else if path == "/api/login" && method == axum::http::Method::POST && status == 200 {
+        emit(
+            Category::Admin,
+            Severity::Notice,
+            "admin_login",
+            "admin login succeeded",
+            &fields,
+        );
+    } else if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        let sev = if status >= 400 {
+            Severity::Warning
+        } else {
+            Severity::Notice
+        };
+        emit(
+            Category::Admin,
+            sev,
+            "admin_change",
+            "admin API state-changing request",
+            &fields,
+        );
+    }
 }
 
 async fn admin_ui() -> Response {
@@ -507,6 +597,70 @@ async fn update_firewall_settings(
         expose_admin_port: body.expose_admin_port,
         from_config: false,
     }))
+}
+
+#[derive(Serialize)]
+struct SiemSettingsResponse {
+    #[serde(flatten)]
+    config: crate::config::SiemConfig,
+    /// True when config.toml has a `[siem]` section: it always takes
+    /// precedence, so the UI shows it read-only.
+    from_config: bool,
+    stats: crate::siem::Stats,
+}
+
+fn siem_response(
+    state: &AppState,
+    stored: Option<crate::config::SiemConfig>,
+) -> SiemSettingsResponse {
+    let from_config = state.siem_config().is_some();
+    let config = state.siem_config().cloned().or(stored).unwrap_or_default();
+    SiemSettingsResponse {
+        config,
+        from_config,
+        stats: crate::siem::stats(),
+    }
+}
+
+async fn get_siem_settings(
+    State(state): State<AppState>,
+) -> Result<Json<SiemSettingsResponse>, ApiError> {
+    let stored = if state.siem_config().is_some() {
+        None
+    } else {
+        crate::db::load_siem_settings(state.db()).await?
+    };
+    Ok(Json(siem_response(&state, stored)))
+}
+
+/// Replaces the whole SIEM forwarding config and applies it immediately.
+/// Rejected when config.toml has a `[siem]` section (it always wins).
+async fn update_siem_settings(
+    State(state): State<AppState>,
+    Json(body): Json<crate::config::SiemConfig>,
+) -> Result<Json<SiemSettingsResponse>, ApiError> {
+    if state.siem_config().is_some() {
+        return Err(ApiError::Conflict(
+            "[siem] is set in config.toml, which always takes precedence -- edit it there instead"
+                .into(),
+        ));
+    }
+    crate::siem::apply(&body).map_err(ApiError::BadRequest)?;
+    crate::db::set_siem_settings(state.db(), &body).await?;
+    Ok(Json(siem_response(&state, Some(body))))
+}
+
+#[derive(Serialize)]
+struct SiemTestResponse {
+    queued: bool,
+}
+
+/// Queues one clearly-labelled test event, so an operator can confirm the
+/// collector sees it. `queued: false` means forwarding is off.
+async fn send_siem_test() -> Json<SiemTestResponse> {
+    Json(SiemTestResponse {
+        queued: crate::siem::emit_test("rust-proxy SIEM test event"),
+    })
 }
 
 /// 32 bytes of real randomness, hex-encoded -- same strength as the
@@ -1894,6 +2048,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
@@ -1934,6 +2089,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         };
         cfg.validate()
             .expect("valid: all three identity fields omitted together");
@@ -1979,6 +2135,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
@@ -2019,6 +2176,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
@@ -2146,6 +2304,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: forward_token,
+            siem: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
@@ -4512,6 +4671,164 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn test_state_with_siem(siem: Option<crate::config::SiemConfig>) -> AppState {
+        let cfg = Config {
+            network: NetworkConfig {
+                bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
+                dedicated_ips: vec![],
+            },
+            admin: AdminConfig {
+                bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
+                bind_ip_v6: None,
+                bind_port: 8080,
+                allowed_ips: vec![],
+                expose_admin_port: None,
+                session_secret: Some("test-secret-key".into()),
+                admin_username: Some("admin".into()),
+                admin_password_hash: Some(auth::hash_password("correct-password").unwrap()),
+                db_path: PathBuf::from(":memory:"),
+                log_dir: None,
+                client_cert_subjects: vec![],
+            },
+            acme: AcmeConfig {
+                directory_url: "https://example.invalid/directory".into(),
+                contact_email: "admin@example.com".into(),
+                dns_provider: crate::config::DnsProviderKind::Cloudflare,
+                dns_api_token: "token".into(),
+                cert_dir: PathBuf::from("/tmp/certs"),
+                account_key_path: PathBuf::from("/tmp/account.key"),
+                renew_before_days: 30,
+                organization: None,
+                organizational_unit: None,
+            },
+            hosts: vec![],
+            port_rules: vec![],
+            client_cert_forward_token: None,
+            siem,
+        };
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
+        AppState::new(cfg, pool, vec![], vec![], None, None, None)
+    }
+
+    async fn siem_call(
+        router: &Router,
+        cookie: &str,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn siem_settings_default_to_off_then_persist_and_apply() {
+        let state = test_state_with_siem(None).await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+
+        let (st, v) = siem_call(&router, &cookie, "GET", "/api/siem", "").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["from_config"], false);
+        assert_eq!(v["port"], 514);
+
+        let enabled = r#"{"enabled":true,"host":"127.0.0.1","port":9,"protocol":"udp","categories":["denied","admin"]}"#;
+        let (st, v) = siem_call(&router, &cookie, "PUT", "/api/siem", enabled).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["stats"]["active"], true);
+        let stored = crate::db::load_siem_settings(state.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.enabled && stored.host == "127.0.0.1");
+
+        let (st, v) = siem_call(&router, &cookie, "POST", "/api/siem/test", "").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["queued"], true);
+
+        let (st, _) = siem_call(&router, &cookie, "PUT", "/api/siem", r#"{"enabled":false}"#).await;
+        assert_eq!(st, StatusCode::OK);
+        let (_, v) = siem_call(&router, &cookie, "POST", "/api/siem/test", "").await;
+        assert_eq!(
+            v["queued"], false,
+            "disabling must stop forwarding immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn siem_settings_reject_invalid_input_and_config_toml_overrides() {
+        let router = build_router(test_state_with_siem(None).await);
+        let cookie = logged_in_cookie(&router).await;
+        for bad in [
+            r#"{"enabled":true,"host":""}"#,
+            r#"{"enabled":false,"facility":"nonsense"}"#,
+            r#"{"enabled":false,"categories":["bogus"]}"#,
+            r#"{"enabled":true,"host":"h","protocol":"tls","tls_ca_file":"/nonexistent/ca.pem"}"#,
+        ] {
+            let (st, _) = siem_call(&router, &cookie, "PUT", "/api/siem", bad).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}");
+        }
+
+        let from_cfg = crate::config::SiemConfig {
+            enabled: false,
+            host: "cfg.example".into(),
+            ..Default::default()
+        };
+        let router = build_router(test_state_with_siem(Some(from_cfg)).await);
+        let cookie = logged_in_cookie(&router).await;
+        let (_, v) = siem_call(&router, &cookie, "GET", "/api/siem", "").await;
+        assert_eq!(v["from_config"], true);
+        assert_eq!(v["host"], "cfg.example");
+        let (st, _) = siem_call(&router, &cookie, "PUT", "/api/siem", r#"{"enabled":false}"#).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn siem_endpoints_require_authentication() {
+        let router = build_router(test_state().await);
+        for (m, u) in [
+            ("GET", "/api/siem"),
+            ("PUT", "/api/siem"),
+            ("POST", "/api/siem/test"),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(m)
+                        .uri(u)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{m} {u}");
+        }
     }
 
     #[tokio::test]

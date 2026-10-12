@@ -47,6 +47,214 @@ pub struct Config {
     /// half-configured into looking safe when it isn't.
     #[serde(default)]
     pub client_cert_forward_token: Option<String>,
+    /// Optional security-event forwarding to any syslog collector or SIEM
+    /// (Wazuh, Splunk, Graylog, rsyslog, ...). Absent or `enabled = false`
+    /// means the feature is entirely inert. When present here it always
+    /// wins over the admin-API/UI-managed copy stored in the database,
+    /// same precedence as every other runtime-settable option.
+    #[serde(default)]
+    pub siem: Option<SiemConfig>,
+}
+
+fn default_siem_port() -> u16 {
+    514
+}
+fn default_siem_facility() -> String {
+    "local0".into()
+}
+fn default_siem_app_name() -> String {
+    "rust-proxy".into()
+}
+fn default_siem_queue_size() -> usize {
+    4096
+}
+fn default_siem_categories() -> Vec<String> {
+    ["denied", "admin", "cert", "system"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SiemProtocol {
+    #[default]
+    Udp,
+    Tcp,
+    Tls,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyslogFormat {
+    #[default]
+    Rfc5424,
+    Rfc3164,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SiemMessageFormat {
+    /// `key=value` pairs.
+    Kv,
+    /// One flat JSON object.
+    #[default]
+    Json,
+    /// ArcSight Common Event Format.
+    Cef,
+}
+
+/// Valid values for `SiemConfig::categories`.
+pub const SIEM_CATEGORIES: [&str; 5] = ["access", "denied", "admin", "cert", "system"];
+
+/// Settings for forwarding security-relevant events to a remote syslog
+/// collector. Contains no secrets by design: the collector is addressed
+/// by host/port, and TLS (if used) verifies the server against the
+/// bundled Mozilla roots plus an optional CA file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SiemConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_siem_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub protocol: SiemProtocol,
+    #[serde(default)]
+    pub syslog_format: SyslogFormat,
+    #[serde(default)]
+    pub message_format: SiemMessageFormat,
+    /// A syslog facility name (`local0`..`local7`, `daemon`, `auth`,
+    /// `authpriv`, `user`, ...) or a number 0-23.
+    #[serde(default = "default_siem_facility")]
+    pub facility: String,
+    #[serde(default = "default_siem_app_name")]
+    pub app_name: String,
+    /// Reported hostname; defaults to the machine's own hostname.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Which event categories to forward: any of `SIEM_CATEGORIES`.
+    /// `access` (one event per proxied request) is high volume and so is
+    /// not in the default set.
+    #[serde(default = "default_siem_categories")]
+    pub categories: Vec<String>,
+    /// Extra PEM CA bundle trusted for `protocol = "tls"` (for a collector
+    /// with a private-CA certificate).
+    #[serde(default)]
+    pub tls_ca_file: Option<PathBuf>,
+    /// Events buffered while the collector is slow or unreachable; beyond
+    /// this, new events are dropped rather than ever slowing a request.
+    #[serde(default = "default_siem_queue_size")]
+    pub queue_size: usize,
+}
+
+impl Default for SiemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: default_siem_port(),
+            protocol: SiemProtocol::default(),
+            syslog_format: SyslogFormat::default(),
+            message_format: SiemMessageFormat::default(),
+            facility: default_siem_facility(),
+            app_name: default_siem_app_name(),
+            hostname: None,
+            categories: default_siem_categories(),
+            tls_ca_file: None,
+            queue_size: default_siem_queue_size(),
+        }
+    }
+}
+
+impl SiemConfig {
+    /// Syslog facility number for `facility`, or an error message.
+    pub fn facility_number(&self) -> Result<u8, String> {
+        let f = self.facility.trim().to_ascii_lowercase();
+        if let Ok(n) = f.parse::<u8>() {
+            return if n <= 23 {
+                Ok(n)
+            } else {
+                Err(format!("siem.facility {n} is out of range (0-23)"))
+            };
+        }
+        let n = match f.as_str() {
+            "kern" => 0,
+            "user" => 1,
+            "mail" => 2,
+            "daemon" => 3,
+            "auth" => 4,
+            "syslog" => 5,
+            "lpr" => 6,
+            "news" => 7,
+            "uucp" => 8,
+            "cron" => 9,
+            "authpriv" => 10,
+            "ftp" => 11,
+            "local0" => 16,
+            "local1" => 17,
+            "local2" => 18,
+            "local3" => 19,
+            "local4" => 20,
+            "local5" => 21,
+            "local6" => 22,
+            "local7" => 23,
+            other => {
+                return Err(format!(
+                    "siem.facility \"{other}\" is not a known syslog facility"
+                ))
+            }
+        };
+        Ok(n)
+    }
+
+    /// Checked whenever the section is loaded or saved. A disabled config
+    /// is only checked for self-consistency, not for being usable, so a
+    /// half-filled form can be saved with `enabled = false`.
+    pub fn validate(&self) -> Result<(), String> {
+        self.facility_number()?;
+        if self.queue_size == 0 || self.queue_size > 1_000_000 {
+            return Err("siem.queue_size must be between 1 and 1000000".into());
+        }
+        let app = self.app_name.trim();
+        if app.is_empty() || app.len() > 48 || !app.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(
+                "siem.app_name must be 1-48 printable ASCII characters with no spaces".into(),
+            );
+        }
+        if let Some(h) = &self.hostname {
+            if h.is_empty() || h.len() > 255 || !h.chars().all(|c| c.is_ascii_graphic()) {
+                return Err(
+                    "siem.hostname must be 1-255 printable ASCII characters with no spaces".into(),
+                );
+            }
+        }
+        for c in &self.categories {
+            if !SIEM_CATEGORIES.contains(&c.as_str()) {
+                return Err(format!(
+                    "siem.categories contains unknown category \"{c}\" (valid: {})",
+                    SIEM_CATEGORIES.join(", ")
+                ));
+            }
+        }
+        if self.enabled {
+            let host = self.host.trim();
+            if host.is_empty() {
+                return Err("siem.host is required when siem.enabled is true".into());
+            }
+            if host.len() > 253 || host.chars().any(|c| c.is_whitespace() || c == '/') {
+                return Err("siem.host must be a hostname or IP address".into());
+            }
+            if self.port == 0 {
+                return Err("siem.port must not be 0".into());
+            }
+            if self.categories.is_empty() {
+                return Err("siem.categories must list at least one category when enabled".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,6 +867,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(siem) = &self.siem {
+            siem.validate().map_err(ConfigError::Validation)?;
+        }
         validate_dual_bind(
             &self.network.bind_ranges,
             self.admin.bind_ip_v4,

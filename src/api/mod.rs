@@ -17,7 +17,11 @@ async fn serve_one(ip: IpAddr, port: u16, state: AppState) -> anyhow::Result<()>
     let router = routes::build_router(state);
     let listener = crate::netbind::bind_tcp_listener(addr)?;
     tracing::info!(%addr, "admin API listening");
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

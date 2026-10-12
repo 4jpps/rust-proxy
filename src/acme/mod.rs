@@ -554,6 +554,13 @@ async fn publish_cert(
         state.upsert_cert(domain.clone(), entry.clone());
     }
     tracing::info!(domains = %domains.join(", "), "certificate issued and published");
+    crate::siem::emit(
+        crate::siem::Category::Cert,
+        crate::siem::Severity::Notice,
+        "cert_issued",
+        "certificate issued and published",
+        &[("domains", domains.join(", ").as_str())],
+    );
     Ok(())
 }
 
@@ -649,6 +656,16 @@ where
     Err(IssuanceError::Timeout(what))
 }
 
+fn siem_cert_failure(domain: &str, error: &str) {
+    crate::siem::emit(
+        crate::siem::Category::Cert,
+        crate::siem::Severity::Error,
+        "cert_issue_failed",
+        "certificate issuance or renewal failed",
+        &[("domain", domain), ("error", error)],
+    );
+}
+
 /// Background task: registers/reuses the ACME account, then periodically
 /// checks every ACME-enabled host's live cert against
 /// `acme.renew_before_days` and re-issues anything close to expiry (or
@@ -667,6 +684,7 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
         match init_acme_client(&state).await {
             Ok(client) => break client,
             Err(err) => {
+                siem_cert_failure("-", &format!("ACME account setup failed: {err}"));
                 tracing::error!(
                     error = %err,
                     "ACME account setup failed -- certificates for ACME-enabled hosts won't be issued until this is fixed; retrying in {}s",
@@ -681,6 +699,7 @@ pub async fn run_renewal_loop(state: AppState) -> anyhow::Result<()> {
         for host in state.hosts().iter().filter(|h| h.acme_enabled && h.enabled) {
             if let Err(err) = renew_if_needed(&state, &client, &http, host).await {
                 tracing::error!(domain = %host.domain, error = %err, "certificate issuance/renewal failed");
+                siem_cert_failure(&host.domain, &err.to_string());
             }
         }
         if let Err(err) = renew_standalone_certs_if_needed(&state, &client, &http).await {
@@ -721,6 +740,7 @@ async fn renew_standalone_certs_if_needed(
         .await
         {
             tracing::error!(domain = %standalone.domain, error = %err, "standalone certificate issuance/renewal failed");
+            siem_cert_failure(&standalone.domain, &err.to_string());
         }
     }
     Ok(())
@@ -1041,6 +1061,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await

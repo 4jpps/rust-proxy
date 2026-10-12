@@ -283,6 +283,70 @@ change needed):
 - **`server.log`** -- everything else: startup/bootstrap, nftables
   sync, config loading.
 
+### SIEM / syslog forwarding (optional)
+
+rust-proxy can forward security-relevant events to any syslog
+collector or SIEM (Wazuh, Graylog, Splunk, rsyslog, Elastic, ...). It is
+**off by default**, needs no particular product, and costs nothing
+unless enabled.
+
+Configure it in `config.toml` (read-only in the UI/API when present) or
+at runtime from the web UI's "SIEM / syslog forwarding" panel, or
+`PUT /api/siem` (stored in the DB, applied live, no restart):
+
+```toml
+[siem]
+enabled        = true
+host           = "siem.example.com"
+port           = 514                # default 514
+protocol       = "udp"              # udp | tcp | tls
+syslog_format  = "rfc5424"          # rfc5424 | rfc3164
+message_format = "json"             # json | kv | cef
+facility       = "local0"           # name or 0-23
+app_name       = "rust-proxy"
+# hostname     = "proxy"            # default: this machine's hostname
+categories     = ["denied", "admin", "cert", "system"]   # add "access" for every request
+# tls_ca_file  = "/etc/ssl/siem-ca.pem"   # extra CA, on top of the public roots
+queue_size     = 4096
+```
+
+Event categories and what they emit:
+
+| Category | Events |
+|---|---|
+| `denied` | `acl_ip_denied`, `host_login_failure` |
+| `admin` | `admin_auth_failure`, `admin_login`, `admin_change` (every non-GET admin API call, warning severity when it fails), `host_login_success` |
+| `cert` | `cert_issued`, `cert_issue_failed` |
+| `system` | `daemon_start`, `siem_test` |
+| `access` | `http_request` (one per proxied HTTPS request; high volume, opt-in) |
+
+Every event carries `event`, `category`, `severity` and `message` plus
+event-specific fields (`client_ip`, `domain`, `method`, `path`,
+`status`, ...). Query strings are never logged, any field whose name
+suggests a secret (password, token, cookie, authorization, ...) is
+replaced with `[redacted]`, passwords and tokens are never read into
+events, control characters are stripped so a request cannot forge extra
+log lines, and values are capped at 1024 characters.
+
+Delivery never blocks traffic: events go through a bounded queue and are
+**dropped** (and counted) when it is full or the collector is down; TCP/TLS
+reconnects with 1s-60s backoff, UDP re-resolves the hostname every 5
+minutes. `GET /api/siem` shows `sent`, `dropped`, `errors` and
+`last_error`; `POST /api/siem/test` sends a `siem_test` event.
+
+Limitations: connections dropped by the kernel firewall (nftables) never
+reach the daemon and are not forwarded; port-forward passthrough has no
+application-level access list, so it produces no events; with TCP, the
+first event written to a connection the collector has silently closed may
+be lost before the reconnect.
+
+**Wazuh:** use `syslog_format = "rfc3164"`, `message_format = "json"`,
+add a `<remote>` with `<connection>syslog</connection>`, the chosen port
+and `<allowed-ips>` set to the proxy's address, and install
+`deploy/wazuh/rustproxy_decoders.xml` and `rustproxy_rules.xml`
+(rule IDs 100300-100399, including brute-force and repeated-denial
+frequency rules) into `/var/ossec/etc/decoders` and `/rules`.
+
 ## API
 
 Every route under `/api/*` except `/api/login`/`/api/logout` requires

@@ -795,6 +795,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await

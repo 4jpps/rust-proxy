@@ -278,6 +278,40 @@
   </section>
 
   <section class="tab-panel" id="tab-certs">
+    <h2>SIEM / syslog forwarding</h2>
+    <p class="hint">Optional. Forwards security events (denied requests, admin logins and changes, certificate
+      issuance) to any syslog collector or SIEM over UDP, TCP or TLS. Off by default; never delays traffic.
+      <code>access</code> sends one event per proxied request and is high volume.</p>
+    <form id="siem-form">
+      <div class="field-grid">
+        <label class="chk"><input type="checkbox" name="enabled"> Enabled</label>
+        <label><span>Collector host</span><input type="text" name="host" placeholder="siem.example.com"></label>
+        <label><span>Port</span><input type="number" name="port" min="1" max="65535" value="514"></label>
+        <label><span>Protocol</span><select name="protocol"><option value="udp">udp</option><option value="tcp">tcp</option><option value="tls">tls</option></select></label>
+        <label><span>Syslog format</span><select name="syslog_format"><option value="rfc5424">RFC 5424</option><option value="rfc3164">RFC 3164</option></select></label>
+        <label><span>Message format</span><select name="message_format"><option value="json">JSON</option><option value="kv">key=value</option><option value="cef">CEF</option></select></label>
+        <label><span>Facility</span><input type="text" name="facility" value="local0"></label>
+        <label><span>App name</span><input type="text" name="app_name" value="rust-proxy"></label>
+        <label><span>Hostname (blank = this machine)</span><input type="text" name="hostname"></label>
+        <label><span>TLS CA file (optional)</span><input type="text" name="tls_ca_file" placeholder="/etc/ssl/my-ca.pem"></label>
+        <label><span>Queue size</span><input type="number" name="queue_size" min="1" value="4096"></label>
+      </div>
+      <div id="siem-categories">
+        <span class="hint">Categories:</span>
+        <label class="chk"><input type="checkbox" name="cat" value="denied"> denied</label>
+        <label class="chk"><input type="checkbox" name="cat" value="admin"> admin</label>
+        <label class="chk"><input type="checkbox" name="cat" value="cert"> cert</label>
+        <label class="chk"><input type="checkbox" name="cat" value="system"> system</label>
+        <label class="chk"><input type="checkbox" name="cat" value="access"> access</label>
+      </div>
+      <div class="form-actions">
+        <button type="submit">Save</button>
+        <button type="button" id="siem-test">Send test event</button>
+        <span class="hint" id="siem-note"></span>
+        <span class="error" id="siem-error"></span>
+      </div>
+    </form>
+
     <h2>ACME settings</h2>
     <p class="hint">The contact email registered with Let's Encrypt for this instance's ACME
       account -- required before any certificate (http-01 or dns-01) can be issued. Changing it
@@ -601,7 +635,7 @@ async function refreshAll() {
   // refreshStandaloneCerts) -- both must resolve before anything that
   // reads them, not run concurrently with it.
   await Promise.all([refreshAcls(), refreshDnsCredentials(), populateBindIpSelects()]);
-  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts(), refreshAcmeSettings(), refreshFirewallSettings()]);
+  await Promise.all([refreshDashboard(), refreshHosts(), refreshRules(), refreshCerts(), refreshTokens(), refreshStandaloneCerts(), refreshAcmeSettings(), refreshFirewallSettings(), refreshSiem()]);
 }
 
 async function refreshDashboard() {
@@ -893,6 +927,54 @@ document.getElementById('firewall-settings-form').addEventListener('submit', asy
   } else {
     document.getElementById('firewall-settings-error').textContent = (await resp.json()).error || 'failed';
   }
+});
+
+async function refreshSiem() {
+  const s = await (await api('/api/siem')).json();
+  const form = document.getElementById('siem-form');
+  form.enabled.checked = !!s.enabled;
+  for (const k of ['host', 'port', 'protocol', 'syslog_format', 'message_format', 'facility', 'app_name', 'queue_size']) form[k].value = s[k];
+  form.hostname.value = s.hostname || '';
+  form.tls_ca_file.value = s.tls_ca_file || '';
+  for (const c of form.querySelectorAll('input[name=cat]')) c.checked = s.categories.includes(c.value);
+  for (const el of form.querySelectorAll('input,select,button[type=submit]')) el.disabled = s.from_config;
+  const st = s.stats;
+  document.getElementById('siem-note').textContent =
+    (s.from_config ? 'Set via config.toml\'s [siem] section, which always takes precedence -- edit it there instead. ' : '') +
+    (st.active ? `Active: ${st.sent} sent, ${st.dropped} dropped, ${st.errors} errors` : 'Not active') +
+    (st.last_error ? ` (last error: ${st.last_error})` : '');
+}
+
+document.getElementById('siem-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {
+    enabled: f.enabled.checked,
+    host: f.host.value.trim(),
+    port: Number(f.port.value),
+    protocol: f.protocol.value,
+    syslog_format: f.syslog_format.value,
+    message_format: f.message_format.value,
+    facility: f.facility.value.trim(),
+    app_name: f.app_name.value.trim(),
+    hostname: f.hostname.value.trim() || null,
+    categories: [...f.querySelectorAll('input[name=cat]:checked')].map((c) => c.value),
+    tls_ca_file: f.tls_ca_file.value.trim() || null,
+    queue_size: Number(f.queue_size.value),
+  };
+  const resp = await api('/api/siem', { method: 'PUT', body: JSON.stringify(body) });
+  if (resp.ok) {
+    document.getElementById('siem-error').textContent = '';
+    refreshSiem();
+  } else {
+    document.getElementById('siem-error').textContent = (await resp.json()).error || 'failed';
+  }
+});
+
+document.getElementById('siem-test').addEventListener('click', async () => {
+  const r = await (await api('/api/siem/test', { method: 'POST' })).json();
+  document.getElementById('siem-error').textContent = r.queued ? '' : 'Forwarding is not active -- save an enabled config first.';
+  setTimeout(refreshSiem, 1500);
 });
 
 async function refreshCerts() {

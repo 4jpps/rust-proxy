@@ -8,6 +8,7 @@ mod logging;
 mod netbind;
 mod nftables;
 mod proxy;
+mod siem;
 mod state;
 
 use std::path::PathBuf;

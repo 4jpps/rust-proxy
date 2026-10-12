@@ -407,6 +407,21 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Single-row table holding the admin-UI/API-managed SIEM forwarding
+    // settings as a JSON document (see `config::SiemConfig`) -- only
+    // consulted when config.toml has no `[siem]` section. No row means
+    // forwarding has never been configured (off).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS siem_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            config_json TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Single-row table (id is always 1, enforced by the CHECK constraint
     // -- `create_admin_identity_if_absent` relies on it as the atomic
     // arbiter for "has this instance been set up yet"). Holds the admin
@@ -1349,6 +1364,35 @@ pub async fn load_expose_admin_port(pool: &SqlitePool) -> Result<Option<bool>, s
 pub async fn set_expose_admin_port(pool: &SqlitePool, value: bool) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO firewall_settings (id, expose_admin_port) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET expose_admin_port = excluded.expose_admin_port")
         .bind(value as i64)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn load_siem_settings(
+    pool: &SqlitePool,
+) -> Result<Option<crate::config::SiemConfig>, sqlx::Error> {
+    let row = sqlx::query("SELECT config_json FROM siem_settings WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    let json: String = row.get("config_json");
+    match serde_json::from_str(&json) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(err) => {
+            tracing::error!(error = %err, "stored siem_settings row is unreadable -- treating SIEM forwarding as unconfigured");
+            Ok(None)
+        }
+    }
+}
+
+pub async fn set_siem_settings(
+    pool: &SqlitePool,
+    cfg: &crate::config::SiemConfig,
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_string(cfg).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    sqlx::query("INSERT INTO siem_settings (id, config_json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json")
+        .bind(json)
         .execute(pool)
         .await?;
     Ok(())

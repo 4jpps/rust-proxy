@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **Optional SIEM / syslog forwarding (off by default, vendor-neutral).**
+  New `[siem]` config section (and a web UI panel plus
+  `GET`/`PUT /api/siem`, `POST /api/siem/test`, stored in the DB and
+  applied live; config.toml wins and makes the API read-only) forwards
+  security events over syslog UDP, TCP or TLS (RFC 5424 or 3164, with a
+  json, key=value or CEF body; host, port, facility, app name, hostname
+  and categories configurable). Events: proxied requests (opt-in
+  `access`), IP-ACL denials and protected-site login failures
+  (`denied`), admin API auth failures, logins and configuration changes
+  and protected-site logins (`admin`), certificate issued/failed
+  (`cert`), and daemon start / test (`system`). Delivery uses a bounded
+  queue that drops (and counts) rather than ever blocking the request
+  path, reconnects with backoff, redacts secret-looking fields, strips
+  control characters and never logs query strings. Admin routes now serve
+  with connect-info so the client IP is known. Includes ready-made Wazuh
+  decoder and rules in `deploy/wazuh/`. Kernel-level nftables drops are
+  not forwarded.
+
 - **Multi-IP readiness: dedicated addresses, listeners that coexist with
   wildcard ones, and same-port passthrough.** (1) Every listener now sets
   `SO_REUSEPORT`, so a listener bound to one specific address (for example

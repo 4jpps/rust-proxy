@@ -79,6 +79,37 @@ pub async fn load_persisted_admin_identity(
     }))
 }
 
+/// Starts SIEM forwarding if configured (config.toml's `[siem]` wins,
+/// else the DB copy). A bad or unreachable collector config must never
+/// stop the proxy from starting, so failures are logged and swallowed.
+async fn start_siem(state: &AppState) {
+    let cfg = match state.siem_config() {
+        Some(cfg) => Some(cfg.clone()),
+        None => match crate::db::load_siem_settings(state.db()).await {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to load SIEM settings");
+                None
+            }
+        },
+    };
+    let Some(cfg) = cfg else { return };
+    match crate::siem::apply(&cfg) {
+        Ok(()) if cfg.enabled => {
+            tracing::info!(host = %cfg.host, port = cfg.port, protocol = ?cfg.protocol, "SIEM forwarding enabled");
+            crate::siem::emit(
+                crate::siem::Category::System,
+                crate::siem::Severity::Notice,
+                "daemon_start",
+                "rust-proxy started",
+                &[("version", env!("CARGO_PKG_VERSION"))],
+            );
+        }
+        Ok(()) => {}
+        Err(err) => tracing::error!(error = %err, "SIEM forwarding not started"),
+    }
+}
+
 /// Full startup sequence: connect the DB, load/seed hosts, port_rules,
 /// and the default DNS credential, resolve the persisted admin identity
 /// and ACME contact email, build `AppState`, and load certs from disk.
@@ -103,6 +134,7 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
         expose_admin_port,
     );
     crate::acme::load_certs_from_disk(&state)?;
+    start_siem(&state).await;
     Ok(state)
 }
 
@@ -145,6 +177,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         }
     }
 

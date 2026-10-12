@@ -1,0 +1,15 @@
+<!--
+  rust-proxy (jpps/proxy) SIEM events.
+  Configure rust-proxy with: syslog_format = "rfc3164", message_format = "json".
+  The line then looks like:
+    <134>Oct 12 03:04:05 proxy rust-proxy[123]: {"event":"admin_auth_failure","category":"admin",...}
+-->
+<decoder name="rust-proxy">
+  <program_name>^rust-proxy</program_name>
+</decoder>
+
+<decoder name="rust-proxy-json">
+  <parent>rust-proxy</parent>
+  <plugin_decoder offset="after_parent">JSON_Decoder</plugin_decoder>
+</decoder>
+

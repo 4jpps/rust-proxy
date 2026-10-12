@@ -58,6 +58,9 @@ struct Inner {
     /// that should be settable through the same surface a compromised
     /// admin session could reach.
     client_cert_forward_token: Option<String>,
+    /// `[siem]` from config.toml, if present -- always wins over the
+    /// DB-backed settings (see `config::Config::siem`).
+    siem_config: Option<crate::config::SiemConfig>,
     hosts: ArcSwap<Vec<ProxyHost>>,
     port_rules: ArcSwap<Vec<PortRule>>,
     certs: ArcSwap<HashMap<String, CertEntry>>,
@@ -127,6 +130,7 @@ impl AppState {
             admin: cfg.admin,
             acme: cfg.acme,
             client_cert_forward_token: cfg.client_cert_forward_token,
+            siem_config: cfg.siem,
             hosts: ArcSwap::from_pointee(hosts),
             port_rules: ArcSwap::from_pointee(port_rules),
             certs: ArcSwap::from_pointee(HashMap::new()),
@@ -159,6 +163,10 @@ impl AppState {
 
     pub fn admin(&self) -> &AdminConfig {
         &self.0.admin
+    }
+
+    pub fn siem_config(&self) -> Option<&crate::config::SiemConfig> {
+        self.0.siem_config.as_ref()
     }
 
     pub fn client_cert_forward_token(&self) -> Option<&str> {
@@ -378,6 +386,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         }
     }
 

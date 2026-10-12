@@ -143,7 +143,8 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
         tracing::info!(%addr, "https listener started");
 
         let config_with_client_auth = Arc::new(build_https_server_config(state.clone()));
-        let config_no_client_auth = Arc::new(build_https_server_config_no_client_auth(state.clone()));
+        let config_no_client_auth =
+            Arc::new(build_https_server_config_no_client_auth(state.clone()));
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -182,7 +183,12 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 // actually for -- see `should_request_client_cert`'s doc
                 // comment for why this replaced a single config shared by
                 // every connection on this listener.
-                let start = match tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await {
+                let start = match tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    stream,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(err) => {
                         tracing::debug!(error = %err, "tls clienthello read failed");
@@ -190,8 +196,14 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                     }
                 };
                 let sni = start.client_hello().server_name().map(|s| s.to_string());
-                let want_client_cert = should_request_client_cert(&state, bind_ip, bind_port, peer_ip, sni.as_deref()).await;
-                let config = if want_client_cert { config_with_client_auth } else { config_no_client_auth };
+                let want_client_cert =
+                    should_request_client_cert(&state, bind_ip, bind_port, peer_ip, sni.as_deref())
+                        .await;
+                let config = if want_client_cert {
+                    config_with_client_auth
+                } else {
+                    config_no_client_auth
+                };
                 let tls_stream = match start.into_stream(config).await {
                     Ok(s) => s,
                     Err(err) => {
@@ -199,14 +211,24 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                         return;
                     }
                 };
-                let client_cert_subject = client_cert::client_cert_subject(tls_stream.get_ref().1.peer_certificates());
+                let client_cert_subject =
+                    client_cert::client_cert_subject(tls_stream.get_ref().1.peer_certificates());
                 let io = TokioIo::new(tls_stream);
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let sni = sni.clone();
                     let client_cert_subject = client_cert_subject.clone();
                     async move {
-                        handle_https_request(state, bind_ip, bind_port, peer_ip, sni, client_cert_subject, req).await
+                        handle_https_request(
+                            state,
+                            bind_ip,
+                            bind_port,
+                            peer_ip,
+                            sni,
+                            client_cert_subject,
+                            req,
+                        )
+                        .await
                     }
                 });
                 // `auto::Builder` sniffs the connection preface to pick
@@ -333,11 +355,82 @@ async fn should_request_client_cert(
     if !resolved.has_client_cert_acl {
         return false;
     }
-    let already_ip_allowed = resolved.has_ip_allow_acl && access::ip_allowed(&resolved.allow_ips, peer_ip);
+    let already_ip_allowed =
+        resolved.has_ip_allow_acl && access::ip_allowed(&resolved.allow_ips, peer_ip);
     !already_ip_allowed
 }
 
+/// Thin wrapper that emits one SIEM `access` event per request (only when
+/// that category is selected -- otherwise this is a single atomic load).
 async fn handle_https_request(
+    state: AppState,
+    bind_ip: IpAddr,
+    bind_port: u16,
+    peer_ip: IpAddr,
+    sni: Option<String>,
+    client_cert_subject: Option<String>,
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    if !crate::siem::wants(crate::siem::Category::Access) {
+        return route_https_request(
+            state,
+            bind_ip,
+            bind_port,
+            peer_ip,
+            sni,
+            client_cert_subject,
+            req,
+        )
+        .await;
+    }
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let domain = req
+        .uri()
+        .host()
+        .map(str::to_string)
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .or_else(|| sni.clone())
+        .unwrap_or_else(|| "-".into());
+    let start = std::time::Instant::now();
+    let result = route_https_request(
+        state,
+        bind_ip,
+        bind_port,
+        peer_ip,
+        sni,
+        client_cert_subject,
+        req,
+    )
+    .await;
+    if let Ok(resp) = &result {
+        let status = resp.status().as_u16().to_string();
+        let elapsed = start.elapsed().as_millis().to_string();
+        let client_ip = peer_ip.to_string();
+        crate::siem::emit(
+            crate::siem::Category::Access,
+            crate::siem::Severity::Info,
+            "http_request",
+            "proxied request",
+            &[
+                ("client_ip", client_ip.as_str()),
+                ("domain", domain.as_str()),
+                ("method", method.as_str()),
+                ("path", path.as_str()),
+                ("status", status.as_str()),
+                ("elapsed_ms", elapsed.as_str()),
+            ],
+        );
+    }
+    result
+}
+
+async fn route_https_request(
     state: AppState,
     bind_ip: IpAddr,
     bind_port: u16,
@@ -462,9 +555,13 @@ async fn handle_https_request(
     // see `db::ResolvedAcls::allowed_client_cert_subjects`'s doc
     // comment.
     let client_cert_ok = resolved_acls.has_client_cert_acl
-        && client_cert_subject
-            .as_deref()
-            .is_some_and(|subject| resolved_acls.allowed_client_cert_subjects.is_empty() || resolved_acls.allowed_client_cert_subjects.iter().any(|s| s == subject));
+        && client_cert_subject.as_deref().is_some_and(|subject| {
+            resolved_acls.allowed_client_cert_subjects.is_empty()
+                || resolved_acls
+                    .allowed_client_cert_subjects
+                    .iter()
+                    .any(|s| s == subject)
+        });
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
     if !(client_cert_ok || (resolved_acls.has_ip_allow_acl && ip_allowed)) {
         if resolved_acls.has_login_acl {
@@ -479,11 +576,27 @@ async fn handle_https_request(
                     &state,
                     &host.domain,
                     &resolved_acls.credentials,
+                    peer_ip,
                     req,
                 )
                 .await);
             }
         } else if resolved_acls.has_ip_allow_acl {
+            if crate::siem::wants(crate::siem::Category::Denied) {
+                let client_ip = peer_ip.to_string();
+                crate::siem::emit(
+                    crate::siem::Category::Denied,
+                    crate::siem::Severity::Warning,
+                    "acl_ip_denied",
+                    "request refused: source IP not in the host's allow list",
+                    &[
+                        ("client_ip", client_ip.as_str()),
+                        ("domain", host.domain.as_str()),
+                        ("method", req.method().as_str()),
+                        ("path", req.uri().path()),
+                    ],
+                );
+            }
             return Ok(forbidden_page(&host.domain));
         }
     }
@@ -504,12 +617,17 @@ async fn handle_https_request(
     // means this feature is silently inert regardless of any host's
     // pass_client_cert_header setting.
     if host.pass_client_cert_header {
-        if let (Some(subject), Some(token)) = (&client_cert_subject, state.client_cert_forward_token()) {
-            if let (Ok(subject_value), Ok(token_value)) =
-                (hyper::header::HeaderValue::from_str(subject), hyper::header::HeaderValue::from_str(token))
-            {
-                req.headers_mut().insert("x-client-cert-subject", subject_value);
-                req.headers_mut().insert("x-rustproxy-client-cert-token", token_value);
+        if let (Some(subject), Some(token)) =
+            (&client_cert_subject, state.client_cert_forward_token())
+        {
+            if let (Ok(subject_value), Ok(token_value)) = (
+                hyper::header::HeaderValue::from_str(subject),
+                hyper::header::HeaderValue::from_str(token),
+            ) {
+                req.headers_mut()
+                    .insert("x-client-cert-subject", subject_value);
+                req.headers_mut()
+                    .insert("x-rustproxy-client-cert-token", token_value);
             }
         }
     }
@@ -593,6 +711,7 @@ async fn handle_login_gate(
     state: &AppState,
     domain: &str,
     credentials: &[crate::config::HostAuth],
+    peer_ip: IpAddr,
     req: Request<Incoming>,
 ) -> Response<BoxBody<Bytes, hyper::Error>> {
     if req.method() == hyper::Method::POST && req.uri().path() == login::LOGIN_SUBMIT_PATH {
@@ -624,8 +743,10 @@ async fn handle_login_gate(
                 return service_unavailable();
             };
             let token = login::sign_session(&identity.session_secret, domain, &submission.username);
+            siem_login_event(true, domain, &submission.username, peer_ip);
             return login_success_response(&token);
         }
+        siem_login_event(false, domain, &submission.username, peer_ip);
         return login_page_response(
             domain,
             &submission.return_to,
@@ -641,6 +762,44 @@ async fn handle_login_gate(
         .unwrap_or("/")
         .to_string();
     login_page_response(domain, &return_to, None, hyper::StatusCode::OK)
+}
+
+/// Reports a host login-gate attempt. The submitted password is never
+/// read here; the username is included (truncated) since it is the
+/// useful signal for spotting credential stuffing.
+fn siem_login_event(ok: bool, domain: &str, username: &str, peer_ip: IpAddr) {
+    use crate::siem::{emit, wants, Category, Severity};
+    let (cat, sev, event, msg) = if ok {
+        (
+            Category::Admin,
+            Severity::Notice,
+            "host_login_success",
+            "host login gate: sign-in succeeded",
+        )
+    } else {
+        (
+            Category::Denied,
+            Severity::Warning,
+            "host_login_failure",
+            "host login gate: invalid credentials",
+        )
+    };
+    if !wants(cat) {
+        return;
+    }
+    let client_ip = peer_ip.to_string();
+    let user: String = username.chars().take(64).collect();
+    emit(
+        cat,
+        sev,
+        event,
+        msg,
+        &[
+            ("client_ip", client_ip.as_str()),
+            ("domain", domain),
+            ("user", user.as_str()),
+        ],
+    );
 }
 
 fn login_page_response(
@@ -880,16 +1039,31 @@ mod tests {
 
     #[test]
     fn passthrough_target_without_port_uses_the_received_port() {
-        assert_eq!(passthrough_target_for_port("172.16.233.2", 8080), "172.16.233.2:8080");
-        assert_eq!(passthrough_target_for_port("unifi.lan", 3478), "unifi.lan:3478");
+        assert_eq!(
+            passthrough_target_for_port("172.16.233.2", 8080),
+            "172.16.233.2:8080"
+        );
+        assert_eq!(
+            passthrough_target_for_port("unifi.lan", 3478),
+            "unifi.lan:3478"
+        );
         assert_eq!(passthrough_target_for_port("fd00::2", 53), "[fd00::2]:53");
     }
 
     #[test]
     fn passthrough_target_with_port_is_left_alone() {
-        assert_eq!(passthrough_target_for_port("172.16.233.2:9", 8080), "172.16.233.2:9");
-        assert_eq!(passthrough_target_for_port("unifi.lan:9", 3478), "unifi.lan:9");
-        assert_eq!(passthrough_target_for_port("[fd00::2]:9", 53), "[fd00::2]:9");
+        assert_eq!(
+            passthrough_target_for_port("172.16.233.2:9", 8080),
+            "172.16.233.2:9"
+        );
+        assert_eq!(
+            passthrough_target_for_port("unifi.lan:9", 3478),
+            "unifi.lan:9"
+        );
+        assert_eq!(
+            passthrough_target_for_port("[fd00::2]:9", 53),
+            "[fd00::2]:9"
+        );
     }
 
     fn path_rewrite(pattern: &str, replacement: &str) -> crate::config::PathRewrite {
@@ -1108,6 +1282,7 @@ mod tests {
             hosts: vec![],
             port_rules: vec![],
             client_cert_forward_token: None,
+            siem: None,
         };
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
@@ -1237,7 +1412,9 @@ mod tests {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let state = state.clone();
                 let sni = sni.clone();
-                async move { handle_https_request(state, bind_ip, bind_port, peer_ip, sni, None, req).await }
+                async move {
+                    handle_https_request(state, bind_ip, bind_port, peer_ip, sni, None, req).await
+                }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -1295,7 +1472,16 @@ mod tests {
                 let sni = sni.clone();
                 let client_cert_subject = client_cert_subject.clone();
                 async move {
-                    handle_https_request(state, bind_ip, bind_port, peer_ip, sni, client_cert_subject, req).await
+                    handle_https_request(
+                        state,
+                        bind_ip,
+                        bind_port,
+                        peer_ip,
+                        sni,
+                        client_cert_subject,
+                        req,
+                    )
+                    .await
                 }
             });
             let _ = hyper::server::conn::http1::Builder::new()
@@ -1623,7 +1809,10 @@ mod tests {
     /// Jeff's own spec: "#2 but fallback with user/pass as is now") a
     /// `Login`-kind ACL as the fallback for a connection that didn't
     /// present a cert.
-    async fn client_cert_host_with_login_fallback(pool: &sqlx::SqlitePool, domain: &str) -> ProxyHost {
+    async fn client_cert_host_with_login_fallback(
+        pool: &sqlx::SqlitePool,
+        domain: &str,
+    ) -> ProxyHost {
         let cert_acl_id = Uuid::new_v4();
         crate::db::create_acl_list(
             pool,
@@ -1677,16 +1866,34 @@ mod tests {
     /// both selected -- for exercising Jeff's "unless it's IP locked
     /// and I'm not on one of the authorized IPs" exception in
     /// `should_request_client_cert`.
-    async fn client_cert_host_with_ip_allow(pool: &sqlx::SqlitePool, domain: &str, allowed_cidr: &str) -> ProxyHost {
+    async fn client_cert_host_with_ip_allow(
+        pool: &sqlx::SqlitePool,
+        domain: &str,
+        allowed_cidr: &str,
+    ) -> ProxyHost {
         let cert_acl_id = Uuid::new_v4();
-        crate::db::create_acl_list(pool, cert_acl_id, "test client cert 2", crate::config::AclKind::ClientCert, chrono::Utc::now())
-            .await
-            .unwrap();
+        crate::db::create_acl_list(
+            pool,
+            cert_acl_id,
+            "test client cert 2",
+            crate::config::AclKind::ClientCert,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let ip_acl_id = Uuid::new_v4();
-        crate::db::create_acl_list(pool, ip_acl_id, "test ip allow 2", crate::config::AclKind::IpAllow, chrono::Utc::now())
+        crate::db::create_acl_list(
+            pool,
+            ip_acl_id,
+            "test ip allow 2",
+            crate::config::AclKind::IpAllow,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        crate::db::add_acl_ip_entries(pool, ip_acl_id, &[allowed_cidr.to_string()])
             .await
             .unwrap();
-        crate::db::add_acl_ip_entries(pool, ip_acl_id, &[allowed_cidr.to_string()]).await.unwrap();
         ProxyHost {
             id: Uuid::new_v4(),
             domain: domain.into(),
@@ -1755,7 +1962,16 @@ mod tests {
     async fn store_style_host_with_pass_client_cert_header_always_wants_a_cert_requested() {
         let state = test_state_with_cert("example.com").await;
         state.set_hosts(vec![pass_header_host("example.com")]);
-        assert!(should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+        assert!(
+            should_request_client_cert(
+                &state,
+                TEST_BIND_IP.parse().unwrap(),
+                TEST_BIND_PORT,
+                "203.0.113.7".parse().unwrap(),
+                Some("example.com")
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -1763,9 +1979,22 @@ mod tests {
         let state = test_state_with_cert("example.com").await;
         state.set_hosts(vec![redirect_host(
             "example.com",
-            crate::config::RedirectTarget { target: "https://a.example.com".into(), preserve_path: false, status: crate::config::RedirectStatus::Permanent },
+            crate::config::RedirectTarget {
+                target: "https://a.example.com".into(),
+                preserve_path: false,
+                status: crate::config::RedirectStatus::Permanent,
+            },
         )]);
-        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+        assert!(
+            !should_request_client_cert(
+                &state,
+                TEST_BIND_IP.parse().unwrap(),
+                TEST_BIND_PORT,
+                "203.0.113.7".parse().unwrap(),
+                Some("example.com")
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -1773,7 +2002,16 @@ mod tests {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
         state.set_hosts(vec![host]);
-        assert!(should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+        assert!(
+            should_request_client_cert(
+                &state,
+                TEST_BIND_IP.parse().unwrap(),
+                TEST_BIND_PORT,
+                "203.0.113.7".parse().unwrap(),
+                Some("example.com")
+            )
+            .await
+        );
     }
 
     /// The exception clause: an IP already covered by the host's own
@@ -1783,18 +2021,37 @@ mod tests {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_ip_allow(state.db(), "example.com", "10.0.0.0/24").await;
         state.set_hosts(vec![host]);
-        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "10.0.0.42".parse().unwrap(), Some("example.com")).await);
+        assert!(
+            !should_request_client_cert(
+                &state,
+                TEST_BIND_IP.parse().unwrap(),
+                TEST_BIND_PORT,
+                "10.0.0.42".parse().unwrap(),
+                Some("example.com")
+            )
+            .await
+        );
     }
 
     /// Same host, but a peer IP outside the allow list -- back to
     /// wanting a cert requested, same as if there were no IpAllow ACL
     /// at all.
     #[tokio::test]
-    async fn a_client_cert_acl_host_still_wants_a_cert_requested_for_a_peer_outside_the_ip_allow_list() {
+    async fn a_client_cert_acl_host_still_wants_a_cert_requested_for_a_peer_outside_the_ip_allow_list(
+    ) {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_ip_allow(state.db(), "example.com", "10.0.0.0/24").await;
         state.set_hosts(vec![host]);
-        assert!(should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("example.com")).await);
+        assert!(
+            should_request_client_cert(
+                &state,
+                TEST_BIND_IP.parse().unwrap(),
+                TEST_BIND_PORT,
+                "203.0.113.7".parse().unwrap(),
+                Some("example.com")
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -1802,7 +2059,16 @@ mod tests {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
         state.set_hosts(vec![host]);
-        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), None).await);
+        assert!(
+            !should_request_client_cert(
+                &state,
+                TEST_BIND_IP.parse().unwrap(),
+                TEST_BIND_PORT,
+                "203.0.113.7".parse().unwrap(),
+                None
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -1810,7 +2076,16 @@ mod tests {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
         state.set_hosts(vec![host]);
-        assert!(!should_request_client_cert(&state, TEST_BIND_IP.parse().unwrap(), TEST_BIND_PORT, "203.0.113.7".parse().unwrap(), Some("unrelated.example.net")).await);
+        assert!(
+            !should_request_client_cert(
+                &state,
+                TEST_BIND_IP.parse().unwrap(),
+                TEST_BIND_PORT,
+                "203.0.113.7".parse().unwrap(),
+                Some("unrelated.example.net")
+            )
+            .await
+        );
     }
 
     /// The core of Jeff's ask: a valid client cert (verified at the TLS
@@ -1864,7 +2139,8 @@ mod tests {
     /// valid TrustBridge cert alone is no longer enough once the
     /// operator has scoped the ACL down to specific subjects.
     #[tokio::test]
-    async fn a_client_cert_not_matching_any_allowed_subject_entry_falls_through_to_the_login_gate() {
+    async fn a_client_cert_not_matching_any_allowed_subject_entry_falls_through_to_the_login_gate()
+    {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
         let cert_acl_id = host.acl_ids[0];

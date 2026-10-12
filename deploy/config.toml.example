@@ -173,3 +173,17 @@ account_key_path = "/var/lib/rust-proxy/acme-account.key"
 # description = "rustdesk udp"
 # passthrough_target = "127.0.0.1:21116"
 # enabled = true
+
+# Optional: forward security events to a syslog collector / SIEM (off by
+# default). See README "SIEM / syslog forwarding". For Wazuh use
+# syslog_format = "rfc3164" and message_format = "json".
+# [siem]
+# enabled        = true
+# host           = "siem.example.com"
+# port           = 514
+# protocol       = "udp"          # udp | tcp | tls
+# syslog_format  = "rfc5424"      # rfc5424 | rfc3164
+# message_format = "json"         # json | kv | cef
+# facility       = "local0"
+# app_name       = "rust-proxy"
+# categories     = ["denied", "admin", "cert", "system"]   # + "access"
