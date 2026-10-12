@@ -53,6 +53,12 @@ fn new_socket(addr: SocketAddr, ty: Type, protocol: Option<Protocol>) -> io::Res
     // is set there implicitly on Unix) -- needed for a quick
     // restart/rebind after this same process exits, same as before.
     socket.set_reuse_address(true)?;
+    // Linux refuses a specific-address listener (204.0.113.5:443) while a
+    // wildcard listener (0.0.0.0:443) is bound on the same port, even with
+    // SO_REUSEADDR. SO_REUSEPORT on every socket lets both exist; the kernel
+    // then delivers to the exact-address socket first. Needed so a dedicated
+    // public IP can have its own listeners beside the wildcard ones.
+    socket.set_reuse_port(true)?;
     // tokio's `TcpListener::from_std`/`UdpSocket::from_std` both require
     // a non-blocking socket -- a still-blocking one panics there instead
     // of erroring cleanly.
@@ -95,6 +101,35 @@ mod tests {
             connect.is_err() || connect.unwrap().is_err(),
             "a v6-only socket must not accept a v4 connection on the same port"
         );
+    }
+
+    #[tokio::test]
+    async fn specific_address_listener_coexists_with_a_wildcard_listener_and_wins() {
+        let wildcard = bind_tcp_listener("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        let specific = bind_tcp_listener(format!("127.0.0.2:{port}").parse().unwrap())
+            .expect("a specific address must bind beside a wildcard listener on the same port");
+        let got_specific = tokio::spawn(async move { specific.accept().await.is_ok() });
+        let got_wildcard = tokio::spawn(async move { wildcard.accept().await.is_ok() });
+        tokio::net::TcpStream::connect(("127.0.0.2", port)).await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), got_specific)
+            .await
+            .expect("exact-address listener must receive the connection")
+            .unwrap());
+        got_wildcard.abort();
+    }
+
+    #[tokio::test]
+    async fn a_connection_to_another_address_still_reaches_the_wildcard_listener() {
+        let wildcard = bind_tcp_listener("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        let _specific = bind_tcp_listener(format!("127.0.0.2:{port}").parse().unwrap()).unwrap();
+        let got_wildcard = tokio::spawn(async move { wildcard.accept().await.is_ok() });
+        tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), got_wildcard)
+            .await
+            .expect("wildcard listener must still get other addresses")
+            .unwrap());
     }
 
     #[tokio::test]

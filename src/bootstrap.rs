@@ -116,6 +116,7 @@ mod tests {
         Config {
             network: crate::config::NetworkConfig {
                 bind_ranges: vec![],
+                dedicated_ips: vec![],
             },
             admin: crate::config::AdminConfig {
                 bind_ip_v4: Some(Ipv4Addr::UNSPECIFIED),

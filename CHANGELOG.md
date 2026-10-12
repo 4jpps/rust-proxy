@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **Multi-IP readiness: dedicated addresses, listeners that coexist with
+  wildcard ones, and same-port passthrough.** (1) Every listener now sets
+  `SO_REUSEPORT`, so a listener bound to one specific address (for example
+  a public IP added to give one site its own address) can run beside the
+  wildcard `0.0.0.0:443` listeners; Linux otherwise refuses it with
+  "Address already in use", and the kernel delivers to the exact-address
+  socket first. (2) New `network.dedicated_ips`: an address listed there
+  serves only hosts and port rules explicitly bound to it. The generated
+  firewall emits those accepts first, then drops everything else addressed
+  to the dedicated IP before the wildcard rules and the always-open
+  22/80/443 can match, and wildcard HTTP(S) listeners refuse connections
+  that arrived on it. (3) A port rule's `passthrough_target` may now be a
+  bare host or IP with no port, meaning "forward to the same port the
+  client connected to", so one range rule (for example UDP 20100-22100)
+  maps each port to the same port on the backend.
+
 - **Fixed a real production incident: the HTTPS/redirect accept loops
   could busy-spin for hours on a transient `accept()` error, pegging a
   CPU core and flooding the log.** Root-caused from a real 15G,

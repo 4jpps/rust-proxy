@@ -66,6 +66,15 @@ pub struct NetworkConfig {
     /// matched against it.
     #[serde(default)]
     pub bind_ranges: Vec<IpNet>,
+    /// Addresses that serve ONLY hosts and port rules explicitly bound to
+    /// them. A wildcard (0.0.0.0 / ::) host, port rule, SSH carve-out or
+    /// the always-open 80/443 would otherwise answer on every address the
+    /// box holds, including a public IP added just to give one site its
+    /// own address. Listed here, the firewall drops everything to that
+    /// address except what is explicitly bound to it, and wildcard HTTP(S)
+    /// listeners refuse connections that arrived on it.
+    #[serde(default)]
+    pub dedicated_ips: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

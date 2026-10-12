@@ -167,6 +167,9 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                     continue;
                 }
             };
+            if wildcard_listener_got_dedicated_ip(&state, bind_ip, &stream) {
+                continue;
+            }
             let peer_ip = peer.ip();
             let config_with_client_auth = config_with_client_auth.clone();
             let config_no_client_auth = config_no_client_auth.clone();
@@ -704,6 +707,9 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
                     continue;
                 }
             };
+            if wildcard_listener_got_dedicated_ip(&state, bind_ip, &stream) {
+                continue;
+            }
             let io = TokioIo::new(stream);
             let state = state.clone();
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
@@ -746,6 +752,7 @@ fn spawn_passthrough_listener(
             tracing::error!(%bind_addr, "passthrough listener spawned with no matching target rule");
             return;
         };
+        let target = passthrough_target_for_port(&target, bind_addr.port());
         let Ok(upstream) = resolve_upstream(&target) else {
             tracing::error!(%bind_addr, target, "passthrough target does not resolve to host:port");
             return;
@@ -758,6 +765,44 @@ fn spawn_passthrough_listener(
             tracing::error!(%bind_addr, error = %err, "passthrough listener exited");
         }
     })
+}
+
+/// A wildcard listener also receives connections addressed to a dedicated
+/// IP (see `NetworkConfig::dedicated_ips`) if the firewall is not managing
+/// the host. Those must only be served by listeners bound to that exact
+/// address, so the wildcard one drops them.
+fn wildcard_listener_got_dedicated_ip(
+    state: &AppState,
+    listener_ip: IpAddr,
+    stream: &tokio::net::TcpStream,
+) -> bool {
+    if !listener_ip.is_unspecified() {
+        return false;
+    }
+    let dedicated = &state.network().dedicated_ips;
+    !dedicated.is_empty()
+        && stream
+            .local_addr()
+            .map(|a| dedicated.contains(&a.ip()))
+            .unwrap_or(false)
+}
+
+/// A target with no `:port` (bare host or IP, bracketed or bare IPv6) means
+/// "same port the client connected to", which is what lets one range rule
+/// forward 20100-22100 to the same ports on the backend.
+fn passthrough_target_for_port(target: &str, port: u16) -> String {
+    if target.parse::<SocketAddr>().is_ok() {
+        return target.to_string();
+    }
+    if let Some((host, p)) = target.rsplit_once(':') {
+        if !host.contains(':') && p.parse::<u16>().is_ok() {
+            return target.to_string();
+        }
+    }
+    if target.parse::<std::net::Ipv6Addr>().is_ok() {
+        return format!("[{target}]:{port}");
+    }
+    format!("{target}:{port}")
 }
 
 fn resolve_upstream(upstream: &str) -> Result<SocketAddr, std::io::Error> {
@@ -832,6 +877,20 @@ mod tests {
     use rustls_pki_types::{CertificateDer, ServerName as RustlsServerName, UnixTime};
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn passthrough_target_without_port_uses_the_received_port() {
+        assert_eq!(passthrough_target_for_port("172.16.233.2", 8080), "172.16.233.2:8080");
+        assert_eq!(passthrough_target_for_port("unifi.lan", 3478), "unifi.lan:3478");
+        assert_eq!(passthrough_target_for_port("fd00::2", 53), "[fd00::2]:53");
+    }
+
+    #[test]
+    fn passthrough_target_with_port_is_left_alone() {
+        assert_eq!(passthrough_target_for_port("172.16.233.2:9", 8080), "172.16.233.2:9");
+        assert_eq!(passthrough_target_for_port("unifi.lan:9", 3478), "unifi.lan:9");
+        assert_eq!(passthrough_target_for_port("[fd00::2]:9", 53), "[fd00::2]:9");
+    }
 
     fn path_rewrite(pattern: &str, replacement: &str) -> crate::config::PathRewrite {
         crate::config::PathRewrite {
@@ -1018,6 +1077,7 @@ mod tests {
         let cfg = Config {
             network: NetworkConfig {
                 bind_ranges: vec![],
+                dedicated_ips: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),

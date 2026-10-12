@@ -347,6 +347,7 @@ mod tests {
         Config {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
+                dedicated_ips: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
