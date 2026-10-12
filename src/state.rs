@@ -13,6 +13,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
 
 use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig, PortRule, ProxyHost};
+use crate::hosting::model::{Allocation, HostingPool};
+use crate::hosting::HostingStatus;
 
 /// One domain's live TLS material, ready for SNI dispatch.
 #[derive(Clone, Debug)]
@@ -107,6 +109,16 @@ struct Inner {
     /// never blocked by them, since they only ever call `.load_full()`.
     hosts_write_lock: Mutex<()>,
     port_rules_write_lock: Mutex<()>,
+    hosting_pools: ArcSwap<Vec<HostingPool>>,
+    hosting_allocations: ArcSwap<Vec<Allocation>>,
+    hosting_status: ArcSwap<HostingStatus>,
+    /// Pools and allocations are validated against each other, so they
+    /// share one write lock.
+    hosting_write_lock: Mutex<()>,
+    /// Separate from `config_dirty` and woken with `notify_one`, which keeps
+    /// a permit if the hosting loop is mid-sync -- an API change is never
+    /// lost until the 5-minute fallback.
+    hosting_dirty: Notify,
 }
 
 #[derive(Clone)]
@@ -142,6 +154,11 @@ impl AppState {
             db,
             hosts_write_lock: Mutex::new(()),
             port_rules_write_lock: Mutex::new(()),
+            hosting_pools: ArcSwap::from_pointee(Vec::new()),
+            hosting_allocations: ArcSwap::from_pointee(Vec::new()),
+            hosting_status: ArcSwap::from_pointee(HostingStatus::default()),
+            hosting_write_lock: Mutex::new(()),
+            hosting_dirty: Notify::new(),
         }))
     }
 
@@ -155,6 +172,43 @@ impl AppState {
 
     pub async fn lock_port_rules_for_write(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.0.port_rules_write_lock.lock().await
+    }
+
+    pub async fn lock_hosting_for_write(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.hosting_write_lock.lock().await
+    }
+
+    pub fn hosting_pools(&self) -> Arc<Vec<HostingPool>> {
+        self.0.hosting_pools.load_full()
+    }
+
+    pub fn hosting_allocations(&self) -> Arc<Vec<Allocation>> {
+        self.0.hosting_allocations.load_full()
+    }
+
+    /// Publishes new pools and allocations together and wakes the hosting
+    /// sync loop.
+    pub fn set_hosting(&self, pools: Vec<HostingPool>, allocations: Vec<Allocation>) {
+        self.0.hosting_pools.store(Arc::new(pools));
+        self.0.hosting_allocations.store(Arc::new(allocations));
+        self.0.hosting_dirty.notify_one();
+    }
+
+    /// Asks the hosting loop to re-sync without changing anything.
+    pub fn request_hosting_sync(&self) {
+        self.0.hosting_dirty.notify_one();
+    }
+
+    pub async fn hosting_changed(&self) {
+        self.0.hosting_dirty.notified().await;
+    }
+
+    pub fn hosting_status(&self) -> Arc<HostingStatus> {
+        self.0.hosting_status.load_full()
+    }
+
+    pub fn set_hosting_status(&self, status: HostingStatus) {
+        self.0.hosting_status.store(Arc::new(status));
     }
 
     pub fn network(&self) -> &NetworkConfig {

@@ -3,6 +3,7 @@ mod api;
 mod bootstrap;
 mod config;
 mod db;
+mod hosting;
 mod localip;
 mod logging;
 mod netbind;
@@ -124,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         proxy::run(state.clone()),
         api::run(state.clone()),
         nftables::run_sync_loop(state.clone()),
+        hosting::run_sync_loop(state.clone()),
         acme::run_renewal_loop(state.clone()),
     )?;
 

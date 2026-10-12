@@ -16,6 +16,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::hosting::model::{Allocation, ForwardMode, HostingPool, PortSpec};
 use crate::config::{
     AclKind, AclList, AcmeChallengeType, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost,
     RedirectStatus, RedirectTarget,
@@ -301,6 +302,41 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE port_rules DROP COLUMN bind_ip")
         .execute(pool)
         .await;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS hosting_pools (
+            name TEXT PRIMARY KEY,
+            cidr TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            reserved TEXT NOT NULL DEFAULT '',
+            vm_cidr TEXT,
+            gateway TEXT
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS hosting_allocations (
+            id TEXT PRIMARY KEY,
+            pool TEXT NOT NULL,
+            public_ip TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            customer TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            vm_ip TEXT,
+            vm_id INTEGER,
+            forward TEXT NOT NULL DEFAULT 'all',
+            ports TEXT NOT NULL DEFAULT '[]',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     // Only `token_hash` is ever persisted -- the plaintext token is shown
     // to the caller exactly once, at creation, and never stored anywhere.
@@ -1612,6 +1648,108 @@ pub async fn save_port_rules(pool: &SqlitePool, rules: &[PortRule]) -> Result<()
     tx.commit().await
 }
 
+pub async fn load_hosting_pools(pool: &SqlitePool) -> Result<Vec<HostingPool>, sqlx::Error> {
+    let rows = sqlx::query("SELECT name, cidr, description, reserved, vm_cidr, gateway FROM hosting_pools ORDER BY name")
+        .fetch_all(pool)
+        .await?;
+    // A row that no longer parses is skipped rather than aborting startup;
+    // the API only ever writes validated values, so this is for manual edits.
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(HostingPool {
+                name: row.get("name"),
+                cidr: row.get::<String, _>("cidr").parse().ok()?,
+                description: row.get("description"),
+                reserved: row
+                    .get::<String, _>("reserved")
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse().ok())
+                    .collect(),
+                vm_cidr: row.get::<Option<String>, _>("vm_cidr").and_then(|s| s.parse().ok()),
+                gateway: row.get::<Option<String>, _>("gateway").and_then(|s| s.parse().ok()),
+            })
+        })
+        .collect())
+}
+
+pub async fn load_hosting_allocations(pool: &SqlitePool) -> Result<Vec<Allocation>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, pool, public_ip, name, customer, notes, vm_ip, vm_id, forward, ports, enabled, created_at FROM hosting_allocations ORDER BY public_ip")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(Allocation {
+                id: Uuid::parse_str(&row.get::<String, _>("id")).ok()?,
+                pool: row.get("pool"),
+                public_ip: row.get::<String, _>("public_ip").parse().ok()?,
+                name: row.get("name"),
+                customer: row.get("customer"),
+                notes: row.get("notes"),
+                vm_ip: row.get::<Option<String>, _>("vm_ip").and_then(|s| s.parse().ok()),
+                vm_id: row.get::<Option<i64>, _>("vm_id").and_then(|v| u32::try_from(v).ok()),
+                forward: match row.get::<String, _>("forward").as_str() {
+                    "ports" => ForwardMode::Ports,
+                    _ => ForwardMode::All,
+                },
+                ports: serde_json::from_str(&row.get::<String, _>("ports")).unwrap_or_default(),
+                enabled: row.get::<i64, _>("enabled") != 0,
+                created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
+                    .ok()?
+                    .with_timezone(&Utc),
+            })
+        })
+        .collect())
+}
+
+/// Replaces both hosting tables in one transaction, so a pool and the
+/// allocations validated against it can never be persisted half-way.
+pub async fn save_hosting(
+    pool: &SqlitePool,
+    pools: &[HostingPool],
+    allocations: &[Allocation],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM hosting_allocations").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM hosting_pools").execute(&mut *tx).await?;
+    for p in pools {
+        let reserved = p.reserved.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",");
+        sqlx::query("INSERT INTO hosting_pools (name, cidr, description, reserved, vm_cidr, gateway) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&p.name)
+            .bind(p.cidr.to_string())
+            .bind(&p.description)
+            .bind(reserved)
+            .bind(p.vm_cidr.map(|n| n.to_string()))
+            .bind(p.gateway.map(|ip| ip.to_string()))
+            .execute(&mut *tx)
+            .await?;
+    }
+    for a in allocations {
+        let forward = match a.forward {
+            ForwardMode::All => "all",
+            ForwardMode::Ports => "ports",
+        };
+        sqlx::query("INSERT INTO hosting_allocations (id, pool, public_ip, name, customer, notes, vm_ip, vm_id, forward, ports, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(a.id.to_string())
+            .bind(&a.pool)
+            .bind(a.public_ip.to_string())
+            .bind(&a.name)
+            .bind(&a.customer)
+            .bind(&a.notes)
+            .bind(a.vm_ip.map(|ip| ip.to_string()))
+            .bind(a.vm_id.map(i64::from))
+            .bind(forward)
+            .bind(serde_json::to_string(&a.ports).unwrap_or_else(|_| "[]".into()))
+            .bind(a.enabled as i64)
+            .bind(a.created_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,6 +1906,103 @@ mod tests {
         save_hosts(&pool, &[sample_host()]).await.unwrap();
         save_hosts(&pool, &[]).await.unwrap();
         assert!(load_hosts(&pool).await.unwrap().is_empty());
+    }
+
+    fn sample_hosting() -> (HostingPool, Allocation) {
+        let pool = HostingPool {
+            name: "standard".into(),
+            cidr: "204.52.221.224/28".parse().unwrap(),
+            description: "standard hosting".into(),
+            reserved: vec!["204.52.221.225".parse().unwrap()],
+            vm_cidr: Some("172.16.63.0/24".parse().unwrap()),
+            gateway: Some("172.16.63.1".parse().unwrap()),
+        };
+        let alloc = Allocation {
+            id: Uuid::new_v4(),
+            pool: "standard".into(),
+            public_ip: "204.52.221.226".parse().unwrap(),
+            name: "web01".into(),
+            customer: "Acme".into(),
+            notes: "line1\nline2".into(),
+            vm_ip: Some("172.16.63.10".parse().unwrap()),
+            vm_id: Some(4001),
+            forward: ForwardMode::Ports,
+            ports: vec![
+                PortSpec { protocol: Protocol::Tcp, port_start: 22, port_end: 22 },
+                PortSpec { protocol: Protocol::Udp, port_start: 20100, port_end: 20200 },
+            ],
+            enabled: true,
+            created_at: Utc::now(),
+        };
+        (pool, alloc)
+    }
+
+    #[tokio::test]
+    async fn hosting_round_trips_including_ports_and_optional_fields() {
+        let pool = memory_pool().await;
+        let (p, a) = sample_hosting();
+        save_hosting(&pool, std::slice::from_ref(&p), std::slice::from_ref(&a)).await.unwrap();
+        let pools = load_hosting_pools(&pool).await.unwrap();
+        let allocs = load_hosting_allocations(&pool).await.unwrap();
+        assert_eq!(pools, vec![p]);
+        assert_eq!(allocs.len(), 1);
+        let got = &allocs[0];
+        assert_eq!(got.id, a.id);
+        assert_eq!(got.ports, a.ports);
+        assert_eq!(got.forward, ForwardMode::Ports);
+        assert_eq!(got.vm_ip, a.vm_ip);
+        assert_eq!(got.vm_id, Some(4001));
+        assert_eq!(got.notes, "line1\nline2");
+        assert_eq!(got.created_at.timestamp(), a.created_at.timestamp());
+    }
+
+    #[tokio::test]
+    async fn hosting_reserved_allocation_without_a_vm_round_trips_and_save_replaces() {
+        let pool = memory_pool().await;
+        let (mut p, mut a) = sample_hosting();
+        p.vm_cidr = None;
+        p.gateway = None;
+        p.reserved.clear();
+        a.vm_ip = None;
+        a.vm_id = None;
+        a.forward = ForwardMode::All;
+        a.ports.clear();
+        a.enabled = false;
+        save_hosting(&pool, &[p], &[a]).await.unwrap();
+        let allocs = load_hosting_allocations(&pool).await.unwrap();
+        assert!(allocs[0].vm_ip.is_none() && !allocs[0].enabled);
+        let pools = load_hosting_pools(&pool).await.unwrap();
+        assert!(pools[0].vm_cidr.is_none() && pools[0].reserved.is_empty());
+        save_hosting(&pool, &[], &[]).await.unwrap();
+        assert!(load_hosting_pools(&pool).await.unwrap().is_empty());
+        assert!(load_hosting_allocations(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hosting_public_ip_is_unique_in_the_schema() {
+        let pool = memory_pool().await;
+        let (p, a) = sample_hosting();
+        let mut dup = a.clone();
+        dup.id = Uuid::new_v4();
+        assert!(save_hosting(&pool, &[p], &[a, dup]).await.is_err());
+        assert!(load_hosting_allocations(&pool).await.unwrap().is_empty(), "failed save must roll back");
+    }
+
+    #[tokio::test]
+    async fn run_migrations_adds_hosting_tables_to_a_pre_existing_database_and_is_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE port_rules (id TEXT PRIMARY KEY, bind_ip TEXT, port_start INTEGER NOT NULL, port_end INTEGER NOT NULL, protocol TEXT NOT NULL, description TEXT NOT NULL, passthrough_target TEXT, enabled INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        assert!(load_hosting_pools(&pool).await.unwrap().is_empty());
+        assert!(load_hosting_allocations(&pool).await.unwrap().is_empty());
     }
 
     #[tokio::test]

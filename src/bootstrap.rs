@@ -134,6 +134,9 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
         expose_admin_port,
     );
     crate::acme::load_certs_from_disk(&state)?;
+    let hosting_pools = crate::db::load_hosting_pools(state.db()).await?;
+    let hosting_allocations = crate::db::load_hosting_allocations(state.db()).await?;
+    state.set_hosting(hosting_pools, hosting_allocations);
     start_siem(&state).await;
     Ok(state)
 }
