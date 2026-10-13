@@ -54,6 +54,17 @@ pub struct Config {
     /// same precedence as every other runtime-settable option.
     #[serde(default)]
     pub siem: Option<SiemConfig>,
+    /// Optional `[hosting]` section: pools to create on first start. Only
+    /// used when the database holds no hosting pools yet; after that the
+    /// admin API owns them.
+    #[serde(default)]
+    pub hosting: Option<HostingSeedConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostingSeedConfig {
+    #[serde(default)]
+    pub pools: Vec<crate::hosting::model::HostingPool>,
 }
 
 fn default_siem_port() -> u16 {
@@ -1188,6 +1199,34 @@ dns_api_token = "token-placeholder"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosting_seed_section_parses_and_is_optional() {
+        let cfg: Config = toml::from_str(&base_toml()).expect("should parse");
+        assert!(cfg.hosting.is_none());
+
+        let toml_str = format!(
+            r#"{}
+[[hosting.pools]]
+name = "standard"
+cidr = "204.52.221.224/28"
+vm_cidr = "172.16.63.0/24"
+gateway = "172.16.63.1"
+
+[[hosting.pools]]
+name = "ham"
+cidr = "44.30.51.224/28"
+vm_cidr = "172.16.63.0/24"
+gateway = "172.16.63.1"
+"#,
+            base_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).expect("should parse");
+        let pools = cfg.hosting.expect("hosting section").pools;
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[1].name, "ham");
+        assert!(pools[0].reserved.is_empty());
     }
 
     #[test]

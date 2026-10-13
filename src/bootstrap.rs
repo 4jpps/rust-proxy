@@ -124,6 +124,7 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
     let acme_contact_email = crate::db::load_acme_contact_email(&db_pool).await?;
     let expose_admin_port = crate::db::load_expose_admin_port(&db_pool).await?;
 
+    let seeded = seed_hosting_pools(&cfg);
     let state = AppState::new(
         cfg,
         db_pool,
@@ -134,11 +135,34 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
         expose_admin_port,
     );
     crate::acme::load_certs_from_disk(&state)?;
-    let hosting_pools = crate::db::load_hosting_pools(state.db()).await?;
+    let mut hosting_pools = crate::db::load_hosting_pools(state.db()).await?;
     let hosting_allocations = crate::db::load_hosting_allocations(state.db()).await?;
+    if hosting_pools.is_empty() && hosting_allocations.is_empty() && !seeded.is_empty() {
+        crate::db::save_hosting(state.db(), &seeded, &[]).await?;
+        tracing::info!(pools = seeded.len(), "hosting pools seeded from config");
+        hosting_pools = seeded;
+    }
     state.set_hosting(hosting_pools, hosting_allocations);
     start_siem(&state).await;
     Ok(state)
+}
+
+/// Pools from the optional `[hosting]` config section, minus any that fail
+/// validation (logged and skipped, so one typo cannot block startup).
+pub(crate) fn seed_hosting_pools(cfg: &crate::config::Config) -> Vec<crate::hosting::model::HostingPool> {
+    let Some(seed) = &cfg.hosting else { return vec![] };
+    let mut accepted: Vec<crate::hosting::model::HostingPool> = Vec::new();
+    for pool in &seed.pools {
+        if accepted.iter().any(|p| p.name == pool.name) {
+            tracing::warn!(pool = %pool.name, "ignoring duplicate [hosting] pool name");
+            continue;
+        }
+        match crate::hosting::model::validate_pool(pool, &accepted, &cfg.network.dedicated_ips) {
+            Ok(()) => accepted.push(pool.clone()),
+            Err(err) => tracing::warn!(pool = %pool.name, error = ?err, "ignoring invalid [hosting] pool"),
+        }
+    }
+    accepted
 }
 
 #[cfg(test)]
@@ -146,6 +170,31 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
+
+    #[test]
+    fn hosting_seed_keeps_valid_pools_and_skips_invalid_ones() {
+        let mut cfg = test_config();
+        let pool = |name: &str, cidr: &str| crate::hosting::model::HostingPool {
+            name: name.into(),
+            cidr: cidr.parse().unwrap(),
+            description: String::new(),
+            reserved: vec![],
+            vm_cidr: None,
+            gateway: None,
+        };
+        assert!(seed_hosting_pools(&cfg).is_empty(), "no [hosting] section");
+        cfg.hosting = Some(crate::config::HostingSeedConfig {
+            pools: vec![
+                pool("standard", "204.52.221.224/28"),
+                pool("ham", "44.30.51.224/28"),
+                pool("overlap", "204.52.221.232/29"),
+                pool("private", "10.9.0.0/28"),
+                pool("standard", "198.51.100.0/28"),
+            ],
+        });
+        let names: Vec<String> = seed_hosting_pools(&cfg).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["standard", "ham"]);
+    }
 
     fn test_config() -> Config {
         Config {
@@ -181,6 +230,7 @@ mod tests {
             port_rules: vec![],
             client_cert_forward_token: None,
             siem: None,
+            hosting: None,
         }
     }
 

@@ -16,7 +16,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::hosting::model::{Allocation, ForwardMode, HostingPool, PortSpec};
+use crate::hosting::model::{Allocation, ForwardMode, HostingPool};
 use crate::config::{
     AclKind, AclList, AcmeChallengeType, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost,
     RedirectStatus, RedirectTarget,
@@ -1753,6 +1753,7 @@ pub async fn save_hosting(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hosting::model::PortSpec;
     use std::path::PathBuf;
     use uuid::Uuid;
 

@@ -441,6 +441,7 @@ mod tests {
             port_rules: vec![],
             client_cert_forward_token: None,
             siem: None,
+            hosting: None,
         }
     }
 
