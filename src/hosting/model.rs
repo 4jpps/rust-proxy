@@ -252,7 +252,10 @@ pub fn validate_pool(candidate: &HostingPool, others: &[HostingPool], dedicated:
         }
         for other in others {
             if let Some(other_net) = other.vm_cidr {
-                if nets_overlap(&vm_net, &other_net) {
+                // Pools may share one VM network (e.g. one hosting VLAN for several
+                // classes) as long as it is the same network with the same gateway.
+                let same_network = other_net == vm_net && other.gateway == Some(gw);
+                if nets_overlap(&vm_net, &other_net) && !same_network {
                     return conflict(format!(
                         "vm_cidr overlaps pool '{}' vm_cidr {}",
                         other.name, other_net
@@ -525,9 +528,25 @@ mod tests {
         first.vm_cidr = Some("172.16.63.0/24".parse().unwrap());
         first.gateway = Some("172.16.63.1".parse().unwrap());
         assert!(matches!(
-            validate_pool(&q, &[first], &[]).unwrap_err(),
+            validate_pool(&q, &[first.clone()], &[]).unwrap_err(),
             HostingError::Conflict(_)
         ));
+
+        let mut shared = pool("ham", "44.30.51.224/28");
+        shared.vm_cidr = first.vm_cidr;
+        shared.gateway = first.gateway;
+        assert!(
+            validate_pool(&shared, &[first.clone()], &[]).is_ok(),
+            "same vm_cidr and gateway may be shared by several pools"
+        );
+        shared.gateway = Some("172.16.63.2".parse().unwrap());
+        assert!(
+            matches!(
+                validate_pool(&shared, &[first], &[]).unwrap_err(),
+                HostingError::Conflict(_)
+            ),
+            "same vm_cidr with a different gateway is a conflict"
+        );
     }
 
     #[test]
