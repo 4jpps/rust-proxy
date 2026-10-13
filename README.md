@@ -549,7 +549,8 @@ Runs on any Linux host, from a Proxmox LXC with a dedicated subnet to a
 single-IP VPS or home server -- see `network.bind_ranges` above.
 `deploy/rust-proxy.service` runs the daemon as a non-root `rust-proxy` user
 with just
-`CAP_NET_BIND_SERVICE` (privileged ports) and `CAP_NET_ADMIN` (nftables)
+`CAP_NET_BIND_SERVICE` (privileged ports), `CAP_NET_ADMIN` (nftables) and
+`CAP_NET_RAW` (the hosting reachability check's single ICMP ping)
 via `AmbientCapabilities`/`CapabilityBoundingSet`, plus
 `NoNewPrivileges`/`ProtectSystem=strict`/`ProtectHome` for defense in
 depth. The admin UI's own port is additionally restricted to
