@@ -96,6 +96,27 @@ pub fn build_router(state: AppState) -> Router {
             get(get_siem_settings).put(update_siem_settings),
         )
         .route("/api/siem/test", post(send_siem_test))
+        .route(
+            "/api/hosting/pools",
+            get(super::hosting::list_pools).post(super::hosting::create_pool),
+        )
+        .route(
+            "/api/hosting/pools/:name",
+            axum::routing::put(super::hosting::update_pool).delete(super::hosting::delete_pool),
+        )
+        .route(
+            "/api/hosting/allocations",
+            get(super::hosting::list_allocations).post(super::hosting::create_allocation),
+        )
+        .route(
+            "/api/hosting/allocations/:id",
+            get(super::hosting::get_allocation)
+                .patch(super::hosting::patch_allocation)
+                .delete(super::hosting::delete_allocation),
+        )
+        .route("/api/hosting/allocations/:id/check", post(super::hosting::check))
+        .route("/api/hosting/status", get(super::hosting::status))
+        .route("/api/hosting/apply", post(super::hosting::apply))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -336,7 +357,7 @@ fn bearer_token(req: &Request) -> Option<String> {
 }
 
 #[derive(Debug)]
-enum ApiError {
+pub(crate) enum ApiError {
     BadRequest(String),
     NotFound,
     Conflict(String),

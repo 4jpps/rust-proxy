@@ -34,8 +34,10 @@ use ipnet::Ipv4Net;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use uuid::Uuid;
 
 use crate::state::AppState;
+use model::Allocation;
 
 const FALLBACK_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -169,4 +171,178 @@ async fn apply_ruleset(ruleset: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CheckItem {
+    pub name: &'static str,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckReport {
+    pub id: Uuid,
+    pub public_ip: Ipv4Addr,
+    pub vm_ip: Option<Ipv4Addr>,
+    pub state: &'static str,
+    /// True only for an active allocation whose every check passed.
+    pub ok: bool,
+    pub checks: Vec<CheckItem>,
+}
+
+fn item(name: &'static str, ok: bool, detail: impl Into<String>) -> CheckItem {
+    CheckItem { name, ok, detail: detail.into() }
+}
+
+/// Judges the live host state for one allocation. `lo` is the output of
+/// `ip -4 -o addr show dev lo`, `ruleset` that of `nft list table ip
+/// rust_proxy_hosting`; either is an error string when it could not be read.
+pub fn evaluate_check(
+    a: &Allocation,
+    lo: Result<&str, &str>,
+    ruleset: Result<&str, &str>,
+    ping: Option<bool>,
+) -> Vec<CheckItem> {
+    let Some(vm) = a.vm_ip.filter(|_| a.is_active()) else {
+        return vec![item(
+            "active",
+            false,
+            format!("allocation is {}: nothing is forwarded", a.state()),
+        )];
+    };
+    let public = a.public_ip;
+    let mut out = vec![item("active", true, "enabled with a VM address")];
+
+    out.push(match lo {
+        Ok(text) if generator::parse_lo_addresses(text).contains(&public) => {
+            item("address_on_lo", true, format!("{public}/32 is on lo"))
+        }
+        Ok(_) => item("address_on_lo", false, format!("{public}/32 is not on lo -- sync has not applied it")),
+        Err(e) => item("address_on_lo", false, format!("could not read lo: {e}")),
+    });
+
+    let line_has = |text: &str, parts: &[String]| {
+        text.lines().any(|l| parts.iter().all(|p| l.contains(p.as_str())))
+    };
+    match ruleset {
+        Ok(text) => {
+            let dnat = line_has(text, &[format!("ip daddr {public}"), format!("dnat to {vm}")]);
+            out.push(item(
+                "dnat_rule",
+                dnat,
+                if dnat { format!("{public} -> {vm}") } else { format!("no DNAT {public} -> {vm} in table {}", generator::TABLE) },
+            ));
+            let snat = line_has(text, &[format!("ip saddr {vm}"), format!("snat to {public}")]);
+            out.push(item(
+                "snat_rule",
+                snat,
+                if snat { format!("{vm} egresses as {public}") } else { format!("no SNAT {vm} -> {public} in table {}", generator::TABLE) },
+            ));
+        }
+        Err(e) => {
+            for name in ["dnat_rule", "snat_rule"] {
+                out.push(item(name, false, format!("could not read table {}: {e}", generator::TABLE)));
+            }
+        }
+    }
+
+    out.push(match ping {
+        Some(true) => item("vm_reachable", true, format!("{vm} answers ping")),
+        Some(false) => item("vm_reachable", false, format!("{vm} did not answer ping (VM down, or blocks ICMP)")),
+        None => item("vm_reachable", false, "ping could not be run"),
+    });
+    out
+}
+
+async fn ping_once(ip: Ipv4Addr) -> Option<bool> {
+    let run = Command::new("ping")
+        .args(["-n", "-c", "1", "-W", "2", &ip.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match tokio::time::timeout(Duration::from_secs(5), run).await {
+        Ok(Ok(status)) => Some(status.success()),
+        _ => None,
+    }
+}
+
+/// Inspects the live host for one allocation. Read-only: runs `ip`, `nft
+/// list` and a single ping, changes nothing.
+pub async fn check_allocation(a: &Allocation) -> CheckReport {
+    let checks = if a.is_active() {
+        let lo = run_capture("ip", &["-4", "-o", "addr", "show", "dev", "lo"]).await;
+        let rules = run_capture("nft", &["list", "table", "ip", generator::TABLE]).await;
+        let ping = match a.vm_ip {
+            Some(vm) => ping_once(vm).await,
+            None => None,
+        };
+        let lo = lo.as_deref().map_err(|e| e.to_string());
+        let rules = rules.as_deref().map_err(|e| e.to_string());
+        evaluate_check(a, lo.as_deref().map_err(String::as_str), rules.as_deref().map_err(String::as_str), ping)
+    } else {
+        evaluate_check(a, Ok(""), Ok(""), None)
+    };
+    CheckReport {
+        id: a.id,
+        public_ip: a.public_ip,
+        vm_ip: a.vm_ip,
+        state: a.state(),
+        ok: a.is_active() && checks.iter().all(|c| c.ok),
+        checks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::ForwardMode;
+
+    fn active() -> Allocation {
+        Allocation {
+            id: Uuid::new_v4(),
+            pool: "standard".into(),
+            public_ip: "204.52.221.226".parse().unwrap(),
+            name: "web".into(),
+            customer: String::new(),
+            notes: String::new(),
+            vm_ip: Some("172.16.63.2".parse().unwrap()),
+            vm_id: None,
+            forward: ForwardMode::All,
+            ports: vec![],
+            enabled: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    const LO: &str = "1: lo    inet 127.0.0.1/8 scope host lo\n1: lo    inet 204.52.221.226/32 scope global lo";
+
+    #[test]
+    fn healthy_allocation_passes_every_check() {
+        let a = active();
+        let rules = generator::generate_ruleset(std::slice::from_ref(&a));
+        let checks = evaluate_check(&a, Ok(LO), Ok(&rules), Some(true));
+        assert!(checks.iter().all(|c| c.ok), "{checks:?}");
+        assert_eq!(checks.len(), 5);
+    }
+
+    #[test]
+    fn missing_pieces_are_reported_individually() {
+        let a = active();
+        let checks = evaluate_check(&a, Ok("1: lo inet 127.0.0.1/8"), Ok("table ip x {}"), Some(false));
+        let failed: Vec<_> = checks.iter().filter(|c| !c.ok).map(|c| c.name).collect();
+        assert_eq!(failed, ["address_on_lo", "dnat_rule", "snat_rule", "vm_reachable"]);
+        let checks = evaluate_check(&a, Err("boom"), Err("denied"), None);
+        assert_eq!(checks.iter().filter(|c| !c.ok).count(), 5 - 1);
+    }
+
+    #[test]
+    fn inactive_allocation_is_one_failed_check() {
+        let mut a = active();
+        a.vm_ip = None;
+        let checks = evaluate_check(&a, Ok(""), Ok(""), None);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].ok);
+        assert!(checks[0].detail.contains("reserved"));
+    }
 }

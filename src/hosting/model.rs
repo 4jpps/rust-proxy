@@ -178,6 +178,23 @@ pub fn next_free_ip(pool: &HostingPool, allocations: &[Allocation]) -> Option<Ip
         .find(|ip| !taken.contains(ip))
 }
 
+/// The lowest private address in the pool's `vm_cidr` that is neither the
+/// network/broadcast address, any pool's gateway, nor already used by an
+/// allocation. `None` when the pool has no `vm_cidr` or it is full.
+pub fn next_free_vm_ip(
+    pool: &HostingPool,
+    all_pools: &[HostingPool],
+    allocations: &[Allocation],
+) -> Option<Ipv4Addr> {
+    let net = pool.vm_cidr?;
+    let taken: HashSet<Ipv4Addr> = allocations.iter().filter_map(|a| a.vm_ip).collect();
+    net.hosts().find(|ip| {
+        !taken.contains(ip)
+            && pool.gateway != Some(*ip)
+            && !all_pools.iter().any(|p| p.gateway == Some(*ip))
+    })
+}
+
 /// `others` are the pools other than the one being validated.
 pub fn validate_pool(candidate: &HostingPool, others: &[HostingPool], dedicated: &[IpAddr]) -> Check {
     validate_slug(&candidate.name)?;
@@ -414,6 +431,23 @@ mod tests {
             enabled: true,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn next_free_vm_ip_skips_gateway_network_and_used() {
+        let mut p = pool("standard", "204.52.221.224/28");
+        p.vm_cidr = Some("172.16.63.0/29".parse().unwrap());
+        p.gateway = Some("172.16.63.1".parse().unwrap());
+        let pools = vec![p.clone()];
+        assert_eq!(next_free_vm_ip(&p, &pools, &[]), Some("172.16.63.2".parse().unwrap()));
+        let used = vec![alloc("standard", "204.52.221.226", Some("172.16.63.2"))];
+        assert_eq!(next_free_vm_ip(&p, &pools, &used), Some("172.16.63.3".parse().unwrap()));
+        let all: Vec<Allocation> = (2..=6)
+            .map(|i| alloc("standard", &format!("204.52.221.{}", 224 + i), Some(&format!("172.16.63.{i}"))))
+            .collect();
+        assert_eq!(next_free_vm_ip(&p, &pools, &all), None, "/29 holds .1 gateway + .2-.6");
+        p.vm_cidr = None;
+        assert_eq!(next_free_vm_ip(&p, &pools, &[]), None);
     }
 
     fn check(a: &Allocation, p: &HostingPool, others: &[Allocation]) -> Check {

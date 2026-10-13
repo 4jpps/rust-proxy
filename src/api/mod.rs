@@ -6,6 +6,7 @@
 //! nftables' job.
 
 pub mod auth;
+pub mod hosting;
 pub mod routes;
 
 use std::net::{IpAddr, SocketAddr};
