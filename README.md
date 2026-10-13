@@ -351,6 +351,48 @@ mappings; normal `access` traffic stays at level 2 so it is archived
 but not alerted; edit the hostname suffix list in rule 100371 to match
 your own domains; `install-retention.sh` adds an optional log-retention cron) into `/var/ossec/etc/decoders` and `/rules`.
 
+### Public-address hosting (optional)
+
+Turns a routed block of public addresses (for example a /28) into 1:1
+forwards to private customer VMs. Nothing happens until you create a pool.
+
+```bash
+# a pool is a class; "standard" and "ham" are just names
+curl -X POST http://127.0.0.1:8084/api/hosting/pools -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"standard","cidr":"204.52.221.224/28","reserved":["204.52.221.225"],
+       "vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1"}'
+
+# next free public address + next free private address, plus provisioning hints
+curl -X POST http://127.0.0.1:8084/api/hosting/allocations -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"class":"standard","name":"web01","customer":"Acme"}'
+```
+
+The response's `provision` object carries what to configure on the VM
+(`private_ip`, `gateway`, `netmask`, `cidr`, `ipconfig0`). `forward` is
+`"all"` (every protocol and port) or `"ports"` with a `ports` list.
+`POST /api/hosting/allocations/:id/check` verifies the live state and
+`GET /api/hosting/status` shows per-pool usage and the last apply.
+
+How it is applied: a `/32` on `lo` per active allocation, a blackhole
+route per pool (unallocated addresses stay silent), and an `ip
+rust_proxy_hosting` nftables table with DNAT in, SNAT out, a guard that
+drops non-ICMP traffic left addressed to a hosted IP, and a rule that
+keeps VMs off private networks. Other tables (`inet rust_proxy`, a router
+table) are never modified, so the host's forward policy must also accept
+the VM network. Needs `CAP_NET_ADMIN`; addresses in `network.dedicated_ips`
+or already bound to a host or port rule cannot be hosted.
+
+Pools can be pre-created on first start (only when the database has none):
+
+```toml
+[[hosting.pools]]
+name     = "standard"
+cidr     = "204.52.221.224/28"
+vm_cidr  = "172.16.63.0/24"
+gateway  = "172.16.63.1"
+```
+
 ## API
 
 Every route under `/api/*` except `/api/login`/`/api/logout` requires

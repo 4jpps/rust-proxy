@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- **Public-address hosting: routed pools, 1:1 forwarding to customer VMs
+  (off until a pool exists).** New `/api/hosting` API: pools (a routed
+  block such as a /28, used as a class like `standard` or `ham`, with an
+  optional private `vm_cidr` and `gateway`) and allocations (one public
+  address forwarded to one VM). `POST /api/hosting/allocations` takes an
+  explicit `public_ip` or just a `pool`/`class` for the next free address,
+  assigns a free private VM address from the pool's `vm_cidr`, and returns
+  a `provision` object (private IP, gateway, netmask, CIDR, hostname hint,
+  Proxmox `ipconfig0`). `POST /api/hosting/allocations/:id/check` inspects
+  the live host (address on `lo`, DNAT/SNAT loaded, VM answers ping) and
+  `GET /api/hosting/status` reports applied state plus per-pool usage.
+  Changes are stored in sqlite and applied by a sync loop (also resynced
+  every 5 minutes): a `/32` on `lo` per active allocation, a blackhole
+  route per pool, and a separate `ip rust_proxy_hosting` nftables table
+  with 1:1 DNAT (all protocols or listed ports), SNAT of the VM's egress
+  to its public address, a guard that drops non-ICMP traffic still
+  addressed to a hosted IP, and isolation of VMs from private networks.
+  It never touches `inet rust_proxy` or other tables, does nothing at all
+  when no pools exist, is idempotent, and needs only the existing
+  `CAP_NET_ADMIN`. Pools named in an optional `[[hosting.pools]]` config
+  section are created on first start when the database has none.
+  Forwarded traffic must still be admitted by the host's own forward
+  policy.
+
 - **Optional SIEM / syslog forwarding (off by default, vendor-neutral).**
   New `[siem]` config section (and a web UI panel plus
   `GET`/`PUT /api/siem`, `POST /api/siem/test`, stored in the DB and
