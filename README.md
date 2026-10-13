@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.svg" alt="RustProxy" width="280">
+</p>
+
 # rust-proxy
 
 A lightweight L7 reverse proxy daemon in Rust, built as an open,
