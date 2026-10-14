@@ -1,9 +1,9 @@
 [package]
 name = "rust-proxy"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight L7 reverse proxy daemon with native ACME, dynamic nftables orchestration, and a web admin UI"
-license = "MIT"
+license = "AGPL-3.0-only OR LicenseRef-Commercial"
 authors = ["Jeff Parrish PC Services LLC <https://www.jpps.us>"]
 repository = "https://gitlab.jpps.us/jpps/rust-proxy"
 
@@ -92,5 +92,7 @@ assets = [
     ["deploy/config.toml.example", "usr/share/doc/rust-proxy/", "644"],
     ["README.md", "usr/share/doc/rust-proxy/", "644"],
     ["LICENSE", "usr/share/doc/rust-proxy/", "644"],
+    ["COMMERCIAL-LICENSE.md", "usr/share/doc/rust-proxy/", "644"],
+    ["CLA.md", "usr/share/doc/rust-proxy/", "644"],
 ]
 maintainer-scripts = "deploy/debian/"
