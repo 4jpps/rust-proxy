@@ -410,6 +410,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -477,6 +478,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         }]);
@@ -562,6 +564,7 @@ mod tests {
                     path_rewrite: None,
                     static_root: None,
                     rewrite_samesite_none_cookies: false,
+                    deny_fallback: None,
             pass_client_cert_header: false,
                     enabled: true,
                 }]);

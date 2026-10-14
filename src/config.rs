@@ -294,6 +294,12 @@ pub struct NetworkConfig {
     /// listeners refuse connections that arrived on it.
     #[serde(default)]
     pub dedicated_ips: Vec<IpAddr>,
+    /// Interfaces on which this host runs a DHCP server (e.g. dnsmasq).
+    /// The default-DROP input chain otherwise discards client broadcasts
+    /// to UDP 67; each listed interface gets an `iifname ... udp dport 67
+    /// accept`. rust-proxy does not serve DHCP itself.
+    #[serde(default)]
+    pub dhcp_interfaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -680,8 +686,82 @@ pub struct ProxyHost {
     /// would break if this were forced on unconditionally.
     #[serde(default)]
     pub rewrite_samesite_none_cookies: bool,
+    /// What a visitor who fails this host's IP-allow ACL sees instead of
+    /// the standard 403 block page. `None` (the default) keeps the 403.
+    /// Only consulted for the "IP-allow list(s) selected, no Login list"
+    /// case -- a host with a Login ACL sends non-matching visitors to its
+    /// login page instead, and that always takes precedence. See
+    /// `DenyFallback` and `proxy::access::deny_fallback_decision`.
+    #[serde(default)]
+    pub deny_fallback: Option<DenyFallback>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// Per-host "send blocked visitors somewhere useful" setting -- works on
+/// any host with an IP-allow ACL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenyFallback {
+    /// Who this applies to. `Blocked` (default): only visitors who fail
+    /// the host's IP-allow ACL. `Everyone`: every visitor, ACL or not --
+    /// a pure path lock (e.g. a captive-portal port that must only ever
+    /// serve `/guest/`). With `Everyone`, a path outside the allowed set
+    /// gets a plain 404 (or the redirect, per `lock`/root rules below)
+    /// instead of reaching the upstream at all.
+    #[serde(default)]
+    pub scope: DenyScope,
+    /// Same-site path (must start with a single `/`) a blocked visitor is
+    /// redirected to, e.g. `/live/`. Always reachable by blocked visitors.
+    /// Empty means "no redirect": nothing is redirected, and only
+    /// `allow_paths` are reachable (a pure path allow-list).
+    #[serde(default)]
+    pub redirect_path: String,
+    /// `false`: a blocked visitor is redirected only when they visit the
+    /// site root (`/`); every other path they request still gets the
+    /// standard 403. `true`: they are locked to `redirect_path` -- any
+    /// other GET/HEAD path redirects back to it (other methods get 403).
+    #[serde(default)]
+    pub lock: bool,
+    /// Extra path prefixes blocked visitors may load as-is, so the
+    /// redirect page can fetch its own CSS/JS/images (e.g. `/css/`,
+    /// `/js/`). A prefix ending in `/` matches everything beneath it;
+    /// otherwise it matches that exact path and anything under
+    /// `<prefix>/`. Paths containing `..` or encoded dots/slashes never
+    /// match.
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenyScope {
+    #[default]
+    Blocked,
+    Everyone,
+}
+
+impl DenyFallback {
+    /// Rejects a `redirect_path`/`allow_paths` that isn't a plain
+    /// same-site path (an open-redirect risk, see
+    /// `proxy::login::sanitize_return_to`).
+    pub fn validate(&self) -> Result<(), String> {
+        fn check(p: &str, what: &str) -> Result<(), String> {
+            if !p.starts_with('/') || p.starts_with("//") || p.contains('\\') || p.contains('?') || p.contains('#') || p.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(format!("{what} must be a plain path starting with a single '/' (got {p:?})"));
+            }
+            Ok(())
+        }
+        if self.redirect_path.is_empty() && self.allow_paths.is_empty() {
+            return Err("deny_fallback needs a redirect_path or at least one allow_paths entry".into());
+        }
+        if !self.redirect_path.is_empty() {
+            check(&self.redirect_path, "deny_fallback redirect_path")?;
+        }
+        for p in &self.allow_paths {
+            check(p, "deny_fallback allow_paths entry")?;
+        }
+        Ok(())
+    }
 }
 
 /// See `ProxyHost::path_rewrite`'s doc comment for the exact semantics.
@@ -1379,6 +1459,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1412,6 +1493,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1444,6 +1526,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1473,6 +1556,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1506,6 +1590,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1539,6 +1624,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1635,6 +1721,7 @@ gateway = "172.16.63.1"
                 path_rewrite: None,
                 static_root: None,
                 rewrite_samesite_none_cookies: false,
+                deny_fallback: None,
             pass_client_cert_header: false,
                 enabled: true,
             });
@@ -1669,6 +1756,7 @@ gateway = "172.16.63.1"
                 path_rewrite: None,
                 static_root: None,
                 rewrite_samesite_none_cookies: false,
+                deny_fallback: None,
             pass_client_cert_header: false,
                 enabled: true,
             });
@@ -1699,6 +1787,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1740,6 +1829,7 @@ gateway = "172.16.63.1"
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });

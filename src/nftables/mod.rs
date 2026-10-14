@@ -103,6 +103,7 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
         state.expose_admin_port(),
         &rule_allow_ips,
         &state.network().dedicated_ips,
+        &state.network().dhcp_interfaces,
     );
     apply(&ruleset).await
 }

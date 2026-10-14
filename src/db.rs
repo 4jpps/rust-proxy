@@ -176,6 +176,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN pass_client_cert_header INTEGER NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
+    // JSON-encoded `config::DenyFallback`; NULL means none.
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN deny_fallback TEXT")
+        .execute(pool)
+        .await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
     // copied above) and `access_allow_ips`/`access_login_username`/
     // `access_login_password_hash` (superseded by the acl_lists/
@@ -1437,7 +1441,7 @@ pub async fn set_siem_settings(
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -1505,6 +1509,9 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                     .map(std::path::PathBuf::from),
                 rewrite_samesite_none_cookies: row.get::<i64, _>("rewrite_samesite_none_cookies") != 0,
                 pass_client_cert_header: row.get::<i64, _>("pass_client_cert_header") != 0,
+                deny_fallback: row
+                    .get::<Option<String>, _>("deny_fallback")
+                    .and_then(|s| serde_json::from_str(&s).ok()),
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1543,8 +1550,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -1569,6 +1576,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.static_root.as_ref().map(|p| p.to_string_lossy().to_string()))
         .bind(h.rewrite_samesite_none_cookies as i64)
         .bind(h.pass_client_cert_header as i64)
+        .bind(h.deny_fallback.as_ref().and_then(|d| serde_json::to_string(d).ok()))
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -1782,6 +1790,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1816,6 +1825,21 @@ mod tests {
         assert_eq!(loaded[0].id, host.id);
         assert!(loaded[0].websockets);
         assert!(!loaded[0].rewrite_samesite_none_cookies, "sample_host()'s default (false) must round-trip too, not just true");
+    }
+
+    #[tokio::test]
+    async fn deny_fallback_round_trips() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.deny_fallback = Some(crate::config::DenyFallback {
+            scope: crate::config::DenyScope::Everyone,
+            redirect_path: "/guest/".into(),
+            lock: true,
+            allow_paths: vec!["/css/".into()],
+        });
+        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert_eq!(loaded[0].deny_fallback, host.deny_fallback);
     }
 
     #[tokio::test]

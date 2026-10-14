@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+- **Per-host path lock / blocked-visitor redirect (`deny_fallback`).** A
+  proxy host can now carry an optional `deny_fallback` setting (API field,
+  sqlite column and an Advanced panel in the web UI) that replaces the
+  plain block page with something more useful. `redirect_path` sends
+  visitors to a public landing page (empty means no redirect, just a plain
+  404 for anything not allowed), `lock` pins every request to that page,
+  and `allow_paths` lists the paths that must keep working so the page can
+  load its own resources (a trailing `/` matches everything beneath it;
+  `..` segments and encoded slashes or dots never match). `scope` chooses
+  who it applies to: `blocked` (visitors an IP-allow ACL turns away; ACL
+  members still see the whole site) or `everyone` (a pure path allow-list
+  in front of the host, applied before the ACL gate). Only GET and HEAD are
+  ever redirected; anything else outside the allow-list is refused. Typical
+  uses: a hotspot dashboard whose public `/live/` page stays open while the
+  admin area is reachable only from allowed networks, and a UniFi guest
+  portal host that exposes only `/guest/`.
+
+- **Hosted VMs: matching last octet, CGNAT networks, DHCP.** Automatic VM
+  address assignment now prefers the private address whose last octet
+  equals the public one (falling back to the lowest free address). A pool's
+  `vm_cidr` and a VM address may now sit in 100.64.0.0/10 as well as RFC
+  1918 space, and VMs are isolated from that range like any other private
+  network. New `network.dhcp_interfaces` setting opens UDP 67 on the named
+  interfaces so a DHCP server on the host can answer clients there.
+
 - **Public-address hosting: routed pools, 1:1 forwarding to customer VMs
   (off until a pool exists).** New `/api/hosting` API: pools (a routed
   block such as a /28, used as a class like `standard` or `ham`, with an

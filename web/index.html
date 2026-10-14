@@ -881,7 +881,7 @@ function hostFormHTML(h) {
   const creds = [['', 'auto (only if exactly one exists)'], ...(D.dnsCreds || []).map((c) => [c.id, `${c.name} (${c.provider})`])];
   const acls = D.acls || [];
   const sel_ = new Set(h.acl_ids || []);
-  const advOpen = h.redirect || h.static_root || h.path_rewrite || h.rewrite_samesite_none_cookies || h.pass_client_cert_header;
+  const advOpen = h.redirect || h.static_root || h.path_rewrite || h.rewrite_samesite_none_cookies || h.pass_client_cert_header || h.deny_fallback;
   return `
   <fieldset><legend>Basics</legend>
     <div class="fgrid">
@@ -934,6 +934,14 @@ function hostFormHTML(h) {
         ${fld({ name: 'path_rewrite_replacement', label: 'Replacement', value: h.path_rewrite ? h.path_rewrite.replacement : '', placeholder: '/$1/-/wikis/Home', wide: true, mono: true, help: 'Use $1, $2 for capture groups. Both fields must be filled for the rewrite to apply.' })}
       </div>
     </fieldset>
+    <fieldset><legend>Path lock / blocked-visitor redirect</legend>
+      <div class="fgrid">
+        ${fld({ name: 'df_redirect_path', label: 'Redirect page (optional)', value: h.deny_fallback ? h.deny_fallback.redirect_path : '', placeholder: '/live/', mono: true, help: 'Where visitors outside the allowed set are sent. Blank: no redirect, they just get the block page / 404. Leave this and the paths below blank to turn the whole feature off.' })}
+        ${sel({ name: 'df_scope', label: 'Applies to', value: h.deny_fallback ? h.deny_fallback.scope : 'blocked', options: [['blocked', 'Visitors blocked by an IP-allow list'], ['everyone', 'Everyone (pure path lock, others get 404)']] })}
+        ${ta({ name: 'df_allow_paths', label: 'Also allow these paths (one per line)', value: h.deny_fallback ? (h.deny_fallback.allow_paths || []).join('\n') : '', rows: 3, help: 'So the redirect page can load its own CSS, scripts and images, e.g. /css/ /js/ /images/. A path ending in / allows everything beneath it.' })}
+      </div>
+      <div class="checks">${chk({ name: 'df_lock', label: 'Lock to the redirect page and allowed paths', checked: h.deny_fallback ? h.deny_fallback.lock : false, help: 'On: every other path sends the visitor back to the redirect page. Off: only the site root redirects; other paths get the block page.' })}</div>
+    </fieldset>
     <fieldset><legend>Compatibility</legend>
       <div class="checks">
         ${chk({ name: 'rewrite_samesite_none_cookies', label: 'Downgrade SameSite=None cookies to SameSite=Lax', checked: h.rewrite_samesite_none_cookies, help: 'Only if an upstream hardcodes SameSite=None and browsers drop its session cookie.' })}
@@ -958,10 +966,14 @@ function collectHost(form) {
     redirect: redirectTarget ? { target: redirectTarget, preserve_path: on('redirect_preserve_path'), status: fd.get('redirect_status') } : null,
     static_root: fd.get('static_root').trim() || null,
     path_rewrite: pat && rep ? { pattern: pat, replacement: rep } : null,
+    deny_fallback: ((fd.get('df_redirect_path') || '').trim() || (fd.get('df_allow_paths') || '').trim()) ? {
+      redirect_path: (fd.get('df_redirect_path') || '').trim(), scope: fd.get('df_scope'), lock: on('df_lock'),
+      allow_paths: (fd.get('df_allow_paths') || '').split('\n').map((x) => x.trim()).filter(Boolean),
+    } : null,
     enabled: on('enabled'),
   };
 }
-const HOST_DEFAULTS = { domain: '', bind_ip_v4: '0.0.0.0', bind_ip_v6: '::', bind_port: 443, upstream: '', upstream_https: false, upstream_tls_verify: true, upstream_preserve_host: true, websockets: false, force_https: true, enabled: true, acme_enabled: true, acme_challenge_type: 'auto', acl_ids: [], rewrite_samesite_none_cookies: false, pass_client_cert_header: false };
+const HOST_DEFAULTS = { domain: '', bind_ip_v4: '0.0.0.0', bind_ip_v6: '::', bind_port: 443, upstream: '', upstream_https: false, upstream_tls_verify: true, upstream_preserve_host: true, websockets: false, force_https: true, enabled: true, acme_enabled: true, acme_challenge_type: 'auto', acl_ids: [], rewrite_samesite_none_cookies: false, pass_client_cert_header: false, deny_fallback: null };
 async function openHostDrawer(id) {
   await ensure(['localIps', 'dnsCreds', 'acls', 'certs']);
   let host = null;

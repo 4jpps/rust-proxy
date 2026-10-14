@@ -15,7 +15,7 @@ use crate::config::Protocol;
 
 pub const TABLE: &str = "rust_proxy_hosting";
 
-const PRIVATE_NETS: &str = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16";
+const PRIVATE_NETS: &str = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10";
 
 fn port_set(ports: &[PortSpec], protocol: Protocol) -> Option<String> {
     let mut ranges: Vec<(u16, u16)> = ports
@@ -53,7 +53,7 @@ fn ip_set(ips: &[Ipv4Addr]) -> String {
 ///   was not forwarded, so it would land on this host's own wildcard
 ///   listeners and rules (80/443, SSH carve-outs, the admin port). Dropped,
 ///   except ICMP.
-/// - `forward`: a hosted VM may not open new connections to private ranges,
+/// - `forward`: a hosted VM may not open new connections to private or CGNAT ranges,
 ///   which keeps customer VMs off the internal networks.
 pub fn generate_ruleset(allocations: &[Allocation]) -> String {
     let mut active: Vec<&Allocation> = allocations.iter().filter(|a| a.is_active()).collect();
@@ -203,11 +203,11 @@ mod tests {
         let out = generate_ruleset(&[alloc("204.52.221.226", Some("172.16.63.10"), ForwardMode::All, vec![])]);
         assert!(out.contains("ip daddr 204.52.221.226 dnat to 172.16.63.10\n"));
         assert!(out.contains(
-            "ip saddr 172.16.63.10 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 204.52.221.226\n"
+            "ip saddr 172.16.63.10 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } snat to 204.52.221.226\n"
         ));
         assert!(out.contains("ip daddr { 204.52.221.226 } meta l4proto != icmp drop\n"));
         assert!(out.contains(
-            "ip saddr { 172.16.63.10 } ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } ct state new drop\n"
+            "ip saddr { 172.16.63.10 } ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } ct state new drop\n"
         ));
     }
 

@@ -792,6 +792,9 @@ struct HostRequest {
     /// See `config::ProxyHost::pass_client_cert_header`'s doc comment.
     #[serde(default)]
     pass_client_cert_header: bool,
+    /// See `config::ProxyHost::deny_fallback`'s doc comment.
+    #[serde(default)]
+    deny_fallback: Option<crate::config::DenyFallback>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -832,6 +835,9 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     if let Some(path_rewrite) = &req.path_rewrite {
         regex::Regex::new(&path_rewrite.pattern)
             .map_err(|e| ApiError::BadRequest(format!("invalid path_rewrite pattern: {e}")))?;
+    }
+    if let Some(fallback) = &req.deny_fallback {
+        fallback.validate().map_err(ApiError::BadRequest)?;
     }
     Ok(())
 }
@@ -1355,6 +1361,7 @@ async fn create_host(
         static_root: body.static_root,
         rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
         pass_client_cert_header: body.pass_client_cert_header,
+        deny_fallback: body.deny_fallback,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -1395,6 +1402,7 @@ async fn update_host(
         static_root: body.static_root,
         rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
         pass_client_cert_header: body.pass_client_cert_header,
+        deny_fallback: body.deny_fallback,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;
@@ -2041,6 +2049,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -2083,6 +2092,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -2130,6 +2140,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -2172,6 +2183,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -2301,6 +2313,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -4704,6 +4717,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),

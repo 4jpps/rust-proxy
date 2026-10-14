@@ -18,9 +18,137 @@ pub fn ip_allowed(allow_ips: &[IpNet], addr: IpAddr) -> bool {
     allow_ips.is_empty() || allow_ips.iter().any(|net| net.contains(&addr))
 }
 
+/// What to do with a request from a source that failed the host's
+/// IP-allow ACL, when the host has a `DenyFallback` configured.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DenyDecision {
+    /// Standard 403 block page.
+    Forbidden,
+    /// 302 to this same-site path.
+    Redirect(String),
+    /// Let the request through to the host's normal handling (it is the
+    /// fallback page itself or one of its allowed resource paths).
+    PassThrough,
+}
+
+fn path_is_safe(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    !(path.split('/').any(|seg| seg == "..")
+        || lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || path.contains('\\'))
+}
+
+fn prefix_matches(prefix: &str, path: &str) -> bool {
+    if prefix.ends_with('/') {
+        path.starts_with(prefix)
+    } else {
+        path == prefix || (path.starts_with(prefix) && path[prefix.len()..].starts_with('/'))
+    }
+}
+
+pub fn deny_fallback_decision(
+    fb: &crate::config::DenyFallback,
+    path: &str,
+    method: &hyper::Method,
+) -> DenyDecision {
+    if path_is_safe(path) {
+        let allowed = std::iter::once(fb.redirect_path.as_str())
+            .chain(fb.allow_paths.iter().map(String::as_str))
+            .filter(|p| !p.is_empty())
+            .any(|p| prefix_matches(p, path));
+        if allowed {
+            return DenyDecision::PassThrough;
+        }
+    }
+    if fb.redirect_path.is_empty() {
+        return DenyDecision::Forbidden;
+    }
+    let safe_method = method == hyper::Method::GET || method == hyper::Method::HEAD;
+    if !safe_method {
+        return DenyDecision::Forbidden;
+    }
+    // `/live` (no trailing slash) for a `/live/` fallback: bounce it
+    // ourselves instead of letting the upstream answer with its own,
+    // possibly scheme-wrong, redirect.
+    let bare = fb.redirect_path.trim_end_matches('/');
+    if path == "/" || path == bare || fb.lock {
+        return DenyDecision::Redirect(fb.redirect_path.clone());
+    }
+    DenyDecision::Forbidden
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DenyFallback;
+    use hyper::Method;
+
+    fn fb(lock: bool) -> DenyFallback {
+        DenyFallback {
+            scope: Default::default(),
+            redirect_path: "/live/".into(),
+            lock,
+            allow_paths: vec!["/css/".into(), "/js".into()],
+        }
+    }
+
+    #[test]
+    fn fallback_page_and_resources_pass_through() {
+        for p in ["/live/", "/live/x.json", "/css/a.css", "/js", "/js/app.js"] {
+            assert_eq!(deny_fallback_decision(&fb(false), p, &Method::GET), DenyDecision::PassThrough, "{p}");
+        }
+    }
+
+    #[test]
+    fn unlocked_redirects_only_the_root() {
+        assert_eq!(deny_fallback_decision(&fb(false), "/", &Method::GET), DenyDecision::Redirect("/live/".into()));
+        assert_eq!(deny_fallback_decision(&fb(false), "/admin/", &Method::GET), DenyDecision::Forbidden);
+    }
+
+    #[test]
+    fn locked_redirects_everything_else_for_get_only() {
+        assert_eq!(deny_fallback_decision(&fb(true), "/admin/", &Method::GET), DenyDecision::Redirect("/live/".into()));
+        assert_eq!(deny_fallback_decision(&fb(true), "/admin/", &Method::HEAD), DenyDecision::Redirect("/live/".into()));
+        assert_eq!(deny_fallback_decision(&fb(true), "/admin/", &Method::POST), DenyDecision::Forbidden);
+        assert_eq!(deny_fallback_decision(&fb(true), "/live/x", &Method::POST), DenyDecision::PassThrough);
+    }
+
+    #[test]
+    fn bare_fallback_path_is_bounced_to_the_slash_form() {
+        assert_eq!(deny_fallback_decision(&fb(false), "/live", &Method::GET), DenyDecision::Redirect("/live/".into()));
+    }
+
+    #[test]
+    fn prefix_lookalikes_and_traversal_do_not_pass() {
+        assert_eq!(deny_fallback_decision(&fb(true), "/livex", &Method::GET), DenyDecision::Redirect("/live/".into()));
+        assert_eq!(deny_fallback_decision(&fb(true), "/jsx/a", &Method::GET), DenyDecision::Redirect("/live/".into()));
+        for p in ["/live/../admin/", "/css/%2e%2e/admin/", "/css/..%2fadmin"] {
+            assert_ne!(deny_fallback_decision(&fb(true), p, &Method::GET), DenyDecision::PassThrough, "{p}");
+        }
+    }
+
+    #[test]
+    fn empty_redirect_is_a_pure_allow_list() {
+        let f = DenyFallback { scope: Default::default(), redirect_path: String::new(), lock: true, allow_paths: vec!["/guest/".into()] };
+        assert!(f.validate().is_ok());
+        assert_eq!(deny_fallback_decision(&f, "/guest/s/x", &Method::GET), DenyDecision::PassThrough);
+        assert_eq!(deny_fallback_decision(&f, "/", &Method::GET), DenyDecision::Forbidden);
+        assert_eq!(deny_fallback_decision(&f, "/api/", &Method::GET), DenyDecision::Forbidden);
+        let empty = DenyFallback { scope: Default::default(), redirect_path: String::new(), lock: false, allow_paths: vec![] };
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_offsite_paths() {
+        let mut f = fb(false);
+        assert!(f.validate().is_ok());
+        for bad in ["//evil.com", "live", "http://x", "/a?b", "/a b"] {
+            f.redirect_path = bad.into();
+            assert!(f.validate().is_err(), "{bad}");
+        }
+    }
 
     fn net(cidr: &str) -> IpNet {
         cidr.parse().unwrap()

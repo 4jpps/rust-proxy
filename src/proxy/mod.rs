@@ -579,6 +579,17 @@ async fn route_https_request(
                     .any(|s| s == subject)
         });
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
+    if let Some(fb) = host
+        .deny_fallback
+        .as_ref()
+        .filter(|fb| fb.scope == crate::config::DenyScope::Everyone)
+    {
+        match access::deny_fallback_decision(fb, req.uri().path(), req.method()) {
+            access::DenyDecision::PassThrough => {}
+            access::DenyDecision::Redirect(path) => return Ok(fallback_redirect(&path)),
+            access::DenyDecision::Forbidden => return Ok(not_found_page()),
+        }
+    }
     if !(client_cert_ok || (resolved_acls.has_ip_allow_acl && ip_allowed)) {
         if resolved_acls.has_login_acl {
             let has_valid_session = find_cookie(&req, login::SESSION_COOKIE)
@@ -598,7 +609,16 @@ async fn route_https_request(
                 .await);
             }
         } else if resolved_acls.has_ip_allow_acl {
-            if crate::siem::wants(crate::siem::Category::Denied) {
+            let decision = match &host.deny_fallback {
+                Some(fb) => access::deny_fallback_decision(fb, req.uri().path(), req.method()),
+                None => access::DenyDecision::Forbidden,
+            };
+            if let access::DenyDecision::Redirect(path) = &decision {
+                return Ok(fallback_redirect(path));
+            }
+            if decision == access::DenyDecision::Forbidden
+                && crate::siem::wants(crate::siem::Category::Denied)
+            {
                 let client_ip = peer_ip.to_string();
                 crate::siem::emit(
                     crate::siem::Category::Denied,
@@ -613,7 +633,9 @@ async fn route_https_request(
                     ],
                 );
             }
-            return Ok(forbidden_page(&host.domain));
+            if decision == access::DenyDecision::Forbidden {
+                return Ok(forbidden_page(&host.domain));
+            }
         }
     }
 
@@ -1012,6 +1034,31 @@ fn bad_gateway() -> Response<BoxBody<Bytes, hyper::Error>> {
         .expect("static response is always valid")
 }
 
+fn fallback_redirect(path: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(hyper::StatusCode::FOUND)
+        .header(hyper::header::LOCATION, path)
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .body(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("static fallback redirect response is always valid")
+}
+
+fn not_found_page() -> Response<BoxBody<Bytes, hyper::Error>> {
+    Response::builder()
+        .status(hyper::StatusCode::NOT_FOUND)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(
+            http_body_util::Full::new(Bytes::from_static(b"Not found\n"))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("static not-found response is always valid")
+}
+
 /// A real "Access denied" page, not a bare unstyled 403 -- shown for a
 /// host with an IP-allow ACL and no login ACL to fall back to, whose
 /// visitor's source IP didn't match (see `handle_https_request`'s
@@ -1268,6 +1315,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
@@ -1395,6 +1443,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1874,6 +1923,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1931,6 +1981,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1957,6 +2008,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: true,
             enabled: true,
         }
@@ -2317,6 +2369,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         }

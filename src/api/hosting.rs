@@ -436,7 +436,7 @@ pub async fn create_allocation(
     let vm_ip = match req.vm_ip {
         Some(ip) => Some(ip),
         None if req.assign_vm_ip && pool.vm_cidr.is_some() => {
-            Some(model::next_free_vm_ip(pool, &pools, &allocations).ok_or_else(|| {
+            Some(model::next_free_vm_ip(pool, &pools, &allocations, Some(public_ip)).ok_or_else(|| {
                 ApiError::Conflict(format!("pool '{}' has no free VM addresses", pool.name))
             })?)
         }
@@ -637,6 +637,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec!["204.52.221.224/27".parse().unwrap()],
                 dedicated_ips: dedicated,
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -980,24 +981,24 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{a}");
         assert_eq!(a["pool"], "standard", "`class` is an alias for `pool`");
         assert_eq!(a["state"], "active");
-        assert_eq!(a["vm_ip"], "172.16.63.2", ".0 network and .1 gateway are skipped");
+        assert_eq!(a["vm_ip"], "172.16.63.226", "private last octet matches the public address");
         let p = &a["provision"];
         assert_eq!(p["public_ip"], "204.52.221.226");
-        assert_eq!(p["private_ip"], "172.16.63.2");
+        assert_eq!(p["private_ip"], "172.16.63.226");
         assert_eq!(p["gateway"], "172.16.63.1");
         assert_eq!(p["netmask"], "255.255.255.0");
-        assert_eq!(p["cidr"], "172.16.63.2/24");
+        assert_eq!(p["cidr"], "172.16.63.226/24");
         assert_eq!(p["hostname"], "my-web-01");
-        assert_eq!(p["ipconfig0"], "ip=172.16.63.2/24,gw=172.16.63.1");
+        assert_eq!(p["ipconfig0"], "ip=172.16.63.226/24,gw=172.16.63.1");
 
         let (_, b) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"b"}"#).await;
-        assert_eq!(b["vm_ip"], "172.16.63.3", "each VM gets its own private address");
+        assert_eq!(b["vm_ip"], "172.16.63.227", "each VM gets its own private address");
 
         let (s, _) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","class":"standard","name":"c"}"#).await;
         assert!(s.is_client_error(), "pool and class together is ambiguous");
 
         let (_, g) = call(&router, &cookie, "GET", &format!("/api/hosting/allocations/{}", a["id"].as_str().unwrap()), "").await;
-        assert_eq!(g["provision"]["private_ip"], "172.16.63.2", "GET carries provision too");
+        assert_eq!(g["provision"]["private_ip"], "172.16.63.226", "GET carries provision too");
     }
 
     #[tokio::test]

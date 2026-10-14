@@ -131,6 +131,11 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     o[0] == 100 && (o[1] & 0xc0) == 64
 }
 
+/// RFC 1918 or CGNAT (100.64.0.0/10): address space a hosted VM may use internally.
+fn is_internal(ip: Ipv4Addr) -> bool {
+    ip.is_private() || is_cgnat(ip)
+}
+
 fn is_publicly_routable(ip: Ipv4Addr) -> bool {
     !(ip.is_private()
         || ip.is_loopback()
@@ -178,21 +183,31 @@ pub fn next_free_ip(pool: &HostingPool, allocations: &[Allocation]) -> Option<Ip
         .find(|ip| !taken.contains(ip))
 }
 
-/// The lowest private address in the pool's `vm_cidr` that is neither the
+/// A private address in the pool's `vm_cidr` that is neither the
 /// network/broadcast address, any pool's gateway, nor already used by an
-/// allocation. `None` when the pool has no `vm_cidr` or it is full.
+/// allocation. Prefers the address whose last octet equals `public_ip`'s (so
+/// the private and public addresses line up); otherwise the lowest free one.
+/// `None` when the pool has no `vm_cidr` or it is full.
 pub fn next_free_vm_ip(
     pool: &HostingPool,
     all_pools: &[HostingPool],
     allocations: &[Allocation],
+    public_ip: Option<Ipv4Addr>,
 ) -> Option<Ipv4Addr> {
     let net = pool.vm_cidr?;
     let taken: HashSet<Ipv4Addr> = allocations.iter().filter_map(|a| a.vm_ip).collect();
-    net.hosts().find(|ip| {
+    let free = |ip: &Ipv4Addr| {
         !taken.contains(ip)
             && pool.gateway != Some(*ip)
             && !all_pools.iter().any(|p| p.gateway == Some(*ip))
-    })
+    };
+    if let Some(public) = public_ip {
+        let octet = public.octets()[3];
+        if let Some(ip) = net.hosts().find(|ip| ip.octets()[3] == octet && free(ip)) {
+            return Some(ip);
+        }
+    }
+    net.hosts().find(free)
 }
 
 /// `others` are the pools other than the one being validated.
@@ -241,8 +256,8 @@ pub fn validate_pool(candidate: &HostingPool, others: &[HostingPool], dedicated:
         return invalid("vm_cidr and gateway must be set together or both left out");
     }
     if let (Some(vm_net), Some(gw)) = (candidate.vm_cidr, candidate.gateway) {
-        if !vm_net.network().is_private() || !vm_net.broadcast().is_private() {
-            return invalid("vm_cidr must be a private (RFC 1918) network");
+        if !is_internal(vm_net.network()) || !is_internal(vm_net.broadcast()) {
+            return invalid("vm_cidr must be a private (RFC 1918) or CGNAT (100.64.0.0/10) network");
         }
         if vm_net.prefix_len() > 29 {
             return invalid("vm_cidr must be a /29 or larger");
@@ -371,8 +386,8 @@ pub fn validate_allocation(a: &Allocation, ctx: &AllocationContext<'_>) -> Check
         return conflict(format!("{} is already allocated", a.public_ip));
     }
     if let Some(vm_ip) = a.vm_ip {
-        if !vm_ip.is_private() {
-            return invalid("vm_ip must be a private (RFC 1918) address");
+        if !is_internal(vm_ip) {
+            return invalid("vm_ip must be a private (RFC 1918) or CGNAT (100.64.0.0/10) address");
         }
         if ctx.all_pools.iter().any(|p| p.cidr.contains(&vm_ip)) {
             return invalid("vm_ip must not be inside a hosting pool");
@@ -442,15 +457,29 @@ mod tests {
         p.vm_cidr = Some("172.16.63.0/29".parse().unwrap());
         p.gateway = Some("172.16.63.1".parse().unwrap());
         let pools = vec![p.clone()];
-        assert_eq!(next_free_vm_ip(&p, &pools, &[]), Some("172.16.63.2".parse().unwrap()));
+        assert_eq!(next_free_vm_ip(&p, &pools, &[], None), Some("172.16.63.2".parse().unwrap()));
         let used = vec![alloc("standard", "204.52.221.226", Some("172.16.63.2"))];
-        assert_eq!(next_free_vm_ip(&p, &pools, &used), Some("172.16.63.3".parse().unwrap()));
+        assert_eq!(next_free_vm_ip(&p, &pools, &used, None), Some("172.16.63.3".parse().unwrap()));
         let all: Vec<Allocation> = (2..=6)
             .map(|i| alloc("standard", &format!("204.52.221.{}", 224 + i), Some(&format!("172.16.63.{i}"))))
             .collect();
-        assert_eq!(next_free_vm_ip(&p, &pools, &all), None, "/29 holds .1 gateway + .2-.6");
+        assert_eq!(next_free_vm_ip(&p, &pools, &all, None), None, "/29 holds .1 gateway + .2-.6");
         p.vm_cidr = None;
-        assert_eq!(next_free_vm_ip(&p, &pools, &[]), None);
+        assert_eq!(next_free_vm_ip(&p, &pools, &[], None), None);
+    }
+
+    #[test]
+    fn next_free_vm_ip_prefers_matching_last_octet() {
+        let mut p = pool("standard", "204.52.221.224/28");
+        p.vm_cidr = Some("100.64.241.224/28".parse().unwrap());
+        p.gateway = Some("100.64.241.225".parse().unwrap());
+        let pools = vec![p.clone()];
+        let public: Ipv4Addr = "204.52.221.230".parse().unwrap();
+        assert_eq!(next_free_vm_ip(&p, &pools, &[], Some(public)), Some("100.64.241.230".parse().unwrap()));
+        let used = vec![alloc("standard", "204.52.221.231", Some("100.64.241.230"))];
+        assert_eq!(next_free_vm_ip(&p, &pools, &used, Some(public)), Some("100.64.241.226".parse().unwrap()));
+        let gw: Ipv4Addr = "204.52.221.225".parse().unwrap();
+        assert_eq!(next_free_vm_ip(&p, &pools, &[], Some(gw)), Some("100.64.241.226".parse().unwrap()));
     }
 
     fn check(a: &Allocation, p: &HostingPool, others: &[Allocation]) -> Check {
@@ -521,6 +550,13 @@ mod tests {
         p.gateway = Some("172.16.63.1".parse().unwrap());
         p.vm_cidr = Some("8.8.8.0/24".parse().unwrap());
         assert!(validate_pool(&p, &[], &[]).is_err(), "vm_cidr must be private");
+        p.vm_cidr = Some("100.64.241.0/24".parse().unwrap());
+        p.gateway = Some("100.64.241.1".parse().unwrap());
+        assert!(validate_pool(&p, &[], &[]).is_ok(), "CGNAT vm_cidr is allowed");
+        p.vm_cidr = Some("100.128.0.0/24".parse().unwrap());
+        p.gateway = Some("100.128.0.1".parse().unwrap());
+        assert!(validate_pool(&p, &[], &[]).is_err(), "just above 100.64/10 is public");
+        p.gateway = Some("172.16.63.1".parse().unwrap());
         let mut q = pool("ham", "44.30.51.224/28");
         q.vm_cidr = Some("172.16.63.0/25".parse().unwrap());
         q.gateway = Some("172.16.63.1".parse().unwrap());

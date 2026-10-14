@@ -765,6 +765,7 @@ mod tests {
             network: NetworkConfig {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),

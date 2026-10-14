@@ -60,6 +60,7 @@ pub fn generate_ruleset(
     expose_admin_port: bool,
     rule_allow_ips: &HashMap<Uuid, Vec<IpNet>>,
     dedicated_ips: &[IpAddr],
+    dhcp_interfaces: &[String],
 ) -> String {
     let mut out = String::new();
 
@@ -108,6 +109,7 @@ pub fn generate_ruleset(
     }
 
     write_always_open_rules(&mut out);
+    write_dhcp_rules(&mut out, dhcp_interfaces);
     write_admin_rule(&mut out, admin, expose_admin_port);
 
     for host in hosts.iter().filter(|h| h.enabled) {
@@ -202,6 +204,22 @@ fn write_always_open_rules(out: &mut String) {
     let _ = writeln!(out, "        tcp dport 22 ip saddr 172.16.0.0/16 accept");
     let _ = writeln!(out, "        tcp dport 80 accept");
     let _ = writeln!(out, "        tcp dport 443 accept");
+    let _ = writeln!(out);
+}
+
+/// DHCP requests arrive as broadcasts from 0.0.0.0, so they can only be
+/// matched by interface. Names are restricted to the characters Linux
+/// allows in practice so a config typo can never inject nft syntax.
+fn write_dhcp_rules(out: &mut String, dhcp_interfaces: &[String]) {
+    let valid = |n: &&String| {
+        !n.is_empty()
+            && n.len() <= 15
+            && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    for iface in dhcp_interfaces.iter().filter(valid) {
+        let _ = writeln!(out, "        # DHCP server on {iface}");
+        let _ = writeln!(out, "        iifname \"{iface}\" udp dport 67 accept");
+    }
     let _ = writeln!(out);
 }
 
@@ -376,6 +394,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -398,7 +417,7 @@ mod tests {
 
     #[test]
     fn default_policy_is_drop() {
-        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("policy drop;"));
     }
 
@@ -409,7 +428,7 @@ mod tests {
         // fresh host (the table has never been created) would fail its
         // very first sync forever, since nft -f - aborts the rest of
         // the script on that first error.
-        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[]);
         let add_pos = out
             .find(&format!("add table inet {TABLE_NAME}"))
             .expect("must add the table");
@@ -425,7 +444,7 @@ mod tests {
     #[test]
     fn single_port_rule_emits_bare_port_not_a_range() {
         let rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 22 ip daddr 10.0.0.3 accept"));
         assert!(!out.contains("22-22"));
     }
@@ -433,7 +452,7 @@ mod tests {
     #[test]
     fn port_range_rule_emits_dash_syntax() {
         let rule = port_rule("10.0.0.4", 21115, 21119, Protocol::Tcp, "rustdesk tcp");
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 21115-21119 ip daddr 10.0.0.4 accept"));
     }
 
@@ -441,7 +460,7 @@ mod tests {
     fn udp_and_tcp_rules_use_distinct_protocol_keywords() {
         let tcp_rule = port_rule("10.0.0.4", 21115, 21119, Protocol::Tcp, "rustdesk tcp");
         let udp_rule = port_rule("10.0.0.4", 21116, 21116, Protocol::Udp, "rustdesk udp");
-        let out = generate_ruleset(&[], &[tcp_rule, udp_rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[tcp_rule, udp_rule], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 21115-21119 ip daddr 10.0.0.4 accept"));
         assert!(out.contains("udp dport 21116 ip daddr 10.0.0.4 accept"));
     }
@@ -450,7 +469,7 @@ mod tests {
     fn rule_targets_only_its_own_bind_ip() {
         let a = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
         let b = port_rule("10.0.0.4", 21116, 21116, Protocol::Udp, "rustdesk udp");
-        let out = generate_ruleset(&[], &[a, b], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[a, b], &admin(), true, &HashMap::new(), &[], &[]);
         // 10.0.0.5 was never assigned anything -- must not appear at all.
         assert!(!out.contains("10.0.0.5"));
         assert!(out.contains("ip daddr 10.0.0.3"));
@@ -465,7 +484,7 @@ mod tests {
         // rule this disabled config would have produced is absent instead.
         let mut rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
         rule.enabled = false;
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(!out.contains("dport 22 ip daddr 10.0.0.3"));
     }
 
@@ -473,7 +492,7 @@ mod tests {
     fn disabled_host_is_not_emitted() {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.enabled = false;
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(!out.contains("example.com"));
         assert!(!out.contains("10.0.0.2"));
     }
@@ -481,7 +500,7 @@ mod tests {
     #[test]
     fn host_with_force_https_also_opens_port_80() {
         let h = host("example.com", "10.0.0.2", 443, true);
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
     }
@@ -490,7 +509,7 @@ mod tests {
     fn host_without_force_https_does_not_open_port_80() {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.acme_challenge_type = crate::config::AcmeChallengeType::Dns01;
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(!out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
     }
@@ -499,13 +518,13 @@ mod tests {
     fn host_with_http01_challenge_type_opens_port_80_without_force_https() {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.acme_challenge_type = crate::config::AcmeChallengeType::Http01;
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
     }
 
     #[test]
     fn admin_ui_restricted_to_allowed_source_ips() {
-        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 8080 ip daddr 10.0.0.1 ip saddr { 10.0.0.1/32 } accept"));
     }
 
@@ -518,7 +537,7 @@ mod tests {
         // admin port back down to loopback underneath it.
         let mut a = admin();
         a.allowed_ips = vec![];
-        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[], &[]);
         assert!(out.contains(&format!(
             "tcp dport {} ip daddr {} accept",
             a.bind_port,
@@ -532,7 +551,7 @@ mod tests {
         a.bind_ip_v4 = Some(std::net::Ipv4Addr::UNSPECIFIED);
         a.bind_ip_v6 = None;
         a.allowed_ips = vec![];
-        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[], &[]);
         assert!(
             out.contains(&format!("tcp dport {} accept", a.bind_port)),
             "got: {out}"
@@ -542,14 +561,14 @@ mod tests {
 
     #[test]
     fn http_and_https_are_always_accepted_unconditionally() {
-        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 80 accept"));
         assert!(out.contains("tcp dport 443 accept"));
     }
 
     #[test]
     fn ssh_is_always_accepted_from_the_internal_network_only() {
-        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 22 ip saddr 172.16.0.0/16 accept"));
         // Not a bare, unconditional accept -- that's the whole point of
         // scoping it (2026-08-10: a real production request to lock
@@ -571,7 +590,7 @@ mod tests {
             Protocol::Tcp,
             "some other ssh-like service",
         );
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 22 ip saddr 172.16.0.0/16 accept"));
     }
 
@@ -579,7 +598,7 @@ mod tests {
     fn unassigned_ips_in_the_29_never_appear_in_output() {
         let h = host("example.com", "10.0.0.2", 443, false);
         let rule = port_rule("10.0.0.4", 21115, 21119, Protocol::Tcp, "rustdesk");
-        let out = generate_ruleset(&[h], &[rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[rule], &admin(), true, &HashMap::new(), &[], &[]);
         for unused in ["10.0.0.5", "10.0.0.6"] {
             assert!(
                 !out.contains(unused),
@@ -593,7 +612,7 @@ mod tests {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.bind_ip_v4 = None;
         h.bind_ip_v6 = Some("2001:db8::1".parse().unwrap());
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 443 ip6 daddr 2001:db8::1 accept"));
         assert!(
             !out.contains("ip daddr 2001:db8::1"),
@@ -605,7 +624,7 @@ mod tests {
     fn dual_stack_host_emits_a_rule_for_each_family() {
         let mut h = host("example.com", "10.0.0.2", 443, true);
         h.bind_ip_v6 = Some("2001:db8::1".parse().unwrap());
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
         assert!(out.contains("tcp dport 443 ip6 daddr 2001:db8::1 accept"));
         assert!(out.contains("tcp dport 80 ip daddr 10.0.0.2 accept"));
@@ -617,7 +636,7 @@ mod tests {
         let mut rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
         rule.bind_ip_v4 = None;
         rule.bind_ip_v6 = Some("2001:db8::5".parse().unwrap());
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 22 ip6 daddr 2001:db8::5 accept"));
     }
 
@@ -628,7 +647,7 @@ mod tests {
         // matching entries -- default-DROP should keep it closed instead.
         let mut a = admin();
         a.bind_ip_v6 = Some(std::net::Ipv6Addr::UNSPECIFIED);
-        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 8080 ip daddr 10.0.0.1 ip saddr { 10.0.0.1/32 } accept"));
         assert!(
             !out.contains("ip6 daddr"),
@@ -641,14 +660,14 @@ mod tests {
         let mut a = admin();
         a.bind_ip_v6 = Some(std::net::Ipv6Addr::UNSPECIFIED);
         a.allowed_ips.push("2001:db8::/32".parse().unwrap());
-        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &a, true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 8080 ip6 saddr { 2001:db8::/32 } accept"));
     }
 
     #[test]
     fn expose_admin_port_false_emits_no_accept_rule_for_the_admin_port() {
         let a = admin();
-        let out = generate_ruleset(&[], &[], &a, false, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &a, false, &HashMap::new(), &[], &[]);
         assert!(
             !out.contains("dport 8080"),
             "no accept rule should mention the admin port at all when expose_admin_port is false"
@@ -659,7 +678,7 @@ mod tests {
     fn expose_admin_port_false_does_not_affect_host_or_port_rule_firewall_entries() {
         let a = admin();
         let h = host("example.com", "10.0.0.2", 443, false);
-        let out = generate_ruleset(&[h], &[], &a, false, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &a, false, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"));
     }
 
@@ -672,7 +691,7 @@ mod tests {
         let rule = port_rule("10.0.0.3", 21115, 21115, Protocol::Tcp, "rustdesk");
         let mut rule_allow_ips = HashMap::new();
         rule_allow_ips.insert(rule.id, vec!["192.168.1.0/24".parse().unwrap()]);
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &rule_allow_ips, &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &rule_allow_ips, &[], &[]);
         assert!(
             out.contains("tcp dport 21115 ip daddr 10.0.0.3 ip saddr { 192.168.1.0/24 } accept")
         );
@@ -683,7 +702,7 @@ mod tests {
     #[test]
     fn port_rule_without_an_acl_is_unrestricted() {
         let rule = port_rule("10.0.0.3", 21115, 21115, Protocol::Tcp, "rustdesk");
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(
             out.contains("tcp dport 21115 ip daddr 10.0.0.3 accept"),
             "got: {out}"
@@ -698,7 +717,7 @@ mod tests {
         let rule = port_rule("10.0.0.3", 21115, 21115, Protocol::Tcp, "rustdesk");
         let mut rule_allow_ips = HashMap::new();
         rule_allow_ips.insert(rule.id, vec!["2001:db8::/32".parse().unwrap()]);
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &rule_allow_ips, &[]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &rule_allow_ips, &[], &[]);
         assert!(
             !out.contains("dport 21115"),
             "no accept rule should exist for a family the ACL has no entries for"
@@ -711,7 +730,7 @@ mod tests {
     fn host_acl_ids_never_affect_the_firewall_rule() {
         let mut h = host("example.com", "10.0.0.2", 443, false);
         h.acl_ids = vec![Uuid::new_v4()]; // a real acl_id, deliberately not in any allow_ips map
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(out.contains("tcp dport 443 ip daddr 10.0.0.2 accept"), "a host must never be source-restricted at the firewall layer regardless of its own acl_ids: got {out}");
     }
 
@@ -721,7 +740,7 @@ mod tests {
 
     #[test]
     fn no_dedicated_ips_emits_no_drop_guard() {
-        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[]);
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[]);
         assert!(!out.contains("daddr {"), "got: {out}");
     }
 
@@ -729,7 +748,7 @@ mod tests {
     fn dedicated_ip_gets_its_explicit_accepts_then_a_drop_before_the_always_open_rules() {
         let dedicated: IpAddr = "10.0.0.9".parse().unwrap();
         let rule = port_rule("10.0.0.9", 3478, 3478, Protocol::Udp, "stun");
-        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[dedicated]);
+        let out = generate_ruleset(&[], &[rule], &admin(), true, &HashMap::new(), &[dedicated], &[]);
         let accept = pos(&out, "udp dport 3478 ip daddr 10.0.0.9 accept");
         let drop = pos(&out, "ip daddr { 10.0.0.9 } drop");
         let http = pos(&out, "tcp dport 80 accept");
@@ -743,7 +762,7 @@ mod tests {
         let dedicated: IpAddr = "10.0.0.9".parse().unwrap();
         let mut wild = port_rule("0.0.0.0", 2222, 2222, Protocol::Tcp, "ssh forward");
         wild.bind_ip_v4 = Some("0.0.0.0".parse().unwrap());
-        let out = generate_ruleset(&[], &[wild], &admin(), true, &HashMap::new(), &[dedicated]);
+        let out = generate_ruleset(&[], &[wild], &admin(), true, &HashMap::new(), &[dedicated], &[]);
         assert_eq!(out.matches("tcp dport 2222 accept").count(), 1, "got: {out}");
         assert!(pos(&out, "tcp dport 2222 accept") > pos(&out, "ip daddr { 10.0.0.9 } drop"));
     }
@@ -752,7 +771,7 @@ mod tests {
     fn a_dedicated_https_host_is_accepted_only_on_its_address() {
         let dedicated: IpAddr = "10.0.0.9".parse().unwrap();
         let h = host("unifi.example.com", "10.0.0.9", 443, true);
-        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[dedicated]);
+        let out = generate_ruleset(&[h], &[], &admin(), true, &HashMap::new(), &[dedicated], &[]);
         assert_eq!(out.matches("tcp dport 443 ip daddr 10.0.0.9 accept").count(), 1, "got: {out}");
         assert!(pos(&out, "tcp dport 443 ip daddr 10.0.0.9 accept") < pos(&out, "ip daddr { 10.0.0.9 } drop"));
     }
@@ -760,8 +779,18 @@ mod tests {
     #[test]
     fn dedicated_v4_and_v6_get_separate_drop_sets() {
         let ips: Vec<IpAddr> = vec!["10.0.0.9".parse().unwrap(), "10.0.0.10".parse().unwrap(), "2001:db8::9".parse().unwrap()];
-        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &ips);
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &ips, &[]);
         assert!(out.contains("ip daddr { 10.0.0.9, 10.0.0.10 } drop"), "got: {out}");
         assert!(out.contains("ip6 daddr { 2001:db8::9 } drop"), "got: {out}");
+    }
+
+    #[test]
+    fn dhcp_interface_gets_udp_67_accept_and_bad_names_are_ignored() {
+        let ifs = vec!["eth2".to_string(), "bad\" ; drop".to_string(), String::new()];
+        let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &ifs);
+        assert!(out.contains("iifname \"eth2\" udp dport 67 accept"), "got: {out}");
+        assert!(!out.contains("drop\""), "got: {out}");
+        let none = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[]);
+        assert!(!none.contains("dport 67"), "got: {none}");
     }
 }

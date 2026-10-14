@@ -201,6 +201,7 @@ mod tests {
             network: crate::config::NetworkConfig {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
+                dhcp_interfaces: vec![],
             },
             admin: crate::config::AdminConfig {
                 bind_ip_v4: Some(Ipv4Addr::UNSPECIFIED),
@@ -264,6 +265,7 @@ mod tests {
             path_rewrite: None,
             static_root: None,
             rewrite_samesite_none_cookies: false,
+            deny_fallback: None,
             pass_client_cert_header: false,
             enabled: true,
         });
