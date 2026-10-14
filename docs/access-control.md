@@ -57,8 +57,17 @@ no entries trusts no certificate.**
 
 > **Current limitation:** the client-certificate verifier trusts a single
 > built-in root, the JPPS TrustBridge CA. It is not yet configurable, so
-> this kind is only useful if you use TrustBridge. Validation covers the
-> chain and expiry, not CRL or OCSP revocation checks.
+> this kind is only useful if you use TrustBridge.
+
+**Revocation.** Besides the chain and expiry, each certificate is checked
+against TrustBridge's OCSP responder (`https://ocsp.pki.jpps.us` by default;
+set `RUST_PROXY_OCSP_URL` to change it, or to an empty value to turn the
+check off). A revoked certificate is treated as if the visitor had presented
+none, so the host falls back to its login page and no identity headers are
+forwarded. If the responder cannot be reached, the certificate is allowed
+(fail open) and the check is retried shortly after. A revocation, once seen,
+is remembered in the database and stays in force even if the responder later
+fails to answer.
 
 If you want to hand the verified subject to your upstream (so an app can
 skip its own login), turn on a host's `pass_client_cert_header` and set

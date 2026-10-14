@@ -223,6 +223,20 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await;
 
+    // Serials of client certificates an OCSP responder has reported
+    // revoked. Never pruned: once seen revoked, a cert stays revoked even
+    // if the responder later fails or answers differently.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS revoked_client_certs (
+            serial TEXT PRIMARY KEY,
+            first_seen TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Metadata only -- kind is 'ip_allow' or 'login'; entries live in
     // the two tables below, keyed by acl_list_id. name is UNIQUE so an
     // operator gets an immediate, clear conflict error rather than two

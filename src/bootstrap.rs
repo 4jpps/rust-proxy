@@ -139,6 +139,7 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
         state.set_default_site(site);
     }
     crate::acme::load_certs_from_disk(&state)?;
+    state.revocation().load_revoked().await;
     let mut hosting_pools = crate::db::load_hosting_pools(state.db()).await?;
     let hosting_allocations = crate::db::load_hosting_allocations(state.db()).await?;
     if hosting_pools.is_empty() && hosting_allocations.is_empty() && !seeded.is_empty() {

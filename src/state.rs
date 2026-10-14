@@ -63,6 +63,7 @@ struct Inner {
     /// `[siem]` from config.toml, if present -- always wins over the
     /// DB-backed settings (see `config::Config::siem`).
     siem_config: Option<crate::config::SiemConfig>,
+    revocation: crate::proxy::revocation::RevocationChecker,
     hosts: ArcSwap<Vec<ProxyHost>>,
     port_rules: ArcSwap<Vec<PortRule>>,
     certs: ArcSwap<HashMap<String, CertEntry>>,
@@ -148,6 +149,7 @@ impl AppState {
             acme: cfg.acme,
             client_cert_forward_token: cfg.client_cert_forward_token,
             siem_config: cfg.siem,
+            revocation: crate::proxy::revocation::RevocationChecker::new(Some(db.clone())),
             hosts: ArcSwap::from_pointee(hosts),
             port_rules: ArcSwap::from_pointee(port_rules),
             certs: ArcSwap::from_pointee(HashMap::new()),
@@ -171,6 +173,10 @@ impl AppState {
 
     pub fn db(&self) -> &SqlitePool {
         &self.0.db
+    }
+
+    pub fn revocation(&self) -> &crate::proxy::revocation::RevocationChecker {
+        &self.0.revocation
     }
 
     pub async fn lock_hosts_for_write(&self) -> tokio::sync::MutexGuard<'_, ()> {

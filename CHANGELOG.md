@@ -2,6 +2,15 @@
 
 ## [0.3.0] - 2026-10-14
 
+- **Client certificate revocation (OCSP).** TrustBridge client certificates
+  are now checked against the TrustBridge OCSP responder on use, not just
+  for chain and expiry. A revoked certificate is treated as no certificate
+  (login fallback, no identity headers). The answer must be signed by the
+  TrustBridge intermediate. Fails open if the responder is unreachable,
+  but a revocation, once seen, is persisted (`revoked_client_certs`) and
+  never forgotten. `RUST_PROXY_OCSP_URL` overrides the responder; empty
+  disables the check. A ClientCert ACL with no entries trusts no certificate.
+
 - **Default site setting (NPM's Settings, Default Site).** System, Default
   site (admin only; `GET`/`PUT /api/default-site`) chooses what a request
   for a hostname with no matching site receives: an empty 404 (the previous

@@ -22,11 +22,9 @@
 //! TrustBridge's root, so a browser with no TrustBridge cert simply
 //! won't offer one at all.
 //!
-//! Known limitation: chain + expiry validation only -- this does not
-//! check TrustBridge's CRL/OCSP, so a *revoked-but-not-yet-expired*
-//! client cert is still accepted here. Acceptable for a first version;
-//! revisit if this ever protects something high-value enough to need
-//! live revocation checking on every handshake.
+//! Revocation is not part of the handshake: `proxy::revocation` asks
+//! TrustBridge's OCSP responder about each presented certificate per
+//! request and treats a revoked one as "no certificate".
 
 use std::sync::Arc;
 

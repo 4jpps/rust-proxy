@@ -15,6 +15,7 @@ pub mod client_cert;
 pub mod http;
 pub mod login;
 pub mod passthrough;
+pub mod revocation;
 pub mod router;
 pub mod tls;
 pub mod upstream_tls;
@@ -213,12 +214,26 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 };
                 let client_cert_subject =
                     client_cert::client_cert_subject(tls_stream.get_ref().1.peer_certificates());
+                let client_cert_leaf: Option<Vec<u8>> = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|c| c.first())
+                    .map(|c| c.as_ref().to_vec());
                 let io = TokioIo::new(tls_stream);
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let sni = sni.clone();
                     let client_cert_subject = client_cert_subject.clone();
+                    let client_cert_leaf = client_cert_leaf.clone();
                     async move {
+                        // A revoked certificate is treated as no certificate
+                        // at all: the host falls back to its login page and
+                        // no identity headers are forwarded.
+                        let client_cert_subject = match (&client_cert_subject, &client_cert_leaf) {
+                            (Some(_), Some(leaf)) if state.revocation().is_revoked(leaf).await => None,
+                            _ => client_cert_subject,
+                        };
                         match handle_https_request(
                             state,
                             bind_ip,
