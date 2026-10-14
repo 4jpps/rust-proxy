@@ -1,0 +1,122 @@
+# Getting started
+
+This walks you from a fresh Debian or Ubuntu host to a working HTTPS
+site behind rust-proxy. It takes about ten minutes.
+
+## Before you start
+
+- A Linux host with systemd and nftables, with ports 80 and 443 reachable from where your visitors are.
+- A domain name whose DNS you control, pointed at this host.
+- For dns-01 certificates (and any wildcard), an API credential for your DNS provider. For http-01 you need none, but port 80 must be reachable from the internet.
+
+## 1. Install
+
+```sh
+sudo mkdir -p /etc/apt/keyrings
+sudo curl -fsSL https://repo.jpps.us/repo-signing-key.asc -o /etc/apt/keyrings/jpps-repo.asc
+echo 'deb [signed-by=/etc/apt/keyrings/jpps-repo.asc] https://repo.jpps.us/stable /' | sudo tee /etc/apt/sources.list.d/jpps.list
+sudo apt update
+sudo apt install rust-proxy
+```
+
+The repo is GPG-signed, and `apt update` verifies it against the key you
+just fetched. The package creates the `rust-proxy` system user, installs
+a working default `/etc/rust-proxy/config.toml`, and starts the service.
+Check it with:
+
+```sh
+systemctl status rust-proxy
+```
+
+If it is not running, `sudo systemctl enable --now rust-proxy`.
+
+You can also download a release `.deb` from the project's Releases page
+and `dpkg -i` it, or [build from source](deployment.md).
+
+## 2. Restrict the admin port
+
+On a fresh install the admin UI listens on `0.0.0.0:8084` and the
+firewall leaves that port open to any source. That is what lets the
+setup wizard work with no config edits, and it means anyone who can reach
+the port can claim the admin account until you create it.
+
+Two ways to close it:
+
+- Set `admin.allowed_ips` in `/etc/rust-proxy/config.toml` to your management network, for example `allowed_ips = ["192.168.1.0/24"]`, then `sudo systemctl restart rust-proxy`. This is enforced in nftables, not just in the app.
+- Or turn off "Expose the admin port via the firewall" in the admin UI (or set `admin.expose_admin_port = false`) and reach the UI through an SSH tunnel: `ssh -L 8084:127.0.0.1:8084 you@host`, then browse to `http://127.0.0.1:8084/`.
+
+Do this right after step 3, once the admin account exists.
+
+## 3. Run the first-run wizard
+
+Open `http://<host-ip>:8084/`. The wizard asks you to create the admin
+account, and optionally to add a DNS credential. Your admin identity is
+stored in the runtime database, not the config file.
+
+Prefer to keep the admin identity in `config.toml`? See
+[Configuration](configuration.md#admin-identity-in-configtoml).
+
+## 4. Add a DNS credential (dns-01 only)
+
+Skip this if you will use http-01. Otherwise, add one under "DNS
+credentials" in the admin UI. [Configuration](configuration.md#dns-providers)
+lists what each provider needs. The one thing to get right is permission
+scope: the token must be able to create and delete TXT records in the
+zone.
+
+![The DNS credentials tab, listing one named Cloudflare credential.](screenshots/dns-credentials.png)
+
+## 5. Add your first host
+
+On the Hosts tab, under "Add a host":
+
+1. **Domain:** `app.example.com`.
+2. **Upstream:** `127.0.0.1:8000`, the internal service as `host:port`.
+3. Leave "Issue/renew a certificate automatically" checked.
+4. Pick the challenge type (`auto` is a good default) and, for dns-01, the credential from step 4.
+5. Click "Add host".
+
+The certificate is requested in the background and renewed
+automatically. The same thing through the API, with a token (see
+[API](api.md)):
+
+```sh
+curl -X POST https://proxy.example.com/api/hosts \
+  -H "Authorization: Bearer rpx_..." \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"app.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,
+       "upstream":"127.0.0.1:8000","websockets":true}'
+```
+
+![The Sites page after adding hosts, each showing a valid certificate.](screenshots/hosts-list.png)
+
+## 6. Check it works
+
+```sh
+curl -I https://app.example.com/
+journalctl -u rust-proxy --no-pager | tail -20
+```
+
+The journal shows each listener it opened and the ACME order progress.
+If the certificate does not appear, see [Troubleshooting](troubleshooting.md).
+
+## Where things live
+
+| What | Where |
+|------|-------|
+| Config | `/etc/rust-proxy/config.toml` |
+| State (sqlite) | `/var/lib/rust-proxy/rust-proxy.db` |
+| Certificates | `/var/lib/rust-proxy/certs/<domain>/` |
+| ACME account key | `/var/lib/rust-proxy/acme-account.key` |
+| Logs | `/var/lib/rust-proxy/` (`proxy.log`, `access.log`, `server.log`) and the journal |
+| Nightly DB backups | `/var/lib/rust-proxy/backups/`, written at 03:00 by `rust-proxy-backup.timer`, 14 days kept |
+
+The `hosts` and `port_rules` in `config.toml` only seed an empty database
+on first boot. After that, the database is the source of truth and you
+manage everything from the UI or API.
+
+## Next steps
+
+- Restrict who can reach a host: [Access control](access-control.md).
+- Send blocked visitors somewhere useful: [deny_fallback](deny-fallback.md).
+- Coming from NPM: [Migration guide](migration-from-npm.md).

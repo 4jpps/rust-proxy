@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-14
+
+- **Multiple admin users with roles.** The admin UI and API now support
+  more than one account. The owner (the wizard or `config.toml` account) is
+  always an admin and is never stored in the new `users` table; admins add
+  further users in a new Users tab or through `/api/users`, each as
+  `admin`, `operator` (changes proxy configuration, cannot touch users,
+  tokens or system settings) or `viewer` (read-only). The session cookie
+  proves identity only: the role is looked up on every request, so a role
+  change, disable or delete applies immediately. Users, API tokens and the
+  `dns-credentials`, `acme-settings`, `firewall-settings`, `siem` and
+  `hosting/pools` endpoints are admin-only for writes (users and tokens are
+  admin-only to read as well). `rpx_` tokens carry a role (new `role`
+  column, default `admin`, so existing tokens are unchanged). `/api/me`
+  reports the caller and `/api/me/password` lets a database user change
+  their own password. Usernames are case-insensitive, passwords need at
+  least 8 characters, and login runs a dummy argon2 verify for unknown or
+  disabled users so response time does not reveal which accounts exist.
+  Refused requests return 403 and emit an `admin_access_denied` SIEM event;
+  the access log and admin SIEM events now include `user` and `role`. The
+  web UI hides pages the role cannot use and shows read-only mode for
+  viewers. New page: `docs/users-and-roles.md`. This closes the last
+  documented NPM gap apart from NPM's finer per-section permissions.
+
+- **Dual licensing: AGPL-3.0 or a $10 lifetime Commercial License.**
+  rust-proxy moves from MIT to AGPL-3.0, with a Commercial License
+  (`COMMERCIAL-LICENSE.md`) sold by Jeff Parrish PC Services LLC at
+  store.jpps.us for people who want to use it without the AGPL's
+  source-sharing conditions. `Cargo.toml` declares
+  `AGPL-3.0-only OR LicenseRef-Commercial`, the `.deb` ships both texts,
+  and `CLA.md` is a short contributor license agreement that lets the LLC
+  ship outside contributions under both licenses (contributors keep their
+  copyright). `CONTRIBUTING.md` explains the process; Buy Me a Coffee is the
+  optional way to support the project. Releases up to 0.1.3 remain MIT.
+
+- **NPM parity: custom locations, block common exploits, fixed response.**
+  Three Nginx Proxy Manager features that had no equivalent now exist.
+  `locations` routes path prefixes of one host to different upstreams
+  (longest segment-boundary prefix wins, a prefix ending in `/` matches
+  everything beneath it, the path is forwarded unchanged, each location has
+  its own `upstream_https` / `upstream_tls_verify`; up to 64 per host, no
+  duplicates, `..`, `//`, `\\`, `?` or `#` in a path). `block_exploits`
+  refuses TRACE/TRACK, traversal and injection probes in the
+  (twice-percent-decoded) URL and well-known scanner user agents with a
+  403 and an `exploit_blocked` SIEM event, before the ACL gate.
+  `fixed_response` answers every request with a configured status (200-599)
+  and plain-text body (up to 64 KiB) and needs no upstream: the NPM "404
+  Host". All three are API fields, sqlite columns (added by additive
+  migrations) and controls in the web UI's Advanced section.
+
 - **Per-host path lock / blocked-visitor redirect (`deny_fallback`).** A
   proxy host can now carry an optional `deny_fallback` setting (API field,
   sqlite column and an Advanced panel in the web UI) that replaces the

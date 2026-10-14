@@ -4,563 +4,33 @@
 
 # rust-proxy
 
-A lightweight L7 reverse proxy daemon in Rust, built as an open,
-self-hostable alternative to Nginx Proxy Manager: HTTP/1.1+HTTP/2 and
-WebSocket reverse proxying with SNI-based TLS, a native RFC 8555 ACME
-client (dns-01 via a
-pluggable, multi-credential DNS provider -- Cloudflare, DigitalOcean,
-Hetzner, DuckDNS, GoDaddy, Namecheap, or Route53 today -- or http-01,
-needing no DNS credentials at all), dynamic default-DROP
-nftables firewall orchestration, arbitrary TCP/UDP port passthrough,
-and a small embedded web admin UI. Runs on anything from a single
-dedicated IP to a full subnet block -- see Configuration below.
+**A self-hosted reverse proxy with built-in ACME, a default-deny firewall, and per-host access control.**
 
-**On this page**
+rust-proxy is a single Rust daemon that terminates TLS, gets and renews
+its own certificates, routes traffic to your internal services, and
+manages the host's nftables firewall to match. It has a small embedded
+web UI and a REST API, and it installs from a signed `.deb`.
 
-- [Quick start](#quick-start)
-- [Building and testing](#building-and-testing)
-- [Configuration](#configuration)
-- [DNS providers](#dns-providers)
-- [Firewall](#firewall)
-- [Logging](#logging)
-- [API](#api)
-- [Architecture](#architecture)
-- [Deployment](#deployment)
-- [Installing the .deb](#installing-the-deb)
-- [Support](#support)
-- [Status](#status)
-- [License](#license)
+- **HTTP/1.1, HTTP/2 and WebSocket** reverse proxying with SNI-based TLS (rustls, no OpenSSL).
+- **Native ACME client** (RFC 8555): dns-01 through Cloudflare, DigitalOcean, Hetzner, DuckDNS, GoDaddy, Namecheap or Route53, or http-01 with no DNS credentials. Wildcards supported.
+- **Default-DROP nftables firewall** generated from your hosts and port rules. Only what you configure is reachable.
+- **TCP/UDP port passthrough** for non-HTTP services.
+- **Per-host access control**: IP allow lists, a built-in login page, and client-certificate auth, combined with OR.
+- **Per-host `deny_fallback`**: send blocked visitors to a public page, or lock a host to a path allow-list (for example only `/guest/`). See [deny_fallback](docs/deny-fallback.md).
+- **Redirect hosts, static-file hosts, fixed-response hosts and path rewrites** alongside normal proxy hosts, plus **custom locations** (different upstreams per path) and an optional **block-common-exploits** filter.
+- **Public-address hosting** (optional): 1:1 forward a routed public IP to a private customer VM.
+- **SIEM/syslog forwarding** (optional), with Wazuh rules included.
+
+![The Sites page lists every host with its upstream, bind address, certificate status and access lists.](docs/screenshots/hosts-list.png)
 
 > **Lock down the admin port.** On a fresh install the admin UI listens on
-> `0.0.0.0:8084`, and the firewall leaves that port open to any source, so
-> the setup wizard works with no config edits. Until you have created the
-> admin account, anyone who can reach the port can claim it. Set
+> `0.0.0.0:8084` and the firewall leaves that port open, so the setup
+> wizard works without editing any config. Until you create the admin
+> account, anyone who can reach the port can claim it. Set
 > `admin.allowed_ips` in `/etc/rust-proxy/config.toml` to your management
-> network as soon as you know it, or turn off "Expose the admin port via
-> the firewall" in the admin UI and reach it through an SSH tunnel.
+> network as soon as you can, or reach the port through an SSH tunnel.
 
-## Quick start
-
-1. **Install the .deb** from the signed JPPS apt repo (full commands under
-   [Installing the .deb](#installing-the-deb)):
-
-   ```sh
-   sudo apt update
-   sudo apt install rust-proxy
-   ```
-
-2. **Start the service.** The package starts it for you. Check with
-   `systemctl status rust-proxy`; if it isn't running,
-   `sudo systemctl enable --now rust-proxy`.
-3. **Open the admin UI** at `http://<this-host's-ip>:8084/`. The first-launch
-   wizard asks you to create the admin account.
-4. **Add a DNS credential** (skip this if you will use http-01, which needs
-   no DNS credentials). The wizard offers it as an optional step. You can
-   also add one later under "DNS credentials" in the admin UI. See
-   [DNS providers](#dns-providers) for what each provider needs.
-5. **Create a host.** On the Hosts tab, under "Add a host", enter the
-   domain (for example `app.example.com`), the upstream as `host:port`
-   (for example `127.0.0.1:8000`), and leave "Issue/renew a certificate
-   automatically" checked. Pick a challenge type and, for dns-01, the
-   credential from step 4, then click "Add host". The certificate is
-   requested and renewed for you.
-
-## Building and testing
-
-```sh
-cargo build
-cargo test
-```
-
-No external services are required for the test suite -- ACME/Cloudflare
-calls are exercised against mock HTTP servers (`wiremock`), and
-persistence tests run against an in-memory sqlite database.
-
-## Configuration
-
-`Config::load` writes `deploy/config.toml.example`'s content to the
-configured path automatically if nothing exists there yet (see
-`config::DEFAULT_CONFIG_TOML`) -- there's genuinely no config file
-dependency, even outside the `.deb`'s `postinst` step (`cargo run`, a
-manually-copied binary with no provisioning step of its own all just
-work). Its `[admin]`/`[acme]` sections are safe to run
-as-is (admin UI on `0.0.0.0:8084`, see the warning at the top; no admin
-account or DNS credential set), since the admin
-identity and any number of named DNS-01 credentials are normally
-created and managed from the admin UI (or the first-launch setup
-wizard it serves when unconfigured) and stored in sqlite, not
-`config.toml`. Each proxy
-host with `acme_enabled` and a dns-01 challenge type picks a named
-credential via `dns_credential_id` (falls back to the sole configured
-credential if there's exactly one and the host doesn't set it
-explicitly). Supported providers (see [DNS providers](#dns-providers)
-for what each needs): `cloudflare`, `digitalocean`, `hetzner`, `duckdns`,
-`godaddy`, `namecheap`, and `route53`. Adding another provider means one new
-file under `src/acme/dns01/` implementing the `DnsProvider` trait
-(`find_zone`/`create_txt_record`/`delete_txt_record`) plus a new
-`DnsProviderKind` variant -- PRs for more providers welcome.
-
-Prefer to manage the admin identity and/or a DNS credential as part of
-`config.toml` instead of through the DB-backed admin UI/wizard? Set
-`admin.session_secret` (`openssl rand -hex 32`), `admin.admin_username`,
-and `admin.admin_password_hash` (`rust-proxy hash-password '...'`) there
-together -- all three or none, a partial set is rejected at startup --
-and/or `acme.dns_provider`/`acme.dns_api_token` for a single seeded
-"default" credential. Whichever of those you set in `config.toml`
-always takes precedence over whatever the wizard or admin UI has
-stored, on every read, not just at first boot.
-
-`network.bind_ranges` is optional
-and empty by default -- unrestricted, bind to whatever address the
-environment actually has, whether that's a single dedicated IP, a full
-LXC /29 block, or several disjoint ranges. Populate it only if you want
-config-validation-time hardening against bind_ip typos for a known
-range you control.
-
-`hosts`/`port_rules` in the TOML file only seed an empty database on
-first boot. After that, sqlite (`admin.db_path`) is the source of
-truth and everything is managed from the admin UI, not by re-editing
-the file.
-
-`upstream` is plain HTTP by default. Set `upstream_https = true` if the
-internal service behind it speaks TLS itself; `upstream_tls_verify`
-(default `true`) checks its certificate against the bundled Mozilla
-root store, or set it `false` to accept a self-signed/untrusted
-upstream cert (still encrypted, just not authenticated -- only
-sensible for an upstream already reached over a network this proxy
-trusts). `upstream_preserve_host` (default `true`) forwards the
-client's original `Host` header unmodified; set it `false` if the
-backend needs to see its own `host:port` instead of the public-facing
-domain this proxy answers for.
-
-Each host picks its own ACME challenge type via `acme_challenge_type`:
-`auto` (the default) tries dns-01 first -- it only depends on a
-working DNS provider credential, not on this daemon's own port 80
-actually being publicly reachable for the exact domain (NAT, a
-firewall, or the domain's own DNS not routing here yet can all silently
-break http-01 in ways invisible from this end) -- and if that fails for
-any reason, retries once with http-01, so port 80 is kept open for
-`auto` hosts; `http01` and `dns01` force one or the other explicitly
-(no fallback). A wildcard domain
-(`*.example.com`) always uses dns-01 regardless of this setting -- CAs
-never offer http-01 for a wildcard identifier. Choosing `http01`
-(or leaving `auto`) without `force_https` still opens a port-80 listener/firewall rule for
-that host, just to answer the challenge. A wildcard's own bare apex
-(`example.com`) is automatically requested as a second SAN in the same
-certificate -- a wildcard alone never covers its own apex (standard
-X.509 semantics), so this matches how certbot/acme.sh commonly issue
-combined wildcard+apex certs instead of requiring two separately
-managed certificates.
-
-`acme.organization`/`acme.organizational_unit` (config.toml only, both
-optional) are requested in every issued CSR's Subject -- only ever a
-*request*, not a guarantee, since Let's Encrypt and virtually every
-public CA issue Domain Validated certs that silently discard Subject
-fields beyond the SAN list; useful mainly against a private/enterprise
-ACME CA that performs real organization vetting.
-
-Each host can also gate access at the application layer, independent of
-`network.bind_ranges` and the nftables firewall -- the same idea as
-Nginx Proxy Manager's own access lists, but as reusable, named ACLs
-(`GET`/`POST`/`DELETE /api/acls`) rather than fields typed inline per
-host:
-
-- **IP allow** ACLs hold one or more CIDRs (`"10.0.0.0/24"`) or bare
-  IPv4 addresses (treated as `/32`). A source IP outside every selected
-  list gets a 403 before the request ever reaches the upstream.
-- **Login** ACLs hold one or more `{"username", "password"}` pairs,
-  checked after the IP allow lists. A visitor without a valid session
-  gets a real HTML login page (`proxy::login`) in place of the
-  upstream, not an HTTP Basic Auth prompt -- Basic Auth's browser-native
-  dialog is poorly recognized by most password managers, since there's
-  no real form/password field for them to offer to save. Submitting the
-  form sets a signed, `HttpOnly`/`Secure` session cookie scoped to that
-  one host (a session for one domain is never accepted on another, even
-  if somehow presented there). Passwords are hashed (argon2)
-  server-side at ACL-creation time and never stored or returned in
-  plaintext.
-
-A host selects `acl_ids`: none, one, or several ACLs. Multiple selected
-lists of the same kind combine by union -- any selected IP-allow list's
-range is enough, any selected Login list's credentials work -- while
-the IP-gate and login-gate stay two independent sequential checks, same
-as a single inline list/login gate did before. Managing the list itself
-(adding an IP, rotating a password) happens once in the ACL, not once
-per host that references it. Deleting an ACL still selected by a host
-is rejected -- clear it from every host first.
-
-A wildcard cert doesn't need a host to exist at all: `POST
-/api/dns01-certs` (`{"domain","dns_credential_id"}`, the latter
-optional under the same "auto only if exactly one exists" rule as
-`dns_credential_id` above) issues a dns-01 cert standalone, tracked for
-automatic renewal the same as a host's own. Every subdomain host
-created under that wildcard then just works with `acme_enabled` off --
-`proxy::tls::select_cert_for_sni` already falls back from an
-exact-domain match to a covering `*.parent` cert, so there's no
-separate "attach this cert to that host" step. Runs the real ACME flow
-synchronously in the request (DNS propagation wait included, so it can
-take up to a minute) rather than only through the background renewal
-loop, since a manual one-off issuance wants immediate feedback.
-
-A host can also be a pure redirect instead of a reverse proxy -- set
-`redirect` (`{"target", "preserve_path", "status"}`) and `upstream`
-becomes ignored/optional. `target` must be an absolute `http://`/
-`https://` URL; `preserve_path` (default `true`) appends the visited
-path/query onto `target` (redirecting `old.example.com/post` straight
-to `new.example.com/post`); `status` is `"permanent"` (301, the
-default) or `"temporary"` (302). Same as Nginx Proxy Manager's
-Redirection Hosts, a redirect host still gets its own ACME cert and its
-own ACL selection -- domain matching, TLS, and access control are
-identical to a proxy host, only the final response differs.
-
-### DNS providers
-
-Pick the provider when you add a credential in the admin UI. The UI shows
-one box per field below and packs them into the single credential string
-the backend stores. If you set a credential in `config.toml` instead
-(`acme.dns_provider` / `acme.dns_api_token`), Namecheap and Route53 take
-their fields joined with colons in the order shown.
-
-| Provider | `dns_provider` | What you enter |
-|----------|----------------|----------------|
-| Cloudflare | `cloudflare` | One API token with Zone:DNS:Edit on the zone (sent as a Bearer token). |
-| DigitalOcean | `digitalocean` | One personal access token with write scope (Bearer token). |
-| Hetzner | `hetzner` | One token from the Hetzner DNS Console (sent in the `Auth-API-Token` header). |
-| DuckDNS | `duckdns` | One token from your DuckDNS account page. The domain must be a DuckDNS subdomain. |
-| GoDaddy | `godaddy` | One Personal Access Token, sent as a Bearer token. The older `sso-key` key and secret scheme is not supported. |
-| Namecheap | `namecheap` | Three fields: API user, API key, and the client IP you have allowlisted in Namecheap's API settings. Stored as `user:key:clientip`. |
-| Route53 (AWS) | `route53` | Two fields: access key ID and secret access key. Stored as `access_key_id:secret_access_key`, signed for us-east-1. |
-
-### Firewall
-
-`nftables::generator` builds a default-DROP `inet` table from scratch
-on every hosts/port-rule change, with an explicit ACCEPT carve-out for
-each configured host/port rule -- see [Architecture](#architecture)
-below. A small, fixed set of ports is always accepted unconditionally,
-regardless of what's configured (or not configured) yet:
-
-- **SSH (22)** -- a completely separate daemon this project has no
-  visibility into. A fresh install with zero port rules must never be
-  able to firewall off the very access an operator needs to configure
-  it in the first place.
-- **HTTP (80) and HTTPS (443)** -- the two ports this whole proxy
-  exists to serve. Per-host rules add narrower bind-ip-scoped
-  carve-outs on top of these, but a host that hasn't been created (or
-  fully configured) yet must not leave 80/443 unreachable network-wide.
-- **The admin port** (`admin.bind_port`, 8084 by default) -- open to
-  any source until `admin.allowed_ips` is set (see the warning at the
-  top).
-
-`nft` itself is validated once at startup (`nftables::validate_environment`)
--- a missing/broken `nft` binary logs one clear, actionable error
-immediately rather than only showing up buried in repeating `nftables
-sync failed` lines. This is deliberately non-fatal: proxying/ACME/the
-admin API all work regardless of whether the firewall layer is healthy,
-so a missing `nft` (e.g. a host whose firewall is managed elsewhere
-instead of via `CAP_NET_ADMIN`) logs loudly but doesn't crash startup.
-
-A host doesn't have to use ACME at all -- set `acme_enabled = false` and
-upload a cert manually via `POST /api/certs` (an internal CA's cert, a
-wildcard bought elsewhere). Uploading is rejected if a host for that
-domain still has `acme_enabled = true`, since the next renewal check
-would otherwise silently overwrite it. Every cert (ACME-issued or
-uploaded) is written to `acme.cert_dir` and reloaded from there on
-startup, so a restart never re-issues or "forgets" one.
-
-### Logging
-
-stdout (journald under `systemd`) behaves exactly as always -- unified,
-`info`-level by default, overridable via `RUST_LOG`. In addition,
-`logging::init` writes three purpose-scoped, daily-rotated files
-alongside the sqlite DB (`admin.db_path`'s directory -- already
-read-write for this daemon, no separate config field or packaging
-change needed):
-
-- **`proxy.log`** -- the data plane (listeners, TLS, forwarding,
-  WebSocket/passthrough) plus ACME issuance/renewal. Also accepts
-  `debug`-level events (real connection-handling `tracing::debug!`
-  calls already exist), without touching stdout/journald's own default
-  verbosity.
-- **`access.log`** -- every admin API request: method, path, status,
-  latency, and how it authenticated (`session`/`token`/`unauthenticated`).
-  The daemon's only per-request admin audit trail.
-- **`server.log`** -- everything else: startup/bootstrap, nftables
-  sync, config loading.
-
-### SIEM / syslog forwarding (optional)
-
-rust-proxy can forward security-relevant events to any syslog
-collector or SIEM (Wazuh, Graylog, Splunk, rsyslog, Elastic, ...). It is
-**off by default**, needs no particular product, and costs nothing
-unless enabled.
-
-Configure it in `config.toml` (read-only in the UI/API when present) or
-at runtime from the web UI's "SIEM / syslog forwarding" panel, or
-`PUT /api/siem` (stored in the DB, applied live, no restart):
-
-```toml
-[siem]
-enabled        = true
-host           = "siem.example.com"
-port           = 514                # default 514
-protocol       = "udp"              # udp | tcp | tls
-syslog_format  = "rfc5424"          # rfc5424 | rfc3164
-message_format = "json"             # json | kv | cef
-facility       = "local0"           # name or 0-23
-app_name       = "rust-proxy"
-# hostname     = "proxy"            # default: this machine's hostname
-categories     = ["denied", "admin", "cert", "system"]   # add "access" for every request
-# tls_ca_file  = "/etc/ssl/siem-ca.pem"   # extra CA, on top of the public roots
-queue_size     = 4096
-```
-
-Event categories and what they emit:
-
-| Category | Events |
-|---|---|
-| `denied` | `acl_ip_denied`, `host_login_failure` |
-| `admin` | `admin_auth_failure`, `admin_login`, `admin_change` (every non-GET admin API call, warning severity when it fails), `host_login_success` |
-| `cert` | `cert_issued`, `cert_issue_failed` |
-| `system` | `daemon_start`, `siem_test` |
-| `access` | `http_request` (one per proxied HTTPS request; high volume, opt-in) |
-
-Every event carries `event`, `category`, `severity` and `message` plus
-event-specific fields (`client_ip`, `domain`, `method`, `path`,
-`http_status`, ...; `access` events also carry `user_agent`, `bytes` and
-`has_query`). Query strings are never logged, any field whose name
-suggests a secret (password, token, cookie, authorization, ...) is
-replaced with `[redacted]`, passwords and tokens are never read into
-events, control characters are stripped so a request cannot forge extra
-log lines, and values are capped at 1024 characters.
-
-Delivery never blocks traffic: events go through a bounded queue and are
-**dropped** (and counted) when it is full or the collector is down; TCP/TLS
-reconnects with 1s-60s backoff, UDP re-resolves the hostname every 5
-minutes. `GET /api/siem` shows `sent`, `dropped`, `errors` and
-`last_error`; `POST /api/siem/test` sends a `siem_test` event.
-
-Limitations: connections dropped by the kernel firewall (nftables) never
-reach the daemon and are not forwarded; port-forward passthrough has no
-application-level access list, so it produces no events; with TCP, the
-first event written to a connection the collector has silently closed may
-be lost before the reconnect.
-
-**Wazuh:** use `syslog_format = "rfc3164"`, `message_format = "json"`,
-add a `<remote>` with `<connection>syslog</connection>`, the chosen port
-and `<allowed-ips>` set to the proxy's address, and install
-`deploy/wazuh/rustproxy_decoders.xml` and `rustproxy_rules.xml`
-(rule IDs 100300-100399: brute-force, repeated-denial, scanner/probe,
-exploit-path, 5xx-burst, unknown-host and request-rate rules with MITRE
-mappings; normal `access` traffic stays at level 2 so it is archived
-but not alerted; edit the hostname suffix list in rule 100371 to match
-your own domains; `install-retention.sh` adds an optional log-retention cron) into `/var/ossec/etc/decoders` and `/rules`.
-
-### Public-address hosting (optional)
-
-Turns a routed block of public addresses (for example a /28) into 1:1
-forwards to private customer VMs. Nothing happens until you create a pool.
-
-```bash
-# a pool is a class; "standard" and "ham" are just names
-curl -X POST http://127.0.0.1:8084/api/hosting/pools -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"standard","cidr":"204.52.221.224/28","reserved":["204.52.221.225"],
-       "vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1"}'
-
-# next free public address + next free private address, plus provisioning hints
-curl -X POST http://127.0.0.1:8084/api/hosting/allocations -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d '{"class":"standard","name":"web01","customer":"Acme"}'
-```
-
-The response's `provision` object carries what to configure on the VM
-(`private_ip`, `gateway`, `netmask`, `cidr`, `ipconfig0`). `forward` is
-`"all"` (every protocol and port) or `"ports"` with a `ports` list.
-`POST /api/hosting/allocations/:id/check` verifies the live state and
-`GET /api/hosting/status` shows per-pool usage and the last apply.
-
-How it is applied: a `/32` on `lo` per active allocation, a blackhole
-route per pool (unallocated addresses stay silent), and an `ip
-rust_proxy_hosting` nftables table with DNAT in, SNAT out, a guard that
-drops non-ICMP traffic left addressed to a hosted IP, and a rule that
-keeps VMs off private networks. Other tables (`inet rust_proxy`, a router
-table) are never modified, so the host's forward policy must also accept
-the VM network. Needs `CAP_NET_ADMIN`; addresses in `network.dedicated_ips`
-or already bound to a host or port rule cannot be hosted.
-
-Pools can be pre-created on first start (only when the database has none):
-
-```toml
-[[hosting.pools]]
-name     = "standard"
-cidr     = "204.52.221.224/28"
-vm_cidr  = "172.16.63.0/24"
-gateway  = "172.16.63.1"
-```
-
-## API
-
-Every route under `/api/*` except `/api/login`/`/api/logout` requires
-authentication, and accepts either of two independent credentials:
-
-- **Session cookie** -- what the web UI uses. `POST /api/login` with
-  `{"username": "...", "password": "..."}` sets an HTTP-only,
-  `SameSite=Lax` cookie good for 12 hours; `POST /api/logout` clears it.
-- **API token** -- `Authorization: Bearer <token>`, for scripts, CI
-  pipelines, or any other tool driving this instance without a browser.
-  A token is exactly as privileged as the admin session that created it
-  (there's no scope/permission system, matching this daemon's one-admin-
-  account model) and can reach every endpoint below, including token
-  management itself -- **treat a token like a password**: anyone holding
-  one can reconfigure the proxy and the firewall behind it.
-
-### Managing tokens
-
-Bootstrapping requires the web UI (or `curl` against `/api/login` with
-the admin password) once, to mint the first token -- there's no way to
-create a token without already having a valid credential.
-
-```sh
-# Sign in, keeping the session cookie, then mint a token:
-curl -c /tmp/cookies -X POST https://proxy.example.com/api/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"..."}'
-
-curl -b /tmp/cookies -X POST https://proxy.example.com/api/tokens \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"ci pipeline"}'
-# -> {"id":"...","name":"ci pipeline","token":"rpx_...","created_at":"..."}
-# The "token" field is shown exactly once -- save it now. Only its
-# SHA-256 hash is ever persisted (see db::create_api_token), so a lost
-# token means minting a new one, not recovering the old one.
-```
-
-| Method | Path             | Body                | Notes |
-|--------|------------------|----------------------|-------|
-| GET    | `/api/tokens`    | --                   | Lists `{id, name, created_at, last_used_at}` -- never the token or its hash. `last_used_at` is `null` until first use, so unused tokens are easy to spot and revoke. |
-| POST   | `/api/tokens`    | `{"name": "..."}`   | Creates a token; response includes the plaintext once. |
-| DELETE | `/api/tokens/:id`| --                   | Revokes immediately -- any request already using it fails on its very next call. |
-
-### Managing proxy hosts and firewall rules
-
-The same token works for everything the admin UI does. The request/
-response shapes match the `HostRequest`/`PortRuleRequest` fields in
-`src/api/routes.rs` (also visible in the web UI's own forms):
-
-| Method | Path                    | Body                                                                                     |
-|--------|-------------------------|-------------------------------------------------------------------------------------------|
-| GET    | `/api/dashboard`        | -- (host/port-rule/cert counts, configured `bind_ranges`)                                 |
-| GET    | `/api/hosts`            | --                                                                                         |
-| POST   | `/api/hosts`            | `{"domain","bind_ip","bind_port","upstream","upstream_https","upstream_tls_verify","upstream_preserve_host","websockets","force_https","acme_enabled","acme_challenge_type","acl_ids","redirect","enabled"}` |
-| PUT    | `/api/hosts/:id`        | same shape as POST                                                                         |
-| DELETE | `/api/hosts/:id`        | --                                                                                         |
-| GET    | `/api/port-rules`       | --                                                                                         |
-| POST   | `/api/port-rules`       | `{"bind_ip","port_start","port_end","protocol","description","passthrough_target","enabled"}` |
-| PUT    | `/api/port-rules/:id`   | same shape as POST                                                                          |
-| DELETE | `/api/port-rules/:id`   | --                                                                                         |
-| GET    | `/api/certs`            | -- (`{domain, not_after, days_remaining}` per issued/uploaded cert)                       |
-| POST   | `/api/certs`            | `{"domain","fullchain_pem","private_key_pem"}` -- upload a custom cert (see Configuration) |
-| DELETE | `/api/certs/:domain`    | --                                                                                         |
-| GET    | `/api/acls`             | -- (`{id, name, kind, created_at}` per ACL, never entries/credentials)                    |
-| POST   | `/api/acls`             | `{"name","kind"}` plus `"ip_entries"` (IP allow) or `"credentials"` (Login, `[{"username","password"}]`) |
-| DELETE | `/api/acls/:id`         | -- refused (409) while any host still selects it                                          |
-| GET    | `/api/dns01-certs`      | -- (`{id, domain, dns_credential_id, created_at}` per tracked standalone cert)             |
-| POST   | `/api/dns01-certs`      | `{"domain","dns_credential_id","organization","organizational_unit"}` -- issues synchronously (can take up to a minute); only persists on success; `organization`/`organizational_unit` override the config.toml default for this one cert |
-| DELETE | `/api/dns01-certs/:id`  | -- stops renewal tracking only; the already-issued cert keeps working                     |
-| GET    | `/api/acme-settings`    | -- (`{contact_email, from_config}`; `from_config: true` means config.toml wins, edits here are refused) |
-| PUT    | `/api/acme-settings`    | `{"contact_email"}` -- 409 if config.toml already supplies `acme.contact_email`            |
-
-```sh
-curl -X POST https://proxy.example.com/api/hosts \
-  -H "Authorization: Bearer rpx_..." \
-  -H 'Content-Type: application/json' \
-  -d '{"domain":"app.example.com","bind_ip":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","websockets":true}'
-```
-
-Errors are `{"error": "message"}` with `400`/`404`/`500` as appropriate;
-`bind_ip` is validated against `network.bind_ranges` the same way the
-web UI's own submissions are -- there's no separate, looser code path
-for the token-authenticated API.
-
-## Architecture
-
-- `config` -- TOML parsing + validation (bind IPs inside the configured
-  `network.bind_ranges`, if any are configured; non-zero/well-ordered
-  ports; no duplicate binds).
-- `state` -- `AppState`: hosts/port_rules/certs live in `ArcSwap` for
-  lock-free hot-reload reads; a `Mutex` per resource serializes the
-  admin API's write path so concurrent edits can't race and drop each
-  other; a `Notify` wakes the nftables sync loop and the proxy listener
-  supervisor immediately on change (plus a periodic fallback in case a
-  notification is ever missed).
-- `nftables::generator` -- pure ruleset-text generation (default-DROP,
-  one explicit ACCEPT per active host/port-rule bind); `nftables::apply`
-  is the thin layer that actually shells out to `nft -f -`.
-- `acme` -- native RFC 8555 client: JWS framing (`jws`), wire types
-  (`types`), the HTTP state machine (`client`), pluggable dns-01
-  (`dns01` -- a `DnsProvider` trait plus one implementation per provider:
-  `dns01::cloudflare`, `dns01::digitalocean`, `dns01::hetzner`), http-01
-  (`http01` -- serves the key authorization from an in-memory map on
-  `proxy::mod`'s port-80 listener, no third-party credentials needed),
-  and CSR/certificate handling (`cert`). `resolve_challenge_type` picks
-  which one a given host actually uses (see Configuration above).
-  `run_renewal_loop` checks every ACME-enabled host every 12h and
-  re-issues anything within `acme.renew_before_days` of expiry.
-  `load_certs_from_disk` restores every already-issued/uploaded cert
-  from `acme.cert_dir` at startup (one subdirectory per domain, same
-  layout `persist_cert_files` writes) -- without it a restart would
-  forget a custom-uploaded cert entirely and needlessly re-issue every
-  ACME one.
-- `proxy` -- the data plane: `router` (pure host-matching), `tls`
-  (SNI cert dispatch reading live state), `http` (forwarding + WebSocket
-  upgrade passthrough + a `redirect` host's response), `access` (pure
-  IP-allow-list checks), `login` (the Login-ACL session-cookie gate:
-  credential check, HMAC session signing/verification, and the login
-  page itself) -- access/login run before a matched request is
-  forwarded (or, for a `redirect` host, before the redirect response is
-  built instead), `passthrough` (raw TCP/UDP
-  for non-HTTP port rules). ALPN offers `h2` then `http/1.1`; the HTTPS
-  listener uses `hyper-util`'s auto builder to actually speak whichever
-  one a client negotiates, with HTTP/1 upgrades (what WebSocket
-  passthrough needs) still enabled. Deliberately doesn't enable HTTP/2
-  Extended CONNECT (RFC 8441) -- per that RFC, a client won't attempt a
-  WebSocket handshake over h2 without confirming that's supported, so
-  leaving it off means WebSocket clients cleanly fall back to HTTP/1.1
-  instead of failing; everything else gets real HTTP/2 multiplexing.
-  Same split Nginx itself makes. A supervisor diffs the desired listener set
-  against what's running on every state change and only starts/stops
-  the delta -- editing a route's upstream never restarts its listener.
-  A host's `domain` may be a single leading wildcard label
-  (`*.pages.example.com`) to cover every one-level subdomain under one
-  route/cert -- e.g. a GitLab instance's Pages feature, which serves
-  each project at its own subdomain. Exact matches always win over a
-  wildcard when both are configured. dns-01 (required for wildcard
-  certs -- CAs never offer http-01 for them) already covers this; no
-  ACME changes were needed beyond record-name handling.
-- `api` -- Axum admin REST API (`routes`) behind dual auth (`auth`):
-  argon2/HMAC session cookies for the web UI, or a SHA-256-hashed-at-rest
-  bearer API token for everything else -- see the API section above.
-  Plus the embedded (`include_str!`) single-page web UI at
-  `web/index.html`.
-- `db` -- sqlite persistence for hosts/port_rules/api_tokens via `sqlx`.
-
-## Deployment
-
-Runs on any Linux host, from a Proxmox LXC with a dedicated subnet to a
-single-IP VPS or home server -- see `network.bind_ranges` above.
-`deploy/rust-proxy.service` runs the daemon as a non-root `rust-proxy` user
-with just
-`CAP_NET_BIND_SERVICE` (privileged ports), `CAP_NET_ADMIN` (nftables) and
-`CAP_NET_RAW` (the hosting reachability check's single ICMP ping)
-via `AmbientCapabilities`/`CapabilityBoundingSet`, plus
-`NoNewPrivileges`/`ProtectSystem=strict`/`ProtectHome` for defense in
-depth. The admin UI's own port is additionally restricted to
-`admin.allowed_ips` at the firewall layer, not just by session auth.
-
-### Installing the `.deb`
-
-Every `vX.Y.Z` tag is built and published by CI (`.gitlab-ci.yml`) to
-this project's [Releases](../../releases) page and to a small
-self-hosted apt repo:
+## Install
 
 ```sh
 sudo mkdir -p /etc/apt/keyrings
@@ -570,60 +40,88 @@ sudo apt update
 sudo apt install rust-proxy
 ```
 
-(The repo is GPG-signed -- `apt update` verifies `InRelease` against
-the key fetched above before trusting anything in it. See
-[`jpps/apt-repo-server`](https://gitlab.jpps.us/jpps/apt-repo-server)'s
-README for the full setup, including how to add both the `stable` and
-`testing` channels at once.)
+Then open `http://<host-ip>:8084/` and follow the first-run wizard. The
+full walkthrough, from install to your first HTTPS host, is in
+[Getting started](docs/getting-started.md).
 
-`postinst` creates the `rust-proxy` system user, installs a working
-default `/etc/rust-proxy/config.toml` on first install (admin UI on
-`0.0.0.0:8084`, see the warning at the top -- no admin account or DNS credential yet), and starts the
-service. Visit the admin UI once (`http://<this-host's-ip>:8084/`, or
-wherever you've pointed `admin.bind_ip`/`admin.bind_port` after editing
-the config) to finish setup -- it walks you through creating the admin account and,
-optionally, an initial DNS-01 credential, both stored in the runtime
-database rather than the config file. An install with no DNS credential
-added yet still works -- it just can't issue dns-01 certs until one is
-added, either through the wizard or later from the admin UI's "DNS
-credentials" section.
+rust-proxy runs as a systemd service and manages the host's nftables
+rules. It is not distributed as a Docker image and Docker support is not
+planned.
 
-Prefer to manage the admin identity/DNS credential as part of
-`config.toml` instead of through the DB-backed wizard? Set
-`admin.session_secret`/`admin.admin_username`/`admin.admin_password_hash`
-(all three together -- a partial set is rejected at startup) and/or
-`acme.dns_provider`/`acme.dns_api_token` there; whichever of those you
-set in `config.toml` always takes precedence over whatever the wizard
-or admin UI has stored, on every read, not just at first boot.
+## A quick example: lock a captive-portal port to one path
 
-Or download a specific release's `.deb` directly and `dpkg -i` it, or
-build/install manually:
+A UniFi Hosted Controller exposes its guest portal on port 8444. Nothing
+else on that port should ever be reachable from the internet. One host
+setting does it:
 
-```sh
-sudo install -d -m 750 -o rust-proxy -g rust-proxy /etc/rust-proxy
-sudo install -m 640 -o root -g rust-proxy deploy/config.toml.example /etc/rust-proxy/config.toml
-# edit /etc/rust-proxy/config.toml -- see Configuration above
-sudo install -m 644 deploy/rust-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now rust-proxy
+```json
+{
+  "domain": "guest.unifi.example.com",
+  "bind_ip_v4": "0.0.0.0",
+  "bind_port": 8444,
+  "upstream": "10.0.0.20:8444",
+  "upstream_https": true,
+  "deny_fallback": { "scope": "everyone", "allow_paths": ["/guest/"] }
+}
 ```
 
-## Support
+Every request outside `/guest/` gets a plain 404 and never reaches the
+upstream. More on this, including redirecting blocked visitors to a
+public page, in [deny_fallback](docs/deny-fallback.md) and the
+[cookbook](docs/cookbook.md).
 
-- **Bugs and questions:** open an issue at
-  [gitlab.jpps.us/jpps/rust-proxy/-/issues](https://gitlab.jpps.us/jpps/rust-proxy/-/issues).
-- **Chip in:** rust-proxy is free and MIT licensed. If it saves you time,
-  you can [buy me a coffee](https://buymeacoffee.com/kb9gxk).
-- **No Docker:** rust-proxy is not distributed as a Docker image, and
-  Docker support is not planned. It manages the host's nftables rules
-  (`CAP_NET_ADMIN`) and is built to run as a normal systemd service,
-  installed from the `.deb`.
+## How it compares to Nginx Proxy Manager
+
+rust-proxy aims at the same job: a web UI in front of a reverse proxy
+with automatic certificates. The differences, stated plainly:
+
+- **Different shape.** One native binary and sqlite, installed from a `.deb` and run by systemd. No Docker, no separate nginx, no MariaDB.
+- **It manages the firewall.** The host's nftables ruleset is generated from your configuration, default-DROP.
+- **Access lists are reusable and named**, and a host can combine IP allow, login and client-certificate lists.
+- **Users have three fixed roles**: admin, operator (changes proxy config, cannot touch users, tokens or system settings) and viewer (read-only). API tokens carry a role too. See [Users and roles](docs/users-and-roles.md).
+- **What NPM has that rust-proxy does not:** per-section permissions finer than those three roles, and a larger community.
+
+If you are moving over, see [Migrating from Nginx Proxy Manager](docs/migration-from-npm.md).
+
+## Documentation
+
+| Page | What it covers |
+|------|----------------|
+| [Getting started](docs/getting-started.md) | Install, first-run wizard, DNS credential, first host, verifying it works |
+| [Configuration](docs/configuration.md) | `config.toml`, every host field, ACME, DNS providers, redirect/static hosts |
+| [Access control](docs/access-control.md) | IP allow, login and client-cert ACLs, and how they combine |
+| [deny_fallback](docs/deny-fallback.md) | Blocked-visitor redirects, path locks and allow-lists |
+| [Firewall](docs/firewall.md) | What the nftables ruleset does, always-open ports, port rules |
+| [Hosting](docs/hosting.md) | Public IP pools and 1:1 forwards to customer VMs |
+| [Users and roles](docs/users-and-roles.md) | Admin, operator and viewer roles, adding users, token roles |
+| [API](docs/api.md) | Authentication, tokens and the endpoint reference |
+| [Logging and SIEM](docs/logging-and-siem.md) | Log files, syslog forwarding, Wazuh rules |
+| [Cookbook](docs/cookbook.md) | Worked recipes |
+| [Troubleshooting](docs/troubleshooting.md) | Common problems and how to check them |
+| [Architecture](docs/architecture.md) | Module layout, for contributors |
+| [Deployment](docs/deployment.md) | systemd unit, capabilities, manual install, building from source |
 
 ## Status
 
-In production use: rust-proxy fronts all of JPPS's public `*.jpps.us` sites, handling TLS termination, SNI dispatch, Let's Encrypt issuance over DNS-01 and dynamic firewalling. It is still pre-1.0, so expect configuration and API details to change between releases; see `CHANGELOG.md` for what has changed.
+rust-proxy fronts all of JPPS's public `*.jpps.us` sites, handling TLS
+termination, SNI dispatch, Let's Encrypt issuance over DNS-01 and
+dynamic firewalling, so it is used in production every day. It is
+maintained by one person and is still pre-1.0: configuration and API
+details can change between releases. Read [`CHANGELOG.md`](CHANGELOG.md)
+before upgrading.
+
+## Support
+
+- **Bugs and questions:** [open an issue](https://gitlab.jpps.us/jpps/rust-proxy/-/issues).
+- **Chip in:** rust-proxy is free under the AGPL-3.0. If it saves you time, you can [buy me a coffee](https://buymeacoffee.com/kb9gxk).
 
 ## License
 
-MIT -- see [LICENSE](LICENSE). Contributions (new DNS providers
-especially) welcome.
+rust-proxy is dual-licensed by Jeff Parrish PC Services LLC. Pick whichever fits:
+
+- **AGPL-3.0**, free, see [LICENSE](LICENSE). If you modify rust-proxy and let others use it over a network, you must offer them your modified source.
+- **Commercial License**, a one-time **$10** for a lifetime license with no source-sharing conditions, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) and buy it at [store.jpps.us](https://store.jpps.us/products/rust-proxy).
+
+Running unmodified rust-proxy, or modified rust-proxy for yourself, needs nothing but the AGPL. Releases up to 0.1.3 were published under MIT and stay MIT.
+
+Code contributions are welcome under a short [contributor agreement](CLA.md) that lets the project stay dual-licensed; see [CONTRIBUTING.md](CONTRIBUTING.md). You can also support the project with [Buy Me a Coffee](https://buymeacoffee.com/kb9gxk).
