@@ -579,6 +579,35 @@ async fn route_https_request(
                     .any(|s| s == subject)
         });
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
+    if host.block_exploits {
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str());
+        let user_agent = req
+            .headers()
+            .get(hyper::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
+        if let Some(reason) = access::exploit_check(req.method(), path_and_query, user_agent) {
+            if crate::siem::wants(crate::siem::Category::Denied) {
+                let client_ip = peer_ip.to_string();
+                crate::siem::emit(
+                    crate::siem::Category::Denied,
+                    crate::siem::Severity::Warning,
+                    "exploit_blocked",
+                    "request refused: looks like an automated exploit probe",
+                    &[
+                        ("client_ip", client_ip.as_str()),
+                        ("domain", host.domain.as_str()),
+                        ("method", req.method().as_str()),
+                        ("path", req.uri().path()),
+                        ("reason", reason),
+                    ],
+                );
+            }
+            return Ok(forbidden_page(&host.domain));
+        }
+    }
     if let Some(fb) = host
         .deny_fallback
         .as_ref()
@@ -639,6 +668,10 @@ async fn route_https_request(
         }
     }
 
+    if let Some(fixed) = &host.fixed_response {
+        return Ok(fixed_response_page(fixed));
+    }
+
     if let Some(redirect) = &host.redirect {
         return Ok(http::redirect_target_response(&req, redirect));
     }
@@ -674,15 +707,20 @@ async fn route_https_request(
         apply_path_rewrite(&mut req, path_rewrite);
     }
 
-    let Ok(upstream) = resolve_upstream(&host.upstream) else {
+    let location = crate::config::match_location(&host.locations, req.uri().path());
+    let (upstream_host_port, upstream_https, upstream_tls_verify) = match location {
+        Some(loc) => (loc.upstream.as_str(), loc.upstream_https, loc.upstream_tls_verify),
+        None => (host.upstream.as_str(), host.upstream_https, host.upstream_tls_verify),
+    };
+    let Ok(upstream) = resolve_upstream(upstream_host_port) else {
         return Ok(bad_gateway());
     };
 
     let opts = http::UpstreamOptions {
         websockets_enabled: host.websockets,
-        https: host.upstream_https,
-        tls_verify: host.upstream_tls_verify,
-        upstream_host_port: &host.upstream,
+        https: upstream_https,
+        tls_verify: upstream_tls_verify,
+        upstream_host_port,
         preserve_host: host.upstream_preserve_host,
         client_ip: peer_ip,
         rewrite_samesite_none_cookies: host.rewrite_samesite_none_cookies,
@@ -1021,6 +1059,27 @@ fn not_found() -> Response<BoxBody<Bytes, hyper::Error>> {
                 .boxed(),
         )
         .expect("static response is always valid")
+}
+
+fn fixed_response_page(
+    fixed: &crate::config::FixedResponse,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let status = hyper::StatusCode::from_u16(fixed.status).unwrap_or(hyper::StatusCode::NOT_FOUND);
+    let body = if matches!(fixed.status, 204 | 205 | 304) {
+        Bytes::new()
+    } else {
+        Bytes::from(fixed.body.clone())
+    };
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .body(
+            http_body_util::Full::new(body)
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("fixed response is always valid")
 }
 
 fn bad_gateway() -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -1444,6 +1503,9 @@ mod tests {
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1924,6 +1986,9 @@ mod tests {
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1982,6 +2047,9 @@ mod tests {
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2009,6 +2077,9 @@ mod tests {
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: true,
             enabled: true,
         }
@@ -2370,6 +2441,9 @@ mod tests {
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2439,6 +2513,93 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_fixed_response_host_answers_without_an_upstream() {
+        let target = crate::config::RedirectTarget {
+            target: "https://unused.example.com".into(),
+            preserve_path: true,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let mut host = redirect_host("example.com", target);
+        host.redirect = None;
+        host.fixed_response = Some(crate::config::FixedResponse {
+            status: 404,
+            body: "no such site".into(),
+        });
+        let state = test_state_with_host(host).await;
+        let resp = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/x", None, None).await;
+        assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"no such site");
+    }
+
+    #[tokio::test]
+    async fn block_exploits_refuses_probes_but_not_ordinary_requests() {
+        let target = crate::config::RedirectTarget {
+            target: "https://new.example.com".into(),
+            preserve_path: true,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let mut host = redirect_host("example.com", target);
+        host.block_exploits = true;
+        let state = test_state_with_host(host).await;
+        let blocked = send_test_request(
+            state.clone(),
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/?q=%3Cscript%3E",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(blocked.status(), hyper::StatusCode::FORBIDDEN);
+        let ok = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/page", None, None).await;
+        assert_eq!(ok.status(), hyper::StatusCode::MOVED_PERMANENTLY);
+    }
+
+    #[tokio::test]
+    async fn a_custom_location_routes_its_path_to_its_own_upstream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loc_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(Response::new(
+                            http_body_util::Full::new(Bytes::from_static(b"from-location")),
+                        ))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+        let target = crate::config::RedirectTarget {
+            target: "https://unused.example.com".into(),
+            preserve_path: true,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let mut host = redirect_host("example.com", target);
+        host.redirect = None;
+        host.upstream = "127.0.0.1:1".into();
+        host.locations = vec![crate::config::HostLocation {
+            path: "/api".into(),
+            upstream: loc_addr.to_string(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+        }];
+        let state = test_state_with_host(host).await;
+        let hit = send_test_request(state.clone(), "203.0.113.7".parse().unwrap(), "GET", "/api/users", None, None).await;
+        assert_eq!(hit.status(), hyper::StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(hit.into_body()).await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"from-location");
+        let miss = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/other", None, None).await;
+        assert_eq!(miss.status(), hyper::StatusCode::BAD_GATEWAY);
     }
 
     /// A test-only "trust anything" verifier -- the self-signed cert

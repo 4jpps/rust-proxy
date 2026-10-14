@@ -16,6 +16,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::api::auth::Role;
 use crate::hosting::model::{Allocation, ForwardMode, HostingPool};
 use crate::config::{
     AclKind, AclList, AcmeChallengeType, DnsProviderKind, HostAuth, PortRule, Protocol, ProxyHost,
@@ -178,6 +179,17 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await;
     // JSON-encoded `config::DenyFallback`; NULL means none.
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN deny_fallback TEXT")
+        .execute(pool)
+        .await;
+    // JSON-encoded `Vec<config::HostLocation>`; NULL or empty means none.
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN locations TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN block_exploits INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    // JSON-encoded `config::FixedResponse`; NULL means none.
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN fixed_response TEXT")
         .execute(pool)
         .await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
@@ -361,6 +373,31 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Tokens created before roles existed keep full access.
+    let _ = sqlx::query("ALTER TABLE api_tokens ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
+        .execute(pool)
+        .await;
+
+    // Extra admin-UI accounts beside the owner identity (config.toml or the
+    // setup wizard), which is never stored here. `role` is one of
+    // admin/operator/viewer; `disabled` blocks sign-in without losing the
+    // account.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_login_at TEXT
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // `token` holds whatever that row's `provider` needs -- a single
     // bearer token for most providers, or a colon-packed multi-field
     // credential (Namecheap, Route53) -- see each provider module's own
@@ -486,25 +523,41 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 }
 
 /// Metadata about an API token, as returned by the admin API -- never
-/// includes the hash (nothing outside `find_api_token_id_by_hash` needs
+/// includes the hash (nothing outside `find_api_token_by_hash` needs
 /// it) or the plaintext (never persisted at all, see `create_api_token`).
 pub struct ApiTokenMeta {
     pub id: Uuid,
     pub name: String,
+    pub role: Role,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
+}
+
+/// An API token resolved from its hash during authentication.
+pub struct ApiTokenAuth {
+    pub id: Uuid,
+    pub name: String,
+    pub role: Role,
+}
+
+/// A stored role string, with anything unrecognised treated as the least
+/// powerful role rather than the most.
+fn role_from_db(s: &str) -> Role {
+    Role::parse(s).unwrap_or(Role::Viewer)
 }
 
 pub async fn create_api_token(
     pool: &SqlitePool,
     id: Uuid,
     name: &str,
+    role: Role,
     token_hash: &str,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_tokens (id, name, token_hash, created_at, last_used_at) VALUES (?, ?, ?, ?, NULL)")
+    sqlx::query("INSERT INTO api_tokens (id, name, role, token_hash, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, NULL)")
         .bind(id.to_string())
         .bind(name)
+        .bind(role.as_str())
         .bind(token_hash)
         .bind(created_at.to_rfc3339())
         .execute(pool)
@@ -514,7 +567,7 @@ pub async fn create_api_token(
 
 pub async fn list_api_tokens(pool: &SqlitePool) -> Result<Vec<ApiTokenMeta>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, name, created_at, last_used_at FROM api_tokens ORDER BY created_at ASC",
+        "SELECT id, name, role, created_at, last_used_at FROM api_tokens ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -524,6 +577,7 @@ pub async fn list_api_tokens(pool: &SqlitePool) -> Result<Vec<ApiTokenMeta>, sql
                 id: Uuid::parse_str(row.get::<String, _>("id").as_str())
                     .unwrap_or_else(|_| Uuid::new_v4()),
                 name: row.get("name"),
+                role: role_from_db(&row.get::<String, _>("role")),
                 created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
                 last_used_at: row
                     .get::<Option<String>, _>("last_used_at")
@@ -535,16 +589,19 @@ pub async fn list_api_tokens(pool: &SqlitePool) -> Result<Vec<ApiTokenMeta>, sql
 
 /// Looks up a token by the hash of its plaintext (never by plaintext
 /// itself -- callers hash first, see `api::auth::hash_api_token`).
-pub async fn find_api_token_id_by_hash(
+pub async fn find_api_token_by_hash(
     pool: &SqlitePool,
     token_hash: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let row = sqlx::query("SELECT id FROM api_tokens WHERE token_hash = ?")
+) -> Result<Option<ApiTokenAuth>, sqlx::Error> {
+    let row = sqlx::query("SELECT id, name, role FROM api_tokens WHERE token_hash = ?")
         .bind(token_hash)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|r| {
-        Uuid::parse_str(r.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4())
+    Ok(row.map(|r| ApiTokenAuth {
+        id: Uuid::parse_str(r.get::<String, _>("id").as_str())
+            .unwrap_or_else(|_| Uuid::new_v4()),
+        name: r.get("name"),
+        role: role_from_db(&r.get::<String, _>("role")),
     }))
 }
 
@@ -566,6 +623,163 @@ pub async fn touch_api_token_last_used(
 
 pub async fn delete_api_token(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM api_tokens WHERE id = ?")
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// An extra admin-UI account. `password_hash` is only ever read back for
+/// sign-in and password changes, never returned by the API.
+pub struct UserRow {
+    pub id: Uuid,
+    pub username: String,
+    pub password_hash: String,
+    pub role: Role,
+    pub disabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for UserRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserRow")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"<redacted>")
+            .field("role", &self.role)
+            .field("disabled", &self.disabled)
+            .finish()
+    }
+}
+
+fn user_from_row(row: &sqlx::sqlite::SqliteRow) -> UserRow {
+    UserRow {
+        id: Uuid::parse_str(row.get::<String, _>("id").as_str()).unwrap_or_else(|_| Uuid::new_v4()),
+        username: row.get("username"),
+        password_hash: row.get("password_hash"),
+        role: role_from_db(&row.get::<String, _>("role")),
+        disabled: row.get::<i64, _>("disabled") != 0,
+        created_at: parse_rfc3339(&row.get::<String, _>("created_at")),
+        last_login_at: row
+            .get::<Option<String>, _>("last_login_at")
+            .map(|s| parse_rfc3339(&s)),
+    }
+}
+
+const USER_COLUMNS: &str =
+    "id, username, password_hash, role, disabled, created_at, last_login_at";
+
+pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRow>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "SELECT {USER_COLUMNS} FROM users ORDER BY username COLLATE NOCASE ASC"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(user_from_row).collect())
+}
+
+pub async fn find_user_by_username(
+    pool: &SqlitePool,
+    username: &str,
+) -> Result<Option<UserRow>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT {USER_COLUMNS} FROM users WHERE username = ? COLLATE NOCASE"
+    ))
+    .bind(username)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(user_from_row))
+}
+
+pub async fn find_user_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<UserRow>, sqlx::Error> {
+    let row = sqlx::query(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?"))
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(user_from_row))
+}
+
+/// Returns `Ok(false)` when the username is already taken (case-insensitively).
+pub async fn create_user(
+    pool: &SqlitePool,
+    id: Uuid,
+    username: &str,
+    password_hash: &str,
+    role: Role,
+    created_at: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT OR IGNORE INTO users (id, username, password_hash, role, disabled, created_at, last_login_at) \
+         SELECT ?, ?, ?, ?, 0, ?, NULL \
+         WHERE NOT EXISTS (SELECT 1 FROM users WHERE username = ? COLLATE NOCASE)",
+    )
+    .bind(id.to_string())
+    .bind(username)
+    .bind(password_hash)
+    .bind(role.as_str())
+    .bind(created_at.to_rfc3339())
+    .bind(username)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn update_user(
+    pool: &SqlitePool,
+    id: Uuid,
+    role: Role,
+    disabled: bool,
+    password_hash: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let result = match password_hash {
+        Some(hash) => {
+            sqlx::query("UPDATE users SET role = ?, disabled = ?, password_hash = ? WHERE id = ?")
+                .bind(role.as_str())
+                .bind(disabled as i64)
+                .bind(hash)
+                .bind(id.to_string())
+                .execute(pool)
+                .await?
+        }
+        None => sqlx::query("UPDATE users SET role = ?, disabled = ? WHERE id = ?")
+            .bind(role.as_str())
+            .bind(disabled as i64)
+            .bind(id.to_string())
+            .execute(pool)
+            .await?,
+    };
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn set_user_password(
+    pool: &SqlitePool,
+    id: Uuid,
+    password_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+        .bind(password_hash)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn touch_user_last_login(
+    pool: &SqlitePool,
+    id: Uuid,
+    when: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
+        .bind(when.to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_user(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(id.to_string())
         .execute(pool)
         .await?;
@@ -1441,7 +1655,7 @@ pub async fn set_siem_settings(
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -1512,6 +1726,14 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 deny_fallback: row
                     .get::<Option<String>, _>("deny_fallback")
                     .and_then(|s| serde_json::from_str(&s).ok()),
+                locations: row
+                    .get::<Option<String>, _>("locations")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                block_exploits: row.get::<i64, _>("block_exploits") != 0,
+                fixed_response: row
+                    .get::<Option<String>, _>("fixed_response")
+                    .and_then(|s| serde_json::from_str(&s).ok()),
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1550,8 +1772,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -1577,6 +1799,9 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.rewrite_samesite_none_cookies as i64)
         .bind(h.pass_client_cert_header as i64)
         .bind(h.deny_fallback.as_ref().and_then(|d| serde_json::to_string(d).ok()))
+        .bind(if h.locations.is_empty() { None } else { serde_json::to_string(&h.locations).ok() })
+        .bind(h.block_exploits as i64)
+        .bind(h.fixed_response.as_ref().and_then(|d| serde_json::to_string(d).ok()))
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -1791,6 +2016,9 @@ mod tests {
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1840,6 +2068,28 @@ mod tests {
         save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
         let loaded = load_hosts(&pool).await.unwrap();
         assert_eq!(loaded[0].deny_fallback, host.deny_fallback);
+    }
+
+    #[tokio::test]
+    async fn parity_fields_round_trip() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.locations = vec![crate::config::HostLocation {
+            path: "/api".into(),
+            upstream: "10.0.0.5:9000".into(),
+            upstream_https: true,
+            upstream_tls_verify: false,
+        }];
+        host.block_exploits = true;
+        host.fixed_response = Some(crate::config::FixedResponse {
+            status: 404,
+            body: "nothing here".into(),
+        });
+        save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert_eq!(loaded[0].locations, host.locations);
+        assert!(loaded[0].block_exploits);
+        assert_eq!(loaded[0].fixed_response, host.fixed_response);
     }
 
     #[tokio::test]
@@ -2064,7 +2314,7 @@ mod tests {
     async fn created_api_token_appears_in_the_list_with_no_last_used_at() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+        create_api_token(&pool, id, "ci pipeline", Role::Admin, "hash-of-token", Utc::now())
             .await
             .unwrap();
 
@@ -2079,29 +2329,124 @@ mod tests {
     async fn api_token_is_found_by_its_hash_and_not_by_a_wrong_one() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+        create_api_token(&pool, id, "ci pipeline", Role::Admin, "hash-of-token", Utc::now())
             .await
             .unwrap();
 
-        assert_eq!(
-            find_api_token_id_by_hash(&pool, "hash-of-token")
-                .await
-                .unwrap(),
-            Some(id)
-        );
-        assert_eq!(
-            find_api_token_id_by_hash(&pool, "wrong-hash")
-                .await
-                .unwrap(),
-            None
-        );
+        let found = find_api_token_by_hash(&pool, "hash-of-token")
+            .await
+            .unwrap()
+            .expect("token should be found by its hash");
+        assert_eq!(found.id, id);
+        assert_eq!(found.name, "ci pipeline");
+        assert_eq!(found.role, Role::Admin);
+        assert!(find_api_token_by_hash(&pool, "wrong-hash")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn api_token_keeps_the_role_it_was_created_with() {
+        let pool = memory_pool().await;
+        create_api_token(&pool, Uuid::new_v4(), "grafana", Role::Viewer, "h-viewer", Utc::now())
+            .await
+            .unwrap();
+        let found = find_api_token_by_hash(&pool, "h-viewer").await.unwrap().unwrap();
+        assert_eq!(found.role, Role::Viewer);
+        assert_eq!(list_api_tokens(&pool).await.unwrap()[0].role, Role::Viewer);
+    }
+
+    #[tokio::test]
+    async fn tokens_from_before_roles_existed_stay_admin() {
+        let pool = SqlitePoolOptions::new()
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE api_tokens (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, last_used_at TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_tokens (id, name, token_hash, created_at) VALUES ('2d6c5d0e-0000-4000-8000-000000000001', 'old', 'old-hash', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let found = find_api_token_by_hash(&pool, "old-hash").await.unwrap().unwrap();
+        assert_eq!(found.role, Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn users_are_created_found_case_insensitively_and_listed() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        assert!(create_user(&pool, id, "Alice", "hash", Role::Operator, Utc::now())
+            .await
+            .unwrap());
+        let found = find_user_by_username(&pool, "alice").await.unwrap().unwrap();
+        assert_eq!(found.id, id);
+        assert_eq!(found.username, "Alice");
+        assert_eq!(found.role, Role::Operator);
+        assert!(!found.disabled);
+        assert_eq!(list_users(&pool).await.unwrap().len(), 1);
+        assert_eq!(find_user_by_id(&pool, id).await.unwrap().unwrap().username, "Alice");
+    }
+
+    #[tokio::test]
+    async fn a_username_cannot_be_reused_even_in_a_different_case() {
+        let pool = memory_pool().await;
+        assert!(create_user(&pool, Uuid::new_v4(), "bob", "h", Role::Viewer, Utc::now())
+            .await
+            .unwrap());
+        assert!(!create_user(&pool, Uuid::new_v4(), "BOB", "h", Role::Admin, Utc::now())
+            .await
+            .unwrap());
+        assert_eq!(list_users(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn updating_a_user_changes_role_disabled_and_optionally_the_password() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_user(&pool, id, "carol", "old-hash", Role::Viewer, Utc::now())
+            .await
+            .unwrap();
+        assert!(update_user(&pool, id, Role::Operator, true, None).await.unwrap());
+        let u = find_user_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!((u.role, u.disabled, u.password_hash.as_str()), (Role::Operator, true, "old-hash"));
+        assert!(update_user(&pool, id, Role::Admin, false, Some("new-hash")).await.unwrap());
+        let u = find_user_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!((u.role, u.disabled, u.password_hash.as_str()), (Role::Admin, false, "new-hash"));
+        assert!(!update_user(&pool, Uuid::new_v4(), Role::Admin, false, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_removes_it_and_reports_whether_it_existed() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_user(&pool, id, "dave", "h", Role::Viewer, Utc::now()).await.unwrap();
+        assert!(delete_user(&pool, id).await.unwrap());
+        assert!(!delete_user(&pool, id).await.unwrap());
+        assert!(find_user_by_username(&pool, "dave").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn last_login_is_recorded() {
+        let pool = memory_pool().await;
+        let id = Uuid::new_v4();
+        create_user(&pool, id, "erin", "h", Role::Viewer, Utc::now()).await.unwrap();
+        assert!(find_user_by_id(&pool, id).await.unwrap().unwrap().last_login_at.is_none());
+        let now = Utc::now();
+        touch_user_last_login(&pool, id, now).await.unwrap();
+        let got = find_user_by_id(&pool, id).await.unwrap().unwrap().last_login_at.unwrap();
+        assert_eq!(got.timestamp(), now.timestamp());
     }
 
     #[tokio::test]
     async fn touching_an_api_token_updates_its_last_used_at() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+        create_api_token(&pool, id, "ci pipeline", Role::Admin, "hash-of-token", Utc::now())
             .await
             .unwrap();
 
@@ -2117,7 +2462,7 @@ mod tests {
     async fn deleting_an_api_token_removes_it_and_reports_whether_it_existed() {
         let pool = memory_pool().await;
         let id = Uuid::new_v4();
-        create_api_token(&pool, id, "ci pipeline", "hash-of-token", Utc::now())
+        create_api_token(&pool, id, "ci pipeline", Role::Admin, "hash-of-token", Utc::now())
             .await
             .unwrap();
 

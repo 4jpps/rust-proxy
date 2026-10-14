@@ -79,6 +79,81 @@ pub fn deny_fallback_decision(
     DenyDecision::Forbidden
 }
 
+/// Decodes `%XX` escapes (leaving malformed ones as-is) into a lossy
+/// UTF-8 string.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+const EXPLOIT_URL_PATTERNS: &[&str] = &[
+    "../",
+    "..\\",
+    "\0",
+    "<script",
+    "</script",
+    "base64_encode(",
+    "base64_decode(",
+    "$globals",
+    "_request[",
+    "_server[",
+    "proc/self/environ",
+    "/etc/passwd",
+    "/etc/shadow",
+    "mosconfig",
+    "union select",
+    "union all select",
+    "information_schema",
+    "<?php",
+    "eval(",
+    "${jndi:",
+];
+
+const EXPLOIT_USER_AGENTS: &[&str] = &[
+    "sqlmap", "nikto", "havij", "acunetix", "nessus", "wpscan", "masscan", "nmap scripting",
+];
+
+/// The opt-in `block_exploits` check: returns the reason a request looks
+/// like a common automated exploit probe, or `None` if it looks ordinary.
+/// The URL is percent-decoded twice (to catch double encoding) and
+/// matched case-insensitively. Deliberately a short, conservative list --
+/// this trims scanner noise, it is not a web application firewall.
+pub fn exploit_check(
+    method: &hyper::Method,
+    path_and_query: &str,
+    user_agent: Option<&str>,
+) -> Option<&'static str> {
+    if method.as_str().eq_ignore_ascii_case("TRACE") || method.as_str().eq_ignore_ascii_case("TRACK") {
+        return Some("TRACE/TRACK method");
+    }
+    let decoded = percent_decode(&percent_decode(path_and_query)).to_ascii_lowercase();
+    let decoded = decoded.replace('+', " ");
+    if EXPLOIT_URL_PATTERNS.iter().any(|p| decoded.contains(p)) {
+        return Some("exploit pattern in URL");
+    }
+    if let Some(ua) = user_agent {
+        let ua = ua.to_ascii_lowercase();
+        if EXPLOIT_USER_AGENTS.iter().any(|p| ua.contains(p)) {
+            return Some("scanner user agent");
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +268,28 @@ mod tests {
         assert!(!ip_allowed(&allow, ip("::1")));
         let allow = vec![net("2001:db8::/32")];
         assert!(!ip_allowed(&allow, ip("10.0.0.5")));
+    }
+
+    #[test]
+    fn exploit_check_flags_common_probes() {
+        use hyper::Method;
+        assert!(exploit_check(&Method::GET, "/a/../../etc/passwd", None).is_some());
+        assert!(exploit_check(&Method::GET, "/a/%2e%2e/%2e%2e/x", None).is_some());
+        assert!(exploit_check(&Method::GET, "/a/%252e%252e%252fx", None).is_some());
+        assert!(exploit_check(&Method::GET, "/?q=%3Cscript%3Ealert(1)", None).is_some());
+        assert!(exploit_check(&Method::GET, "/?id=1+UNION+SELECT+1", None).is_some());
+        assert!(exploit_check(&Method::GET, "/?x=${jndi:ldap://x}", None).is_some());
+        assert!(exploit_check(&Method::TRACE, "/", None).is_some());
+        assert!(exploit_check(&Method::GET, "/", Some("sqlmap/1.7")).is_some());
+    }
+
+    #[test]
+    fn exploit_check_passes_ordinary_requests() {
+        use hyper::Method;
+        assert!(exploit_check(&Method::GET, "/", Some("Mozilla/5.0")).is_none());
+        assert!(exploit_check(&Method::POST, "/api/v1/items?page=2&sort=name", None).is_none());
+        assert!(exploit_check(&Method::GET, "/files/my%20report.pdf", None).is_none());
+        assert!(exploit_check(&Method::GET, "/100%25/done", None).is_none());
+        assert!(exploit_check(&Method::GET, "/trailing%", None).is_none());
     }
 }

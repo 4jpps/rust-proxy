@@ -806,6 +806,9 @@ mod tests {
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         }

@@ -6,7 +6,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Extension, Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -18,7 +18,7 @@ use tower_cookies::cookie::SameSite;
 use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
 use uuid::Uuid;
 
-use super::auth;
+use super::auth::{self, Role};
 use crate::config::{PortRule, Protocol, ProxyHost};
 use crate::state::AppState;
 
@@ -42,6 +42,13 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/certs", get(list_certs).post(upload_cert))
         .route("/api/certs/:domain", axum::routing::delete(delete_cert))
+        .route("/api/me", get(get_me))
+        .route("/api/me/password", post(change_my_password))
+        .route("/api/users", get(list_users).post(create_user))
+        .route(
+            "/api/users/:id",
+            axum::routing::put(update_user).delete(delete_user),
+        )
         .route("/api/tokens", get(list_api_tokens).post(create_api_token))
         .route("/api/tokens/:id", axum::routing::delete(delete_api_token))
         .route(
@@ -140,14 +147,18 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(access_log))
 }
 
-/// How a request that reached a protected route actually authenticated
-/// -- `require_admin` stashes this into the response's extensions on
-/// success (extensions on a `Response` propagate back out through every
-/// enclosing layer, unlike a `Request`'s, which only ever flow inward)
-/// so `access_log`, running outside it, can log who without an extra
-/// DB/session lookup of its own.
+/// Who a request that reached a protected route is, and how they proved
+/// it. `require_admin` puts it on the request (so handlers like `/api/me`
+/// can read it) and on the response (extensions on a `Response`
+/// propagate back out through every enclosing layer, unlike a
+/// `Request`'s, which only flow inward) so `access_log`, running
+/// outside it, can log who without an extra lookup of its own.
 #[derive(Clone)]
-struct AuthenticatedVia(&'static str);
+struct Principal {
+    username: String,
+    role: Role,
+    via: &'static str,
+}
 
 /// Every admin API request, logged to `access.log` (see `logging.rs`)
 /// under the dedicated `rust_proxy::access` target -- method, path,
@@ -160,11 +171,10 @@ async fn access_log(req: Request, next: Next) -> Response {
     let client_ip = admin_client_ip(&req);
     let start = std::time::Instant::now();
     let resp = next.run(req).await;
-    let auth = resp
-        .extensions()
-        .get::<AuthenticatedVia>()
-        .map(|a| a.0)
-        .unwrap_or("unauthenticated");
+    let principal = resp.extensions().get::<Principal>().cloned();
+    let auth = principal.as_ref().map_or("unauthenticated", |p| p.via);
+    let user = principal.as_ref().map_or("", |p| p.username.as_str());
+    let role = principal.as_ref().map_or("", |p| p.role.as_str());
     let status = resp.status().as_u16();
     tracing::info!(
         target: "rust_proxy::access",
@@ -173,9 +183,11 @@ async fn access_log(req: Request, next: Next) -> Response {
         status,
         elapsed_ms = start.elapsed().as_millis() as u64,
         auth,
+        user,
+        role,
         "admin api request"
     );
-    siem_admin_event(&method, &path, status, auth, client_ip.as_deref());
+    siem_admin_event(&method, &path, status, auth, user, role, client_ip.as_deref());
     resp
 }
 
@@ -213,6 +225,8 @@ fn siem_admin_event(
     path: &str,
     status: u16,
     auth: &str,
+    user: &str,
+    role: &str,
     client_ip: Option<&str>,
 ) {
     use crate::siem::{emit, wants, Category, Severity};
@@ -226,10 +240,22 @@ fn siem_admin_event(
         ("status", status_s.as_str()),
         ("auth", auth),
     ];
+    if !user.is_empty() {
+        fields.push(("user", user));
+        fields.push(("role", role));
+    }
     if let Some(ip) = client_ip {
         fields.push(("client_ip", ip));
     }
-    if status == 401 {
+    if status == 403 {
+        emit(
+            Category::Admin,
+            Severity::Warning,
+            "admin_access_denied",
+            "admin API request denied by role",
+            &fields,
+        );
+    } else if status == 401 {
         emit(
             Category::Admin,
             Severity::Warning,
@@ -269,82 +295,130 @@ async fn admin_ui() -> Response {
         .into_response()
 }
 
-/// Every protected route accepts either credential, checked in this
-/// order: first the session cookie (the common case for the web UI, and
-/// cheaper -- no DB round trip), then an `Authorization: Bearer <token>`
-/// header (see `api::auth::generate_api_token`/`README.md`'s API Tokens
-/// section for how to mint one). A valid token can reach every endpoint
-/// this middleware guards, including token management itself -- there's
-/// no scope system, a token is exactly as privileged as the admin
-/// session it was created from, matching this daemon's single-admin-
-/// account model. Treat a token like a password: anyone holding one can
-/// reconfigure the proxy and the firewall behind it.
+/// Every protected route accepts any of these credentials, checked in
+/// this order: a trusted client certificate, the session cookie (the
+/// common case for the web UI, and cheaper -- no token lookup), then an
+/// `Authorization: Bearer <token>` header (see
+/// `api::auth::generate_api_token`/`README.md`'s API Tokens section).
+///
+/// Each credential resolves to a `Principal` with a `Role`, and
+/// `Role::allows` decides whether that role may make this request (403
+/// if not). The owner account from `config.toml`/the setup wizard and
+/// client-certificate admins are always `Admin`. Extra accounts get
+/// their role looked up live on every request, so changing a role,
+/// disabling an account or deleting it takes effect immediately even
+/// for a still-valid cookie. A token carries the role it was created
+/// with; tokens created before roles existed are `Admin`. Treat an
+/// admin token like a password: anyone holding one can reconfigure the
+/// proxy and the firewall behind it.
 async fn require_admin(
     State(state): State<AppState>,
     cookies: Cookies,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let Some(identity) = state.admin_identity() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    // Client-cert bypass, same trust model as jpps/store's
-    // require_admin_session: only trusted when a shared-secret token
-    // (proving the subject header came from this daemon's own
-    // TLS-verified mTLS handshake, not a forged loopback request) is
-    // both configured and matches, AND the presented subject is one of
-    // `admin.client_cert_subjects`. This daemon has no per-account
-    // mapping (single admin identity), so it's a plain subject
-    // allow-list rather than a subject->account lookup.
-    if let Some(expected_token) = state.client_cert_forward_token() {
-        let token_ok = req
-            .headers()
-            .get("x-rustproxy-client-cert-token")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|presented| bool::from(presented.as_bytes().ct_eq(expected_token.as_bytes())));
-        if token_ok {
-            let subject_ok = req
+    let principal = 'auth: {
+        // Client-cert bypass, same trust model as jpps/store's
+        // require_admin_session: only trusted when a shared-secret token
+        // (proving the subject header came from this daemon's own
+        // TLS-verified mTLS handshake, not a forged loopback request) is
+        // both configured and matches, AND the presented subject is one
+        // of `admin.client_cert_subjects`.
+        if let Some(expected_token) = state.client_cert_forward_token() {
+            let token_ok = req
                 .headers()
-                .get("x-client-cert-subject")
+                .get("x-rustproxy-client-cert-token")
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|subject| state.admin().client_cert_subjects.iter().any(|s| s == subject));
-            if subject_ok {
-                let mut resp = next.run(req).await;
-                resp.extensions_mut().insert(AuthenticatedVia("client_cert"));
-                return resp;
+                .is_some_and(|presented| {
+                    bool::from(presented.as_bytes().ct_eq(expected_token.as_bytes()))
+                });
+            if token_ok {
+                let subject = req
+                    .headers()
+                    .get("x-client-cert-subject")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|subject| {
+                        state.admin().client_cert_subjects.iter().any(|s| s == subject)
+                    });
+                if let Some(subject) = subject {
+                    break 'auth Some(Principal {
+                        username: format!("cert:{subject}"),
+                        role: Role::Admin,
+                        via: "client_cert",
+                    });
+                }
             }
         }
-    }
 
-    let session_ok = cookies
-        .get(auth::SESSION_COOKIE)
-        .map(|c| c.value().to_string())
-        .and_then(|t| auth::verify_session(&identity.session_secret, &t))
-        .is_some();
-    if session_ok {
-        let mut resp = next.run(req).await;
-        resp.extensions_mut().insert(AuthenticatedVia("session"));
+        let session_user = cookies
+            .get(auth::SESSION_COOKIE)
+            .map(|c| c.value().to_string())
+            .and_then(|t| auth::verify_session(&identity.session_secret, &t));
+        if let Some(username) = session_user {
+            if username == identity.username {
+                break 'auth Some(Principal {
+                    username,
+                    role: Role::Admin,
+                    via: "session",
+                });
+            }
+            match crate::db::find_user_by_username(state.db(), &username).await {
+                Ok(Some(user)) if !user.disabled => {
+                    break 'auth Some(Principal {
+                        username: user.username,
+                        role: user.role,
+                        via: "session",
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(token) = bearer_token(&req) {
+            let hash = auth::hash_api_token(&token);
+            if let Ok(Some(found)) = crate::db::find_api_token_by_hash(state.db(), &hash).await {
+                // Best-effort -- a failure to record last-used time must
+                // never block the request it's just bookkeeping for.
+                if let Err(err) =
+                    crate::db::touch_api_token_last_used(state.db(), found.id, chrono::Utc::now())
+                        .await
+                {
+                    tracing::warn!(error = %err, "failed to update api token last_used_at");
+                }
+                break 'auth Some(Principal {
+                    username: format!("token:{}", found.name),
+                    role: found.role,
+                    via: "token",
+                });
+            }
+        }
+        None
+    };
+
+    let Some(principal) = principal else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    if !principal.role.allows(req.method(), req.uri().path()) {
+        let mut resp = (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("the {} role is not allowed to do this", principal.role.as_str())
+            })),
+        )
+            .into_response();
+        resp.extensions_mut().insert(principal);
         return resp;
     }
 
-    if let Some(token) = bearer_token(&req) {
-        let hash = auth::hash_api_token(&token);
-        if let Ok(Some(id)) = crate::db::find_api_token_id_by_hash(state.db(), &hash).await {
-            // Best-effort -- a failure to record last-used time must
-            // never block the request it's just bookkeeping for.
-            if let Err(err) =
-                crate::db::touch_api_token_last_used(state.db(), id, chrono::Utc::now()).await
-            {
-                tracing::warn!(error = %err, "failed to update api token last_used_at");
-            }
-            let mut resp = next.run(req).await;
-            resp.extensions_mut().insert(AuthenticatedVia("token"));
-            return resp;
-        }
-    }
-
-    StatusCode::UNAUTHORIZED.into_response()
+    req.extensions_mut().insert(principal.clone());
+    let mut resp = next.run(req).await;
+    resp.extensions_mut().insert(principal);
+    resp
 }
 
 fn bearer_token(req: &Request) -> Option<String> {
@@ -396,18 +470,63 @@ async fn login(
     let Some(identity) = state.admin_identity() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if body.username != identity.username
-        || !auth::verify_password(&body.password, &identity.password_hash)
-    {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let token = auth::sign_session(&identity.session_secret, &body.username);
+
+    let principal = if body.username == identity.username {
+        if !auth::verify_password(&body.password, &identity.password_hash) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Principal {
+            username: identity.username.clone(),
+            role: Role::Admin,
+            via: "session",
+        }
+    } else {
+        // Unknown and disabled accounts still pay for one argon2
+        // verification so response time doesn't reveal which usernames
+        // exist.
+        let user = match crate::db::find_user_by_username(state.db(), &body.username).await {
+            Ok(user) => user,
+            Err(err) => {
+                tracing::error!(error = %err, "user lookup failed during login");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        match user {
+            Some(user) if !user.disabled => {
+                if !auth::verify_password(&body.password, &user.password_hash) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                if let Err(err) =
+                    crate::db::touch_user_last_login(state.db(), user.id, chrono::Utc::now()).await
+                {
+                    tracing::warn!(error = %err, "failed to record user last login");
+                }
+                Principal {
+                    username: user.username,
+                    role: user.role,
+                    via: "session",
+                }
+            }
+            Some(user) => {
+                let _ = auth::verify_password(&body.password, &user.password_hash);
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            None => {
+                auth::verify_against_dummy_hash(&body.password);
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        }
+    };
+
+    let token = auth::sign_session(&identity.session_secret, &principal.username);
     let mut cookie = Cookie::new(auth::SESSION_COOKIE, token);
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax);
     cookie.set_path("/");
     cookies.add(cookie);
-    StatusCode::OK.into_response()
+    let mut resp = StatusCode::OK.into_response();
+    resp.extensions_mut().insert(principal);
+    resp
 }
 
 #[derive(Serialize)]
@@ -795,6 +914,15 @@ struct HostRequest {
     /// See `config::ProxyHost::deny_fallback`'s doc comment.
     #[serde(default)]
     deny_fallback: Option<crate::config::DenyFallback>,
+    /// See `config::ProxyHost::locations`'s doc comment.
+    #[serde(default)]
+    locations: Vec<crate::config::HostLocation>,
+    /// See `config::ProxyHost::block_exploits`'s doc comment.
+    #[serde(default)]
+    block_exploits: bool,
+    /// See `config::ProxyHost::fixed_response`'s doc comment.
+    #[serde(default)]
+    fixed_response: Option<crate::config::FixedResponse>,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -808,7 +936,11 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     if req.bind_port == 0 {
         return Err(ApiError::BadRequest("bind_port must not be 0".into()));
     }
+    if let Some(fixed) = &req.fixed_response {
+        fixed.validate().map_err(ApiError::BadRequest)?;
+    }
     match (&req.redirect, &req.static_root) {
+        _ if req.fixed_response.is_some() => {}
         (Some(redirect), _) => crate::config::validate_redirect_target(&redirect.target)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?,
         (None, Some(static_root)) => {
@@ -838,6 +970,19 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     }
     if let Some(fallback) = &req.deny_fallback {
         fallback.validate().map_err(ApiError::BadRequest)?;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for loc in &req.locations {
+        loc.validate().map_err(ApiError::BadRequest)?;
+        if !seen.insert(loc.path.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate location path {:?}",
+                loc.path
+            )));
+        }
+    }
+    if req.locations.len() > 64 {
+        return Err(ApiError::BadRequest("at most 64 locations per host".into()));
     }
     Ok(())
 }
@@ -1362,6 +1507,9 @@ async fn create_host(
         rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
         pass_client_cert_header: body.pass_client_cert_header,
         deny_fallback: body.deny_fallback,
+        locations: body.locations,
+        block_exploits: body.block_exploits,
+        fixed_response: body.fixed_response,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -1403,6 +1551,9 @@ async fn update_host(
         rewrite_samesite_none_cookies: body.rewrite_samesite_none_cookies,
         pass_client_cert_header: body.pass_client_cert_header,
         deny_fallback: body.deny_fallback,
+        locations: body.locations,
+        block_exploits: body.block_exploits,
+        fixed_response: body.fixed_response,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;
@@ -1680,6 +1831,7 @@ async fn delete_cert(
 struct ApiTokenSummary {
     id: Uuid,
     name: String,
+    role: Role,
     created_at: chrono::DateTime<chrono::Utc>,
     /// `None` until the token is used for the first time -- lets an
     /// admin spot stale/unused tokens worth revoking.
@@ -1689,12 +1841,21 @@ struct ApiTokenSummary {
 #[derive(Deserialize)]
 struct CreateApiTokenRequest {
     name: String,
+    /// Defaults to `admin`, which is what every token was before roles
+    /// existed.
+    #[serde(default = "default_token_role")]
+    role: Role,
+}
+
+fn default_token_role() -> Role {
+    Role::Admin
 }
 
 #[derive(Serialize)]
 struct ApiTokenCreated {
     id: Uuid,
     name: String,
+    role: Role,
     /// The only time the plaintext is ever transmitted -- callers must
     /// save it now, it can't be retrieved again (only the hash is
     /// persisted; see `db::create_api_token`).
@@ -1712,6 +1873,7 @@ async fn list_api_tokens(
             .map(|t| ApiTokenSummary {
                 id: t.id,
                 name: t.name,
+                role: t.role,
                 created_at: t.created_at,
                 last_used_at: t.last_used_at,
             })
@@ -1730,10 +1892,11 @@ async fn create_api_token(
     let (token, hash) = auth::generate_api_token();
     let id = Uuid::new_v4();
     let created_at = chrono::Utc::now();
-    crate::db::create_api_token(state.db(), id, name, &hash, created_at).await?;
+    crate::db::create_api_token(state.db(), id, name, body.role, &hash, created_at).await?;
     Ok(Json(ApiTokenCreated {
         id,
         name: name.to_string(),
+        role: body.role,
         token,
         created_at,
     }))
@@ -1745,6 +1908,224 @@ async fn delete_api_token(
 ) -> Result<StatusCode, ApiError> {
     let found = crate::db::delete_api_token(state.db(), id).await?;
     if !found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct MeResponse {
+    username: String,
+    role: Role,
+    via: &'static str,
+    /// True for the owner account from `config.toml` / the setup wizard.
+    primary: bool,
+}
+
+async fn get_me(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Json<MeResponse> {
+    let primary = principal.via == "session"
+        && state
+            .admin_identity()
+            .is_some_and(|i| i.username == principal.username);
+    Json(MeResponse {
+        username: principal.username,
+        role: principal.role,
+        via: principal.via,
+        primary,
+    })
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+const MIN_PASSWORD_LEN: usize = 8;
+
+/// Only accounts stored in the database can change their password here.
+/// The owner's lives in `config.toml` or the setup wizard, and tokens and
+/// client certificates have no password.
+async fn change_my_password(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<ChangePasswordRequest>,
+) -> Result<StatusCode, ApiError> {
+    let not_a_user = || {
+        ApiError::BadRequest(
+            "only accounts created under Users can change their password here".into(),
+        )
+    };
+    if principal.via != "session" {
+        return Err(not_a_user());
+    }
+    let user = crate::db::find_user_by_username(state.db(), &principal.username)
+        .await?
+        .ok_or_else(not_a_user)?;
+    if !auth::verify_password(&body.current_password, &user.password_hash) {
+        return Err(ApiError::BadRequest("current password is incorrect".into()));
+    }
+    if body.new_password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "new password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
+    }
+    let hash = auth::hash_password(&body.new_password)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    crate::db::set_user_password(state.db(), user.id, &hash).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct UserSummary {
+    /// `None` for the owner account, which lives in `config.toml` or the
+    /// setup wizard rather than in this list.
+    id: Option<Uuid>,
+    username: String,
+    role: Role,
+    disabled: bool,
+    primary: bool,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_login_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn user_summary(u: crate::db::UserRow) -> UserSummary {
+    UserSummary {
+        id: Some(u.id),
+        username: u.username,
+        role: u.role,
+        disabled: u.disabled,
+        primary: false,
+        created_at: Some(u.created_at),
+        last_login_at: u.last_login_at,
+    }
+}
+
+async fn list_users(State(state): State<AppState>) -> Result<Json<Vec<UserSummary>>, ApiError> {
+    let mut out = Vec::new();
+    if let Some(identity) = state.admin_identity() {
+        out.push(UserSummary {
+            id: None,
+            username: identity.username.clone(),
+            role: Role::Admin,
+            disabled: false,
+            primary: true,
+            created_at: None,
+            last_login_at: None,
+        });
+    }
+    out.extend(crate::db::list_users(state.db()).await?.into_iter().map(user_summary));
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    role: Role,
+}
+
+fn validate_username(name: &str) -> Result<(), ApiError> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "username must be 1-64 characters: letters, digits, '.', '_', '@' or '-'".into(),
+        ))
+    }
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    Json(body): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<UserSummary>), ApiError> {
+    let username = body.username.trim();
+    validate_username(username)?;
+    if body.password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
+    }
+    if state
+        .admin_identity()
+        .is_some_and(|i| i.username.eq_ignore_ascii_case(username))
+    {
+        return Err(ApiError::Conflict(
+            "that username belongs to the primary admin account".into(),
+        ));
+    }
+    let hash = auth::hash_password(&body.password)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let id = Uuid::new_v4();
+    let created_at = chrono::Utc::now();
+    if !crate::db::create_user(state.db(), id, username, &hash, body.role, created_at).await? {
+        return Err(ApiError::Conflict("a user with that name already exists".into()));
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(UserSummary {
+            id: Some(id),
+            username: username.to_string(),
+            role: body.role,
+            disabled: false,
+            primary: false,
+            created_at: Some(created_at),
+            last_login_at: None,
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct UpdateUserRequest {
+    role: Option<Role>,
+    disabled: Option<bool>,
+    /// Sets a new password when present (an admin reset).
+    password: Option<String>,
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateUserRequest>,
+) -> Result<Json<UserSummary>, ApiError> {
+    let existing = crate::db::find_user_by_id(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let new_hash = match body.password.as_deref() {
+        Some(p) if p.chars().count() < MIN_PASSWORD_LEN => {
+            return Err(ApiError::BadRequest(format!(
+                "password must be at least {MIN_PASSWORD_LEN} characters"
+            )));
+        }
+        Some(p) => Some(
+            auth::hash_password(p).map_err(|e| ApiError::Internal(e.to_string()))?,
+        ),
+        None => None,
+    };
+    let role = body.role.unwrap_or(existing.role);
+    let disabled = body.disabled.unwrap_or(existing.disabled);
+    if !crate::db::update_user(state.db(), id, role, disabled, new_hash.as_deref()).await? {
+        return Err(ApiError::NotFound);
+    }
+    let updated = crate::db::find_user_by_id(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(user_summary(updated)))
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    if !crate::db::delete_user(state.db(), id).await? {
         return Err(ApiError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
@@ -4909,5 +5290,279 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ---- multi-user / roles ----
+
+    async fn send(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        bearer: Option<&str>,
+        json: Option<&str>,
+    ) -> Response {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let body = match json {
+            Some(j) => {
+                b = b.header(header::CONTENT_TYPE, "application/json");
+                axum::body::Body::from(j.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        router.clone().oneshot(b.body(body).unwrap()).await.unwrap()
+    }
+
+    async fn login_as(router: &Router, user: &str, pass: &str) -> Option<String> {
+        let resp = send(
+            router,
+            "POST",
+            "/api/login",
+            None,
+            None,
+            Some(&format!(r#"{{"username":"{user}","password":"{pass}"}}"#)),
+        )
+        .await;
+        if resp.status() == StatusCode::OK {
+            Some(session_cookie_header(&resp))
+        } else {
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            None
+        }
+    }
+
+    /// Returns (router, owner cookie, id of the created user).
+    async fn router_with_user(name: &str, role: &str) -> (Router, String, String) {
+        let router = build_router(test_state().await);
+        let owner = logged_in_cookie(&router).await;
+        let resp = send(
+            &router,
+            "POST",
+            "/api/users",
+            Some(&owner),
+            None,
+            Some(&format!(
+                r#"{{"username":"{name}","password":"a-long-password","role":"{role}"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+        (router, owner, id)
+    }
+
+    #[tokio::test]
+    async fn the_owner_is_an_admin_and_listed_first_as_primary() {
+        let router = build_router(test_state().await);
+        let owner = logged_in_cookie(&router).await;
+        let me = body_json(send(&router, "GET", "/api/me", Some(&owner), None, None).await).await;
+        assert_eq!(me["username"], "admin");
+        assert_eq!(me["role"], "admin");
+        assert_eq!(me["primary"], true);
+        let users =
+            body_json(send(&router, "GET", "/api/users", Some(&owner), None, None).await).await;
+        assert_eq!(users[0]["primary"], true);
+        assert_eq!(users[0]["username"], "admin");
+        assert!(users[0]["id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_created_user_can_sign_in_and_gets_the_role_they_were_given() {
+        let (router, _owner, _id) = router_with_user("Olivia", "operator").await;
+        assert!(login_as(&router, "olivia", "wrong-password").await.is_none());
+        let cookie = login_as(&router, "olivia", "a-long-password").await.unwrap();
+        let me = body_json(send(&router, "GET", "/api/me", Some(&cookie), None, None).await).await;
+        assert_eq!(me["username"], "Olivia");
+        assert_eq!(me["role"], "operator");
+    }
+
+    #[tokio::test]
+    async fn unknown_and_disabled_users_cannot_sign_in() {
+        let (router, owner, id) = router_with_user("sam", "viewer").await;
+        assert!(login_as(&router, "nobody", "a-long-password").await.is_none());
+        let resp = send(
+            &router,
+            "PUT",
+            &format!("/api/users/{id}"),
+            Some(&owner),
+            None,
+            Some(r#"{"disabled":true}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(login_as(&router, "sam", "a-long-password").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_viewer_can_read_but_not_change_anything() {
+        let (router, _owner, _id) = router_with_user("vera", "viewer").await;
+        let cookie = login_as(&router, "vera", "a-long-password").await.unwrap();
+        for uri in ["/api/dashboard", "/api/hosts", "/api/certs", "/api/dns-credentials", "/api/siem"] {
+            let resp = send(&router, "GET", uri, Some(&cookie), None, None).await;
+            assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+        }
+        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some("{}")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_json(resp).await["error"],
+            "the viewer role is not allowed to do this"
+        );
+        for uri in ["/api/users", "/api/tokens"] {
+            let resp = send(&router, "GET", uri, Some(&cookie), None, None).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "GET {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_changes_proxy_config_but_not_users_tokens_or_system_settings() {
+        let (router, _owner, _id) = router_with_user("oscar", "operator").await;
+        let cookie = login_as(&router, "oscar", "a-long-password").await.unwrap();
+        // Not a 403 -- the (empty) body is rejected by the handler instead.
+        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some("{}")).await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        for (m, uri) in [
+            ("GET", "/api/users"),
+            ("POST", "/api/users"),
+            ("GET", "/api/tokens"),
+            ("POST", "/api/tokens"),
+            ("POST", "/api/dns-credentials"),
+            ("PUT", "/api/siem"),
+            ("PUT", "/api/firewall-settings"),
+            ("POST", "/api/hosting/pools"),
+        ] {
+            let resp = send(&router, m, uri, Some(&cookie), None, Some("{}")).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{m} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_a_role_deleting_or_disabling_a_user_takes_effect_on_their_existing_cookie() {
+        let (router, owner, id) = router_with_user("rita", "operator").await;
+        let cookie = login_as(&router, "rita", "a-long-password").await.unwrap();
+        let write = |c: String| {
+            let r = router.clone();
+            async move { send(&r, "POST", "/api/hosts", Some(&c), None, Some("{}")).await.status() }
+        };
+        assert_ne!(write(cookie.clone()).await, StatusCode::FORBIDDEN);
+
+        send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None, Some(r#"{"role":"viewer"}"#)).await;
+        assert_eq!(write(cookie.clone()).await, StatusCode::FORBIDDEN);
+
+        send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None, Some(r#"{"disabled":true}"#)).await;
+        assert_eq!(write(cookie.clone()).await, StatusCode::UNAUTHORIZED);
+
+        send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None, Some(r#"{"disabled":false,"role":"admin"}"#)).await;
+        assert_ne!(write(cookie.clone()).await, StatusCode::FORBIDDEN);
+
+        let resp = send(&router, "DELETE", &format!("/api/users/{id}"), Some(&owner), None, None).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(write(cookie).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn user_creation_rejects_the_owners_name_duplicates_and_bad_input() {
+        let (router, owner, _id) = router_with_user("dup", "viewer").await;
+        let create = |body: &'static str| {
+            let r = router.clone();
+            let c = owner.clone();
+            async move { send(&r, "POST", "/api/users", Some(&c), None, Some(body)).await.status() }
+        };
+        assert_eq!(create(r#"{"username":"ADMIN","password":"a-long-password","role":"viewer"}"#).await, StatusCode::CONFLICT);
+        assert_eq!(create(r#"{"username":"DUP","password":"a-long-password","role":"viewer"}"#).await, StatusCode::CONFLICT);
+        assert_eq!(create(r#"{"username":"short","password":"1234567","role":"viewer"}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(create(r#"{"username":"bad name","password":"a-long-password","role":"viewer"}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(create(r#"{"username":"","password":"a-long-password","role":"viewer"}"#).await, StatusCode::BAD_REQUEST);
+        assert!(create(r#"{"username":"x","password":"a-long-password","role":"root"}"#).await.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn the_users_list_never_exposes_password_hashes() {
+        let (router, owner, _id) = router_with_user("hank", "viewer").await;
+        let resp = send(&router, "GET", "/api/users", Some(&owner), None, None).await;
+        let text = serde_json::to_string(&body_json(resp).await).unwrap();
+        assert!(!text.contains("argon2"));
+        assert!(!text.contains("password"));
+    }
+
+    #[tokio::test]
+    async fn a_user_can_change_their_own_password_and_the_old_one_stops_working() {
+        let (router, _owner, _id) = router_with_user("pam", "viewer").await;
+        let cookie = login_as(&router, "pam", "a-long-password").await.unwrap();
+        let bad = send(&router, "POST", "/api/me/password", Some(&cookie), None,
+            Some(r#"{"current_password":"nope","new_password":"another-long-one"}"#)).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let short = send(&router, "POST", "/api/me/password", Some(&cookie), None,
+            Some(r#"{"current_password":"a-long-password","new_password":"short"}"#)).await;
+        assert_eq!(short.status(), StatusCode::BAD_REQUEST);
+        let ok = send(&router, "POST", "/api/me/password", Some(&cookie), None,
+            Some(r#"{"current_password":"a-long-password","new_password":"another-long-one"}"#)).await;
+        assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+        assert!(login_as(&router, "pam", "a-long-password").await.is_none());
+        assert!(login_as(&router, "pam", "another-long-one").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_owner_cannot_use_the_user_password_endpoint() {
+        let router = build_router(test_state().await);
+        let owner = logged_in_cookie(&router).await;
+        let resp = send(&router, "POST", "/api/me/password", Some(&owner), None,
+            Some(r#"{"current_password":"correct-password","new_password":"another-long-one"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_admin_resets_another_users_password() {
+        let (router, owner, id) = router_with_user("ruth", "viewer").await;
+        let resp = send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None,
+            Some(r#"{"password":"brand-new-password"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(login_as(&router, "ruth", "a-long-password").await.is_none());
+        assert!(login_as(&router, "ruth", "brand-new-password").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn tokens_carry_the_role_they_were_created_with() {
+        let router = build_router(test_state().await);
+        let owner = logged_in_cookie(&router).await;
+        let mint = |role: &'static str| {
+            let r = router.clone();
+            let c = owner.clone();
+            async move {
+                let body = format!(r#"{{"name":"t-{role}","role":"{role}"}}"#);
+                let resp = send(&r, "POST", "/api/tokens", Some(&c), None, Some(&body)).await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                body_json(resp).await["token"].as_str().unwrap().to_string()
+            }
+        };
+        let viewer = mint("viewer").await;
+        let operator = mint("operator").await;
+        let me = body_json(send(&router, "GET", "/api/me", None, Some(&viewer), None).await).await;
+        assert_eq!(me["role"], "viewer");
+        assert_eq!(me["username"], "token:t-viewer");
+        assert_eq!(me["via"], "token");
+        assert_eq!(send(&router, "GET", "/api/hosts", None, Some(&viewer), None).await.status(), StatusCode::OK);
+        assert_eq!(send(&router, "POST", "/api/hosts", None, Some(&viewer), Some("{}")).await.status(), StatusCode::FORBIDDEN);
+        assert_ne!(send(&router, "POST", "/api/hosts", None, Some(&operator), Some("{}")).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(send(&router, "GET", "/api/tokens", None, Some(&operator), None).await.status(), StatusCode::FORBIDDEN);
+        let listed = body_json(send(&router, "GET", "/api/tokens", Some(&owner), None, None).await).await;
+        assert!(listed.as_array().unwrap().iter().any(|t| t["role"] == "viewer"));
+    }
+
+    #[tokio::test]
+    async fn a_token_created_without_a_role_is_an_admin_token() {
+        let router = build_router(test_state().await);
+        let owner = logged_in_cookie(&router).await;
+        let resp = send(&router, "POST", "/api/tokens", Some(&owner), None, Some(r#"{"name":"legacy"}"#)).await;
+        let json = body_json(resp).await;
+        assert_eq!(json["role"], "admin");
+        let token = json["token"].as_str().unwrap().to_string();
+        assert_eq!(send(&router, "GET", "/api/users", None, Some(&token), None).await.status(), StatusCode::OK);
     }
 }

@@ -75,6 +75,9 @@ main{width:100%;max-width:1280px;margin:0 auto;padding:var(--s-5) var(--s-4) cal
 .page-head{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s-3);margin-bottom:var(--s-4)}
 .page-head h1{font-size:var(--fs-xl);letter-spacing:-.3px;flex:1 1 auto;min-width:0}
 .page-head .actions{display:flex;flex-wrap:wrap;gap:var(--s-2)}
+.who{font-size:var(--fs-xs);color:var(--text-muted);white-space:nowrap}
+.who b{color:var(--text);font-weight:600}
+.readonly-note{margin:0 0 var(--s-4);padding:var(--s-3) var(--s-4);border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-muted);font-size:var(--fs-sm)}
 .tabs{display:flex;gap:2px;padding:3px;margin-bottom:var(--s-5);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow-x:auto;scrollbar-width:none;width:max-content;max-width:100%}
 .tabs::-webkit-scrollbar{display:none}
 .tabs a{white-space:nowrap;padding:0 var(--s-4);height:32px;display:inline-flex;align-items:center;border-radius:var(--radius-sm);color:var(--text-muted);text-decoration:none;font-size:var(--fs-sm);font-weight:600}
@@ -337,6 +340,8 @@ footer.foot{margin-top:var(--s-7);color:var(--text-faint);font-size:var(--fs-xs)
     <a class="brand" href="#/overview" aria-label="RustProxy, go to overview"><svg aria-hidden="true"><use href="#rp-mark"/></svg><span>Rust<b>Proxy</b></span></a>
     <span class="grow"></span>
     <span class="ver" id="ver" hidden></span>
+    <span class="who" id="who" hidden></span>
+    <button type="button" class="btn ghost sm" id="pw-btn" hidden>Change password</button>
     <button type="button" class="btn ghost sm" id="logout-btn">Sign out</button>
   </header>
   <nav id="nav" aria-label="Main"></nav>
@@ -496,9 +501,9 @@ function fld({ name, label, type = 'text', value = '', placeholder = '', require
     `<input id="${id}" name="${name}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}"${mono ? ' class="mono"' : ''}${required ? ' required aria-required="true"' : ''}${help ? ` aria-describedby="${id}-h"` : ''} ${attrs}>` +
     `${help ? `<span class="help" id="${id}-h">${esc(help)}</span>` : ''}</div>`;
 }
-function ta({ name, label, value = '', required = false, rows = 4, help = '', mono = true }) {
+function ta({ name, label, value = '', required = false, rows = 4, help = '', mono = true, placeholder = '' }) {
   const id = `f-${name}`;
-  return `<div class="field wide"><label for="${id}"${required ? ' class="req"' : ''}>${esc(label)}</label><textarea id="${id}" name="${name}" rows="${rows}"${mono ? ' class="mono"' : ''}${required ? ' required aria-required="true"' : ''} spellcheck="false">${esc(value)}</textarea>${help ? `<span class="help">${esc(help)}</span>` : ''}</div>`;
+  return `<div class="field wide"><label for="${id}"${required ? ' class="req"' : ''}>${esc(label)}</label><textarea id="${id}" name="${name}" rows="${rows}"${placeholder ? ` placeholder="${esc(placeholder)}"` : ''}${mono ? ' class="mono"' : ''}${required ? ' required aria-required="true"' : ''} spellcheck="false">${esc(value)}</textarea>${help ? `<span class="help">${esc(help)}</span>` : ''}</div>`;
 }
 function sel({ name, label, options, value = '', help = '', wide = false, required = false, attrs = '' }) {
   const id = `f-${name}`;
@@ -644,6 +649,7 @@ const LOADERS = {
   dnsCreds: () => jget('/api/dns-credentials'),
   acls: () => jget('/api/acls'),
   tokens: () => jget('/api/tokens'),
+  users: () => jget('/api/users'),
   localIps: () => jget('/api/network/local-ips'),
   acme: () => jget('/api/acme-settings'),
   fw: () => jget('/api/firewall-settings'),
@@ -652,7 +658,12 @@ const LOADERS = {
   allocs: () => jget('/api/hosting/allocations'),
   hstatus: () => jget('/api/hosting/status'),
 };
+const ADMIN_KEYS = new Set(['tokens', 'users']);
+const ME = { username: '', role: 'viewer', via: '', primary: false };
+const ROLE_RANK = { viewer: 0, operator: 1, admin: 2 };
+const hasRole = (min) => (ROLE_RANK[ME.role] ?? 0) >= ROLE_RANK[min];
 const ALL_KEYS = Object.keys(LOADERS);
+const allKeys = () => ALL_KEYS.filter((k) => !ADMIN_KEYS.has(k) || hasRole('admin'));
 async function load(keys) {
   await Promise.all(keys.map(async (k) => {
     try { D[k] = await LOADERS[k](); delete ERR[k]; }
@@ -660,7 +671,7 @@ async function load(keys) {
     finally { TRIED.add(k); }
   }));
 }
-async function refresh(...keys) { await load(keys.length ? keys : ALL_KEYS); renderPage(); }
+async function refresh(...keys) { await load(keys.length ? keys : allKeys()); renderPage(); }
 const aclById = () => Object.fromEntries((D.acls || []).map((a) => [a.id, a]));
 const credById = () => Object.fromEntries((D.dnsCreds || []).map((c) => [c.id, c]));
 function certFor(domain) {
@@ -711,31 +722,37 @@ const SECTIONS = {
     label: 'Sites', icon: 'sites', pages: [
       { id: 'hosts', label: 'Hosts', keys: ['hosts', 'certs', 'acls'], actions: [{ label: 'Add site', act: 'host-add' }], render: pHosts, after: afterHosts },
       { id: 'certs', label: 'Certificates', keys: ['certs', 'standalone', 'dnsCreds'], actions: [{ label: 'Upload certificate', act: 'cert-upload' }, { label: 'Issue DNS-01 certificate', act: 'cert-issue', plain: true }], render: pCerts },
-      { id: 'dns', label: 'DNS credentials', keys: ['dnsCreds'], actions: [{ label: 'Add credential', act: 'dns-add' }], render: pDns },
+      { id: 'dns', label: 'DNS credentials', write: 'admin', keys: ['dnsCreds'], actions: [{ label: 'Add credential', act: 'dns-add' }], render: pDns },
     ],
   },
   hosting: {
     label: 'Hosting', icon: 'hosting', pages: [
       { id: 'allocations', label: 'Allocations', keys: ['allocs', 'pools', 'hstatus'], actions: [{ label: 'Allocate next free IP', act: 'alloc-add' }], render: pAllocations, after: afterAllocations },
-      { id: 'pools', label: 'Pools', keys: ['pools'], actions: [{ label: 'New pool', act: 'pool-add' }], render: pPools },
+      { id: 'pools', label: 'Pools', write: 'admin', keys: ['pools'], actions: [{ label: 'New pool', act: 'pool-add' }], render: pPools },
     ],
   },
   network: {
     label: 'Network', icon: 'network', pages: [
       { id: 'rules', label: 'Port rules', keys: ['rules', 'acls'], actions: [{ label: 'New rule', act: 'rule-add' }], render: pRules },
       { id: 'acls', label: 'Access lists', keys: ['acls'], actions: [{ label: 'New access list', act: 'acl-add' }], render: pAcls },
-      { id: 'firewall', label: 'Firewall settings', keys: ['fw'], render: pFirewall, after: afterFirewall },
+      { id: 'firewall', label: 'Firewall settings', write: 'admin', keys: ['fw'], render: pFirewall, after: afterFirewall },
     ],
   },
   system: {
     label: 'System', icon: 'system', pages: [
-      { id: 'tokens', label: 'API tokens', keys: ['tokens'], actions: [{ label: 'New token', act: 'token-add' }], render: pTokens },
-      { id: 'acme', label: 'ACME', keys: ['acme'], render: pAcme, after: afterAcme },
-      { id: 'siem', label: 'SIEM', keys: ['siem'], render: pSiem, after: afterSiem },
+      { id: 'users', label: 'Users', only: 'admin', keys: ['users'], actions: [{ label: 'Add user', act: 'user-add' }], render: pUsers },
+      { id: 'tokens', label: 'API tokens', only: 'admin', keys: ['tokens'], actions: [{ label: 'New token', act: 'token-add' }], render: pTokens },
+      { id: 'acme', label: 'ACME', write: 'admin', keys: ['acme'], render: pAcme, after: afterAcme },
+      { id: 'siem', label: 'SIEM', write: 'admin', keys: ['siem'], render: pSiem, after: afterSiem },
       { id: 'about', label: 'About', keys: ['dash'], render: pAbout },
     ],
   },
 };
+const ALL_PAGES = Object.fromEntries(Object.entries(SECTIONS).map(([k, s]) => [k, s.pages]));
+// Hides pages the signed-in role can never use (users, tokens); the server enforces the same rules.
+function applyRole() {
+  for (const [k, s] of Object.entries(SECTIONS)) if (ALL_PAGES[k]) s.pages = ALL_PAGES[k].filter((x) => !x.only || hasRole(x.only));
+}
 let route = { s: 'overview', p: null };
 function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, '').split('/');
@@ -753,7 +770,7 @@ function renderChrome() {
   const sec = SECTIONS[route.s];
   $$('#nav a').forEach((a) => { if (a.dataset.s === route.s) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   const page = sec.pages ? sec.pages.find((x) => x.id === route.p) : null;
-  const actions = (page && page.actions) || [];
+  const actions = page && hasRole(page.write || 'operator') ? page.actions || [] : [];
   const head = `<div class="page-head"><h1 id="page-title" tabindex="-1">${esc(sec.label)}</h1><div class="actions">${actions.map((a, i) => `<button type="button" class="btn ${i === 0 && !a.plain ? 'primary' : ''}" data-act="${a.act}">${i === 0 && !a.plain ? icon('plus') : ''}${esc(a.label)}</button>`).join('')}</div></div>`;
   const tabs = sec.pages ? `<div class="tabs" role="tablist" aria-label="${esc(sec.label)} sections">${sec.pages.map((x) => `<a role="tab" id="tab-${x.id}" href="#/${route.s}/${x.id}" aria-selected="${x.id === route.p}" aria-controls="page" tabindex="${x.id === route.p ? 0 : -1}">${esc(x.label)}</a>`).join('')}</div>` : '';
   $('#main').innerHTML = `${head}${tabs}<div id="page" role="${sec.pages ? 'tabpanel' : 'region'}" ${sec.pages ? `aria-labelledby="tab-${route.p}"` : 'aria-labelledby="page-title"'}></div>`;
@@ -766,7 +783,16 @@ function renderPage() {
   const root = $('#page');
   if (!root || !def) return;
   root.innerHTML = gate(def.keys, () => def.render());
+  if (!hasRole(def.write || 'operator')) makeReadOnly(root, def);
   if (def.after && !def.keys.some((k) => !TRIED.has(k) || (ERR[k] && D[k] == null))) def.after(root);
+}
+// Strips edit controls from a page the signed-in role may only read; the API refuses the writes regardless.
+function makeReadOnly(root, def) {
+  if (!def.keys.every((k) => TRIED.has(k) && !(ERR[k] && D[k] == null))) return;
+  $$('.acts, .empty [data-act]:not([data-act=retry])', root).forEach((el) => el.remove());
+  $$('form', root).forEach((f) => $$('input, select, textarea, button', f).forEach((el) => { el.disabled = true; }));
+  const why = def.write === 'admin' ? 'Only an admin can change this.' : 'Your role is read-only.';
+  root.insertAdjacentHTML('afterbegin', `<p class="readonly-note" role="note">${esc(why)} You are signed in as <b>${esc(ME.username)}</b> (${esc(ME.role)}).</p>`);
 }
 window.addEventListener('hashchange', () => {
   if (!AUTHED) return;
@@ -881,7 +907,7 @@ function hostFormHTML(h) {
   const creds = [['', 'auto (only if exactly one exists)'], ...(D.dnsCreds || []).map((c) => [c.id, `${c.name} (${c.provider})`])];
   const acls = D.acls || [];
   const sel_ = new Set(h.acl_ids || []);
-  const advOpen = h.redirect || h.static_root || h.path_rewrite || h.rewrite_samesite_none_cookies || h.pass_client_cert_header || h.deny_fallback;
+  const advOpen = h.redirect || h.static_root || h.path_rewrite || h.rewrite_samesite_none_cookies || h.pass_client_cert_header || h.deny_fallback || (h.locations && h.locations.length) || h.block_exploits || h.fixed_response;
   return `
   <fieldset><legend>Basics</legend>
     <div class="fgrid">
@@ -930,7 +956,7 @@ function hostFormHTML(h) {
     </fieldset>
     <fieldset><legend>Path rewrite</legend>
       <div class="fgrid">
-        ${fld({ name: 'path_rewrite_pattern', label: 'Pattern (regular expression)', value: h.path_rewrite ? h.path_rewrite.pattern : '', placeholder: '^/((?:jpps|kb9gxk)/[^/]+)/?$', wide: true, mono: true, help: 'Matched against the incoming path. Anchor it to the exact values you mean to rewrite.' })}
+        ${fld({ name: 'path_rewrite_pattern', label: 'Pattern (regular expression)', value: h.path_rewrite ? h.path_rewrite.pattern : '', placeholder: '^/((?:team|project)/[^/]+)/?$', wide: true, mono: true, help: 'Matched against the incoming path. Anchor it to the exact values you mean to rewrite.' })}
         ${fld({ name: 'path_rewrite_replacement', label: 'Replacement', value: h.path_rewrite ? h.path_rewrite.replacement : '', placeholder: '/$1/-/wikis/Home', wide: true, mono: true, help: 'Use $1, $2 for capture groups. Both fields must be filled for the rewrite to apply.' })}
       </div>
     </fieldset>
@@ -941,6 +967,18 @@ function hostFormHTML(h) {
         ${ta({ name: 'df_allow_paths', label: 'Also allow these paths (one per line)', value: h.deny_fallback ? (h.deny_fallback.allow_paths || []).join('\n') : '', rows: 3, help: 'So the redirect page can load its own CSS, scripts and images, e.g. /css/ /js/ /images/. A path ending in / allows everything beneath it.' })}
       </div>
       <div class="checks">${chk({ name: 'df_lock', label: 'Lock to the redirect page and allowed paths', checked: h.deny_fallback ? h.deny_fallback.lock : false, help: 'On: every other path sends the visitor back to the redirect page. Off: only the site root redirects; other paths get the block page.' })}</div>
+    </fieldset>
+    <fieldset><legend>Custom locations</legend>
+      ${ta({ name: 'locations', label: 'Send some paths to a different upstream (one per line)', value: (h.locations || []).map((l) => `${l.path} ${l.upstream}${l.upstream_https ? (l.upstream_tls_verify ? ' https' : ' https-insecure') : ''}`).join('\n'), rows: 3, mono: true, placeholder: '/api 10.0.0.5:9000\n/admin 10.0.0.6:8443 https-insecure', help: 'Format: /path host:port, optionally followed by https or https-insecure (accept a self-signed certificate). The longest matching path wins; everything else goes to the main upstream. The path is forwarded unchanged.' })}
+    </fieldset>
+    <fieldset><legend>Fixed response (overrides everything else)</legend>
+      <div class="fgrid">
+        ${fld({ name: 'fr_status', label: 'Status code', type: 'number', value: h.fixed_response ? h.fixed_response.status : '', placeholder: '404', attrs: 'min="200" max="599"', help: 'Leave blank to proxy normally. Visitors who pass the access rules get this status and message instead of the site, like a "404 Host".' })}
+        ${ta({ name: 'fr_body', label: 'Message (plain text)', value: h.fixed_response ? h.fixed_response.body : '', rows: 2, wide: true })}
+      </div>
+    </fieldset>
+    <fieldset><legend>Protection</legend>
+      <div class="checks">${chk({ name: 'block_exploits', label: 'Block common exploits', checked: h.block_exploits, help: 'Refuses path traversal, script and SQL-injection probes in the URL, TRACE requests and well-known scanner user agents with a 403. It trims scanner noise; it is not a full web application firewall.' })}</div>
     </fieldset>
     <fieldset><legend>Compatibility</legend>
       <div class="checks">
@@ -970,10 +1008,19 @@ function collectHost(form) {
       redirect_path: (fd.get('df_redirect_path') || '').trim(), scope: fd.get('df_scope'), lock: on('df_lock'),
       allow_paths: (fd.get('df_allow_paths') || '').split('\n').map((x) => x.trim()).filter(Boolean),
     } : null,
+    locations: parseLocations(fd.get('locations') || ''),
+    block_exploits: on('block_exploits'),
+    fixed_response: String(fd.get('fr_status') || '').trim() ? { status: Number(fd.get('fr_status')), body: fd.get('fr_body') || '' } : null,
     enabled: on('enabled'),
   };
 }
-const HOST_DEFAULTS = { domain: '', bind_ip_v4: '0.0.0.0', bind_ip_v6: '::', bind_port: 443, upstream: '', upstream_https: false, upstream_tls_verify: true, upstream_preserve_host: true, websockets: false, force_https: true, enabled: true, acme_enabled: true, acme_challenge_type: 'auto', acl_ids: [], rewrite_samesite_none_cookies: false, pass_client_cert_header: false, deny_fallback: null };
+function parseLocations(text) {
+  return text.split('\n').map((l) => l.trim()).filter(Boolean).map((line) => {
+    const [path, upstream, mode] = line.split(/\s+/);
+    return { path, upstream: upstream || '', upstream_https: mode === 'https' || mode === 'https-insecure', upstream_tls_verify: mode !== 'https-insecure' };
+  });
+}
+const HOST_DEFAULTS = { domain: '', bind_ip_v4: '0.0.0.0', bind_ip_v6: '::', bind_port: 443, upstream: '', upstream_https: false, upstream_tls_verify: true, upstream_preserve_host: true, websockets: false, force_https: true, enabled: true, acme_enabled: true, acme_challenge_type: 'auto', acl_ids: [], rewrite_samesite_none_cookies: false, pass_client_cert_header: false, deny_fallback: null, locations: [], block_exploits: false, fixed_response: null };
 async function openHostDrawer(id) {
   await ensure(['localIps', 'dnsCreds', 'acls', 'certs']);
   let host = null;
@@ -1572,14 +1619,14 @@ function pTokens() {
     <code id="reveal-val">${esc(UI.reveal)}</code>
     <div style="display:flex;gap:var(--s-2)"><button type="button" class="btn primary" data-act="token-copy">${icon('copy')}Copy token</button><button type="button" class="btn" data-act="token-done">Done</button></div></div>` : '';
   return reveal + (toks.length
-    ? table([{ l: 'Name' }, { l: 'Created' }, { l: 'Last used' }, { l: 'Actions', sr: true }], toks.map((t) => '<tr>' + td('Name', `<span class="dom">${esc(t.name)}</span>`) + td('Created', esc(fmtDT(t.created_at))) + td('Last used', t.last_used_at ? esc(fmtDT(t.last_used_at)) : '<span class="faint">never</span>') + actsTd(abtn('token-del', t.id, 'Revoke', 'danger')) + '</tr>'))
+    ? table([{ l: 'Name' }, { l: 'Role' }, { l: 'Created' }, { l: 'Last used' }, { l: 'Actions', sr: true }], toks.map((t) => '<tr>' + td('Name', `<span class="dom">${esc(t.name)}</span>`) + td('Role', rolePill(t.role)) + td('Created', esc(fmtDT(t.created_at))) + td('Last used', t.last_used_at ? esc(fmtDT(t.last_used_at)) : '<span class="faint">never</span>') + actsTd(abtn('token-del', t.id, 'Revoke', 'danger')) + '</tr>'))
     : emptyState({ ic: 'system', title: 'No API tokens', text: 'Tokens let scripts and other services call the admin API.', cta: { label: 'New token', act: 'token-add' } }));
 }
 ACTIONS['token-add'] = () => openDrawer({
   title: 'New API token', submitLabel: 'Create token',
-  body: `<div class="fgrid">${fld({ name: 'name', label: 'Name', required: true, wide: true, placeholder: 'deploy-script', help: 'A label so you can tell tokens apart later.' })}</div>`,
+  body: `<div class="fgrid">${fld({ name: 'name', label: 'Name', required: true, wide: true, placeholder: 'deploy-script', help: 'A label so you can tell tokens apart later.' })}${sel({ name: 'role', label: 'Role', wide: true, value: 'viewer', options: ROLE_OPTIONS, help: ROLE_HELP })}</div>`,
   onSubmit: async (form) => {
-    const made = await send('POST', '/api/tokens', { name: form.elements.name.value.trim() });
+    const made = await send('POST', '/api/tokens', { name: form.elements.name.value.trim(), role: form.elements.role.value });
     UI.reveal = made.token; await refresh('tokens');
     const r = $('#reveal-val'); if (r) r.scrollIntoView({ block: 'center' });
   },
@@ -1591,6 +1638,54 @@ ACTIONS['token-del'] = async (el) => {
   if (!await confirmAsync({ title: 'Revoke token', body: `Revoke token <b>${esc(t.name)}</b>? Anything using it will stop working immediately.`, confirmLabel: 'Revoke token', typeToConfirm: t.name })) return;
   try { await send('DELETE', `/api/tokens/${t.id}`); toast('Token revoked', 'ok'); await refresh('tokens'); } catch (e) { fail(e); }
 };
+
+/* --------------------------------------------------------------- users */
+const ROLE_OPTIONS = [['viewer', 'Viewer'], ['operator', 'Operator'], ['admin', 'Admin']];
+const ROLE_HELP = 'Viewer: read only. Operator: also changes sites, certificates, port rules, access lists and hosting. Admin: everything, including users, tokens and system settings.';
+const rolePill = (r) => pill(r === 'admin' ? 'info' : r === 'operator' ? 'ok' : '', r);
+function pUsers() {
+  const users = D.users || [];
+  return table([{ l: 'User' }, { l: 'Role' }, { l: 'Status' }, { l: 'Last sign-in' }, { l: 'Actions', sr: true }], users.map((u) => '<tr>'
+    + td('User', `<span class="dom">${esc(u.username)}</span>${u.primary ? ' <span class="faint">(owner)</span>' : ''}`)
+    + td('Role', rolePill(u.role))
+    + td('Status', u.disabled ? pill('error', 'Disabled') : pill('ok', 'Active'))
+    + td('Last sign-in', u.last_login_at ? esc(fmtDT(u.last_login_at)) : '<span class="faint">never</span>')
+    + actsTd(u.primary ? '<span class="faint">Set in config or setup</span>' : abtn('user-edit', u.id, 'Edit') + abtn('user-del', u.id, 'Delete', 'danger')) + '</tr>'));
+}
+ACTIONS['user-add'] = () => openDrawer({
+  title: 'Add user', submitLabel: 'Create user',
+  body: `<div class="fgrid">${fld({ name: 'username', label: 'Username', required: true, wide: true, attrs: 'autocomplete="off" maxlength="64"', help: 'Letters, digits, dot, underscore, @ and dash.' })}${fld({ name: 'password', label: 'Password', type: 'password', required: true, wide: true, attrs: 'autocomplete="new-password" minlength="8"', help: 'At least 8 characters.' })}${sel({ name: 'role', label: 'Role', wide: true, value: 'viewer', options: ROLE_OPTIONS, help: ROLE_HELP })}</div>`,
+  onSubmit: async (form) => {
+    await send('POST', '/api/users', { username: form.elements.username.value.trim(), password: form.elements.password.value, role: form.elements.role.value });
+    toast('User created', 'ok'); await refresh('users');
+  },
+});
+ACTIONS['user-edit'] = (el) => {
+  const u = (D.users || []).find((x) => x.id === el.dataset.id); if (!u) return;
+  openDrawer({
+    title: `Edit ${u.username}`, submitLabel: 'Save',
+    body: `<div class="fgrid">${sel({ name: 'role', label: 'Role', wide: true, value: u.role, options: ROLE_OPTIONS, help: ROLE_HELP })}${fld({ name: 'password', label: 'New password', type: 'password', wide: true, attrs: 'autocomplete="new-password" minlength="8"', help: 'Leave blank to keep the current password.' })}</div>${chk({ name: 'disabled', label: 'Disabled', checked: u.disabled, help: 'A disabled user is signed out and cannot sign in.' })}`,
+    onSubmit: async (form) => {
+      const body = { role: form.elements.role.value, disabled: form.elements.disabled.checked };
+      if (form.elements.password.value) body.password = form.elements.password.value;
+      await send('PUT', `/api/users/${u.id}`, body);
+      toast('User updated', 'ok'); await refresh('users');
+    },
+  });
+};
+ACTIONS['user-del'] = async (el) => {
+  const u = (D.users || []).find((x) => x.id === el.dataset.id); if (!u) return;
+  if (!await confirmAsync({ title: 'Delete user', body: `Delete <b>${esc(u.username)}</b>? They are signed out immediately.`, confirmLabel: 'Delete user' })) return;
+  try { await send('DELETE', `/api/users/${u.id}`); toast('User deleted', 'ok'); await refresh('users'); } catch (e) { fail(e); }
+};
+$('#pw-btn').addEventListener('click', () => openDrawer({
+  title: 'Change password', submitLabel: 'Change password',
+  body: `<div class="fgrid">${fld({ name: 'current_password', label: 'Current password', type: 'password', required: true, wide: true, attrs: 'autocomplete="current-password"' })}${fld({ name: 'new_password', label: 'New password', type: 'password', required: true, wide: true, attrs: 'autocomplete="new-password" minlength="8"', help: 'At least 8 characters.' })}</div>`,
+  onSubmit: async (form) => {
+    await send('POST', '/api/me/password', { current_password: form.elements.current_password.value, new_password: form.elements.new_password.value });
+    toast('Password changed', 'ok');
+  },
+}));
 
 function pAbout() {
   const d = D.dash;
@@ -1622,11 +1717,16 @@ function showLogin() {
 }
 function showSetup() { AUTHED = false; show('setup-screen'); }
 async function showApp() {
-  AUTHED = true; show('app');
+  AUTHED = true;
+  try { Object.assign(ME, await jget('/api/me')); } catch (e) { if (e.message === 'unauthenticated') return; ME.role = 'viewer'; }
+  show('app');
+  applyRole();
+  const who = $('#who'); who.innerHTML = `<b>${esc(ME.username)}</b> · ${esc(ME.role)}`; who.hidden = false;
+  $('#pw-btn').hidden = !(ME.via === 'session' && !ME.primary);
   if (!$('#nav').children.length) buildNav();
   fetch('/api/version').then((r) => r.json()).then((v) => { UI.version = v.version; const el = $('#ver'); el.textContent = `v${v.version}`; el.hidden = false; if (route.s === 'system') safeRender(); }).catch(() => {});
   await enter();
-  const rest = ALL_KEYS.filter((k) => !TRIED.has(k));
+  const rest = allKeys().filter((k) => !TRIED.has(k));
   await load(rest);
   safeRender();
 }

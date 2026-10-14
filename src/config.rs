@@ -694,8 +694,119 @@ pub struct ProxyHost {
     /// `DenyFallback` and `proxy::access::deny_fallback_decision`.
     #[serde(default)]
     pub deny_fallback: Option<DenyFallback>,
+    /// Per-path upstream overrides ("custom locations"). A request whose
+    /// path falls under a location's `path` (longest match wins, on a
+    /// path-segment boundary) is forwarded to that location's upstream
+    /// instead of `upstream`. Checked after the access gate and after
+    /// `redirect`/`static_root`/`fixed_response` are ruled out.
+    #[serde(default)]
+    pub locations: Vec<HostLocation>,
+    /// `true` refuses requests matching a small set of common exploit
+    /// patterns (path traversal, SQL-injection and script-injection
+    /// probes in the URL, scanner user agents) with a 403 before they
+    /// reach the upstream. See `proxy::access::exploit_check`.
+    #[serde(default)]
+    pub block_exploits: bool,
+    /// When set, every request that passes the access gate gets this
+    /// fixed status and body instead of being proxied, redirected or
+    /// served from disk (the equivalent of NPM's "404 Host").
+    #[serde(default)]
+    pub fixed_response: Option<FixedResponse>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// One entry of `ProxyHost::locations`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostLocation {
+    /// Path prefix, e.g. `/api`. A prefix ending in `/` matches
+    /// everything beneath it; otherwise it matches that exact path and
+    /// anything under `<prefix>/`.
+    pub path: String,
+    /// `host:port` of the upstream for this location.
+    pub upstream: String,
+    #[serde(default)]
+    pub upstream_https: bool,
+    #[serde(default = "default_true")]
+    pub upstream_tls_verify: bool,
+}
+
+impl HostLocation {
+    pub fn validate(&self) -> Result<(), String> {
+        let p = &self.path;
+        if !p.starts_with('/')
+            || p.starts_with("//")
+            || p.contains('\\')
+            || p.contains('?')
+            || p.contains('#')
+            || p.split('/').any(|seg| seg == "..")
+            || p.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(format!(
+                "location path must be a plain path starting with a single '/' (got {p:?})"
+            ));
+        }
+        if p == "/" {
+            return Err("location path '/' is the host's own upstream; set that instead".into());
+        }
+        if !self.upstream.contains(':') {
+            return Err(format!(
+                "location {p:?} upstream must be host:port (got {:?})",
+                self.upstream
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Picks the location whose path is the longest prefix of `request_path`
+/// on a segment boundary, if any.
+pub fn match_location<'a>(
+    locations: &'a [HostLocation],
+    request_path: &str,
+) -> Option<&'a HostLocation> {
+    locations
+        .iter()
+        .filter(|l| {
+            if l.path.ends_with('/') {
+                request_path.starts_with(&l.path)
+            } else {
+                request_path == l.path
+                    || (request_path.starts_with(&l.path)
+                        && request_path[l.path.len()..].starts_with('/'))
+            }
+        })
+        .max_by_key(|l| l.path.len())
+}
+
+/// See `ProxyHost::fixed_response`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixedResponse {
+    #[serde(default = "default_fixed_status")]
+    pub status: u16,
+    #[serde(default)]
+    pub body: String,
+}
+
+fn default_fixed_status() -> u16 {
+    404
+}
+
+impl FixedResponse {
+    pub const MAX_BODY: usize = 64 * 1024;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(200..=599).contains(&self.status) || matches!(self.status, 204 | 205 | 304) && !self.body.is_empty() {
+            return Err("fixed_response status must be 200-599 (204/205/304 take no body)".into());
+        }
+        if self.body.len() > Self::MAX_BODY {
+            return Err(format!(
+                "fixed_response body is too large (max {} bytes)",
+                Self::MAX_BODY
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Per-host "send blocked visitors somewhere useful" setting -- works on
@@ -1460,6 +1571,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1494,6 +1608,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1527,6 +1644,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1557,6 +1677,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1591,6 +1714,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1625,6 +1751,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1722,6 +1851,9 @@ gateway = "172.16.63.1"
                 static_root: None,
                 rewrite_samesite_none_cookies: false,
                 deny_fallback: None,
+                locations: Vec::new(),
+                block_exploits: false,
+                fixed_response: None,
             pass_client_cert_header: false,
                 enabled: true,
             });
@@ -1757,6 +1889,9 @@ gateway = "172.16.63.1"
                 static_root: None,
                 rewrite_samesite_none_cookies: false,
                 deny_fallback: None,
+                locations: Vec::new(),
+                block_exploits: false,
+                fixed_response: None,
             pass_client_cert_header: false,
                 enabled: true,
             });
@@ -1788,6 +1923,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1830,6 +1968,9 @@ gateway = "172.16.63.1"
             static_root: None,
             rewrite_samesite_none_cookies: false,
             deny_fallback: None,
+            locations: Vec::new(),
+            block_exploits: false,
+            fixed_response: None,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1853,5 +1994,52 @@ gateway = "172.16.63.1"
     fn accepts_an_ordinary_non_wildcard_domain() {
         assert!(validate_domain("example.com").is_ok());
         assert!(validate_domain("*.example.com").is_ok());
+    }
+
+    #[test]
+    fn match_location_prefers_longest_segment_prefix() {
+        let loc = |path: &str, up: &str| HostLocation {
+            path: path.into(),
+            upstream: up.into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+        };
+        let locs = vec![loc("/api", "a:1"), loc("/api/v2", "b:2"), loc("/static/", "c:3")];
+        assert_eq!(match_location(&locs, "/api").unwrap().upstream, "a:1");
+        assert_eq!(match_location(&locs, "/api/users").unwrap().upstream, "a:1");
+        assert_eq!(match_location(&locs, "/api/v2/users").unwrap().upstream, "b:2");
+        assert_eq!(match_location(&locs, "/static/x.css").unwrap().upstream, "c:3");
+        assert!(match_location(&locs, "/apiary").is_none());
+        assert!(match_location(&locs, "/static").is_none());
+        assert!(match_location(&locs, "/").is_none());
+    }
+
+    #[test]
+    fn host_location_validation() {
+        let ok = |path: &str, up: &str| HostLocation {
+            path: path.into(),
+            upstream: up.into(),
+            upstream_https: false,
+            upstream_tls_verify: true,
+        }
+        .validate();
+        assert!(ok("/api", "10.0.0.1:80").is_ok());
+        assert!(ok("api", "10.0.0.1:80").is_err());
+        assert!(ok("//evil", "10.0.0.1:80").is_err());
+        assert!(ok("/a/../b", "10.0.0.1:80").is_err());
+        assert!(ok("/a b", "10.0.0.1:80").is_err());
+        assert!(ok("/", "10.0.0.1:80").is_err());
+        assert!(ok("/api", "no-port").is_err());
+    }
+
+    #[test]
+    fn fixed_response_validation() {
+        let fr = |status, body: &str| FixedResponse { status, body: body.into() }.validate();
+        assert!(fr(404, "").is_ok());
+        assert!(fr(200, "hello").is_ok());
+        assert!(fr(99, "").is_err());
+        assert!(fr(600, "").is_err());
+        assert!(fr(204, "body").is_err());
+        assert!(fr(404, &"x".repeat(FixedResponse::MAX_BODY + 1)).is_err());
     }
 }

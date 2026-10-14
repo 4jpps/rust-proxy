@@ -1,8 +1,10 @@
 //! Admin authentication, two independent mechanisms:
 //! - Session: argon2 password verification (never a plaintext comparison)
 //!   plus a stateless HMAC-signed cookie -- same "no server-side session
-//!   table" shape as jpps-store's `token.rs`, just scoped to this
-//!   daemon's one admin account instead of many. For the web UI.
+//!   table" shape as jpps-store's `token.rs`. The cookie only proves who
+//!   signed in; the account's role is looked up on every request (see
+//!   `routes::require_admin`), so a role change or a deleted account takes
+//!   effect immediately. For the web UI.
 //! - API tokens: opaque random bearer credentials, hashed at rest in
 //!   sqlite (see `db::api_tokens`) and looked up by hash on every
 //!   request. For programmatic/CI use -- see `routes::require_admin`,
@@ -19,6 +21,98 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 pub const SESSION_COOKIE: &str = "rust_proxy_session";
+
+/// What a signed-in user or API token may do. The owner account from
+/// `config.toml` / the setup wizard is always `Admin`; extra accounts and
+/// tokens carry one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Everything, including users, API tokens and system settings.
+    Admin,
+    /// Reads everything and changes the proxy's own configuration (hosts,
+    /// port rules, certificates, access lists, hosting allocations), but
+    /// not users, tokens or system-wide settings.
+    Operator,
+    /// Reads everything except users and tokens. Changes nothing.
+    Viewer,
+}
+
+/// Paths only an admin may touch, for any method (they expose or mint
+/// credentials).
+const ADMIN_ONLY_PATHS: &[&str] = &["/api/users", "/api/tokens"];
+
+/// Paths anyone may read but only an admin may change (system-wide
+/// settings and the secrets and address space behind them).
+const ADMIN_WRITE_PATHS: &[&str] = &[
+    "/api/dns-credentials",
+    "/api/acme-settings",
+    "/api/firewall-settings",
+    "/api/siem",
+    "/api/hosting/pools",
+];
+
+fn path_is_under(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Operator => "operator",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "admin" => Some(Role::Admin),
+            "operator" => Some(Role::Operator),
+            "viewer" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+
+    /// The one place that decides whether a role may make a request.
+    /// `/api/me` and `/api/me/password` are open to every signed-in role
+    /// (the password handler itself refuses accounts that have no
+    /// password of their own to change).
+    pub fn allows(self, method: &axum::http::Method, path: &str) -> bool {
+        if path == "/api/me" || path == "/api/me/password" {
+            return true;
+        }
+        if self == Role::Admin {
+            return true;
+        }
+        if ADMIN_ONLY_PATHS.iter().any(|p| path_is_under(path, p)) {
+            return false;
+        }
+        let is_read = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+        match self {
+            Role::Admin => true,
+            Role::Viewer => is_read,
+            Role::Operator => {
+                is_read || !ADMIN_WRITE_PATHS.iter().any(|p| path_is_under(path, p))
+            }
+        }
+    }
+}
+
+/// A password hash that no real password matches, verified against when a
+/// login names an account that doesn't exist so that "no such user" costs
+/// the same as "wrong password".
+pub fn verify_against_dummy_hash(password: &str) {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let hash = DUMMY.get_or_init(|| {
+        hash_password("no account has this password")
+            .expect("hashing a constant password cannot fail")
+    });
+    let _ = verify_password(password, hash);
+}
 const SESSION_LIFETIME_SECS: i64 = 12 * 3600;
 
 /// Prefixed like GitHub/Stripe/GitLab tokens (`ghp_`, `sk_`, `glpat-`) so
@@ -116,6 +210,82 @@ fn hmac_sign(secret: &str, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::http::Method;
+
+    #[test]
+    fn admin_may_do_anything() {
+        assert!(Role::Admin.allows(&Method::DELETE, "/api/users/abc"));
+        assert!(Role::Admin.allows(&Method::POST, "/api/tokens"));
+        assert!(Role::Admin.allows(&Method::PUT, "/api/firewall-settings"));
+    }
+
+    #[test]
+    fn operator_changes_proxy_config_but_not_users_tokens_or_system_settings() {
+        for (m, p) in [
+            (Method::POST, "/api/hosts"),
+            (Method::PUT, "/api/hosts/x"),
+            (Method::DELETE, "/api/port-rules/x"),
+            (Method::POST, "/api/certs"),
+            (Method::POST, "/api/acls"),
+            (Method::POST, "/api/dns01-certs"),
+            (Method::POST, "/api/hosting/allocations"),
+            (Method::POST, "/api/hosting/apply"),
+            (Method::GET, "/api/dns-credentials"),
+            (Method::GET, "/api/siem"),
+        ] {
+            assert!(Role::Operator.allows(&m, p), "{m} {p}");
+        }
+        for (m, p) in [
+            (Method::GET, "/api/users"),
+            (Method::POST, "/api/users"),
+            (Method::GET, "/api/tokens"),
+            (Method::DELETE, "/api/tokens/x"),
+            (Method::POST, "/api/dns-credentials"),
+            (Method::PUT, "/api/acme-settings"),
+            (Method::PUT, "/api/firewall-settings"),
+            (Method::PUT, "/api/siem"),
+            (Method::POST, "/api/siem/test"),
+            (Method::POST, "/api/hosting/pools"),
+            (Method::PUT, "/api/hosting/pools/main"),
+        ] {
+            assert!(!Role::Operator.allows(&m, p), "{m} {p}");
+        }
+    }
+
+    #[test]
+    fn viewer_only_reads_and_never_sees_users_or_tokens() {
+        assert!(Role::Viewer.allows(&Method::GET, "/api/hosts"));
+        assert!(Role::Viewer.allows(&Method::GET, "/api/dashboard"));
+        assert!(!Role::Viewer.allows(&Method::POST, "/api/hosts"));
+        assert!(!Role::Viewer.allows(&Method::DELETE, "/api/hosts/x"));
+        assert!(!Role::Viewer.allows(&Method::POST, "/api/hosting/apply"));
+        assert!(!Role::Viewer.allows(&Method::GET, "/api/users"));
+        assert!(!Role::Viewer.allows(&Method::GET, "/api/tokens"));
+    }
+
+    #[test]
+    fn every_role_reaches_me_endpoints() {
+        for role in [Role::Admin, Role::Operator, Role::Viewer] {
+            assert!(role.allows(&Method::GET, "/api/me"));
+            assert!(role.allows(&Method::POST, "/api/me/password"));
+        }
+    }
+
+    #[test]
+    fn similarly_named_paths_are_not_treated_as_the_protected_prefix() {
+        assert!(Role::Operator.allows(&Method::POST, "/api/userspace"));
+        assert!(Role::Viewer.allows(&Method::GET, "/api/tokenizer"));
+    }
+
+    #[test]
+    fn role_round_trips_through_its_string_form() {
+        for role in [Role::Admin, Role::Operator, Role::Viewer] {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(Role::parse("root"), None);
+        assert_eq!(Role::parse("Admin"), None);
+    }
 
     #[test]
     fn password_hash_round_trips() {
