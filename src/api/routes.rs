@@ -104,6 +104,16 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/siem/test", post(send_siem_test))
         .route(
+            "/api/default-site",
+            get(super::default_site::get_default_site).put(super::default_site::put_default_site),
+        )
+        .route(
+            "/api/license",
+            get(super::license::get_license)
+                .put(super::license::put_license)
+                .delete(super::license::delete_license),
+        )
+        .route(
             "/api/hosting/pools",
             get(super::hosting::list_pools).post(super::hosting::create_pool),
         )
@@ -196,14 +206,19 @@ async fn access_log(req: Request, next: Next) -> Response {
 /// appends the real client to `X-Forwarded-For` -- the last entry is the
 /// one the proxy itself observed, so it is the trustworthy one.
 fn admin_client_ip(req: &Request) -> Option<String> {
-    let peer = req
-        .extensions()
+    client_ip_from(req.extensions(), req.headers())
+}
+
+fn client_ip_from(
+    extensions: &axum::http::Extensions,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let peer = extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()?
         .0
         .ip();
     if peer.is_loopback() {
-        if let Some(last) = req
-            .headers()
+        if let Some(last) = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit(',').next())
@@ -436,6 +451,8 @@ pub(crate) enum ApiError {
     NotFound,
     Conflict(String),
     Internal(String),
+    BadGateway(String),
+    Forbidden(String),
 }
 
 impl IntoResponse for ApiError {
@@ -445,6 +462,8 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
     }
@@ -532,11 +551,20 @@ async fn login(
 #[derive(Serialize)]
 struct SetupStatusResponse {
     configured: bool,
+    /// The caller's own address, so the setup wizard can offer to lock
+    /// the admin UI to it. Only revealed before setup, to the caller itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_ip: Option<String>,
 }
 
-async fn setup_status(State(state): State<AppState>) -> Json<SetupStatusResponse> {
+async fn setup_status(
+    State(state): State<AppState>,
+    parts: axum::http::request::Parts,
+) -> Json<SetupStatusResponse> {
+    let configured = state.admin_identity().is_some();
     Json(SetupStatusResponse {
-        configured: state.admin_identity().is_some(),
+        configured,
+        client_ip: if configured { None } else { client_ip_from(&parts.extensions, &parts.headers) },
     })
 }
 
@@ -576,6 +604,37 @@ struct SetupRequest {
     /// instead, or add it later from the settings section.
     #[serde(default)]
     acme_contact_email: Option<String>,
+    /// Lock the admin UI/API to these IPs/CIDRs (enforced by the
+    /// firewall). Empty or absent leaves it unrestricted.
+    #[serde(default)]
+    admin_allowed_ips: Vec<String>,
+    /// Whether the firewall opens the admin port at all (default yes).
+    #[serde(default)]
+    expose_admin_port: Option<bool>,
+}
+
+/// Parses a "lock to" list and refuses one that would lock out the
+/// caller's own (non-loopback) address, which is almost always a typo.
+fn parse_admin_allowed_ips(
+    raw: &[String],
+    client_ip: Option<&str>,
+) -> Result<Vec<ipnet::IpNet>, ApiError> {
+    let mut out = Vec::new();
+    for entry in raw.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        let net = entry
+            .parse::<ipnet::IpNet>()
+            .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+            .map_err(|_| ApiError::BadRequest(format!("'{entry}' is not an IP address or CIDR")))?;
+        out.push(net);
+    }
+    if let Some(ip) = client_ip.and_then(|c| c.parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_canonical()) {
+        if !out.is_empty() && !ip.is_loopback() && !out.iter().any(|n| n.contains(&ip)) {
+            return Err(ApiError::BadRequest(format!(
+                "your own address ({ip}) is not in this list, which would lock you out of the admin UI"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 /// Creates the admin identity on a genuinely unconfigured instance.
@@ -591,6 +650,7 @@ struct SetupRequest {
 /// only the request that actually inserts the row gets to publish it.
 async fn setup(
     State(state): State<AppState>,
+    parts: axum::http::request::Parts,
     Json(body): Json<SetupRequest>,
 ) -> Result<StatusCode, ApiError> {
     if state.admin_identity().is_some() {
@@ -603,6 +663,8 @@ async fn setup(
             "username and password must not be empty".into(),
         ));
     }
+    let client_ip = client_ip_from(&parts.extensions, &parts.headers);
+    let allowed_ips = parse_admin_allowed_ips(&body.admin_allowed_ips, client_ip.as_deref())?;
     let password_hash =
         auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
     let session_secret = generate_session_secret();
@@ -648,6 +710,17 @@ async fn setup(
             state.set_acme_contact_email(email.to_string());
         }
     }
+    if !allowed_ips.is_empty() && state.admin().allowed_ips.is_empty() {
+        crate::db::set_admin_allowed_ips(state.db(), &allowed_ips).await?;
+        state.set_admin_allowed_ips(allowed_ips);
+    }
+    if let Some(expose) = body.expose_admin_port {
+        if state.admin().expose_admin_port.is_none() {
+            crate::db::set_expose_admin_port(state.db(), expose).await?;
+            state.set_expose_admin_port(expose);
+        }
+    }
+    state.notify_config_change();
     Ok(StatusCode::CREATED)
 }
 
@@ -705,38 +778,66 @@ async fn update_acme_settings(
 #[derive(Serialize)]
 struct FirewallSettingsResponse {
     expose_admin_port: bool,
+    /// The admin UI "lock to" list; empty means unrestricted.
+    admin_allowed_ips: Vec<String>,
+    /// True when config.toml's `admin.allowed_ips` supplies the list.
+    allowed_ips_from_config: bool,
     /// Same "read-only in the UI, edit config.toml instead" reasoning as
     /// `AcmeSettingsResponse::from_config`.
     from_config: bool,
 }
 
-async fn get_firewall_settings(State(state): State<AppState>) -> Json<FirewallSettingsResponse> {
-    Json(FirewallSettingsResponse {
+fn firewall_response(state: &AppState) -> FirewallSettingsResponse {
+    FirewallSettingsResponse {
         expose_admin_port: state.expose_admin_port(),
+        admin_allowed_ips: state.admin_allowed_ips().iter().map(|n| n.to_string()).collect(),
+        allowed_ips_from_config: !state.admin().allowed_ips.is_empty(),
         from_config: state.admin().expose_admin_port.is_some(),
-    })
+    }
+}
+
+async fn get_firewall_settings(State(state): State<AppState>) -> Json<FirewallSettingsResponse> {
+    Json(firewall_response(&state))
 }
 
 #[derive(Deserialize)]
 struct UpdateFirewallSettingsRequest {
-    expose_admin_port: bool,
+    #[serde(default)]
+    expose_admin_port: Option<bool>,
+    #[serde(default)]
+    admin_allowed_ips: Option<Vec<String>>,
 }
 
-/// Rejected outright when config.toml already supplies
-/// `admin.expose_admin_port` -- same reasoning as `update_acme_settings`.
+/// Each field is refused when config.toml already supplies it -- same
+/// reasoning as `update_acme_settings`. Omitted fields are left alone.
 async fn update_firewall_settings(
     State(state): State<AppState>,
+    parts: axum::http::request::Parts,
     Json(body): Json<UpdateFirewallSettingsRequest>,
 ) -> Result<Json<FirewallSettingsResponse>, ApiError> {
-    if state.admin().expose_admin_port.is_some() {
+    if body.expose_admin_port.is_some() && state.admin().expose_admin_port.is_some() {
         return Err(ApiError::Conflict("admin.expose_admin_port is set in config.toml, which always takes precedence -- edit it there instead".into()));
     }
-    crate::db::set_expose_admin_port(state.db(), body.expose_admin_port).await?;
-    state.set_expose_admin_port(body.expose_admin_port);
-    Ok(Json(FirewallSettingsResponse {
-        expose_admin_port: body.expose_admin_port,
-        from_config: false,
-    }))
+    if body.admin_allowed_ips.is_some() && !state.admin().allowed_ips.is_empty() {
+        return Err(ApiError::Conflict("admin.allowed_ips is set in config.toml, which always takes precedence -- edit it there instead".into()));
+    }
+    let allowed = match &body.admin_allowed_ips {
+        Some(raw) => {
+            let client_ip = client_ip_from(&parts.extensions, &parts.headers);
+            Some(parse_admin_allowed_ips(raw, client_ip.as_deref())?)
+        }
+        None => None,
+    };
+    if let Some(expose) = body.expose_admin_port {
+        crate::db::set_expose_admin_port(state.db(), expose).await?;
+        state.set_expose_admin_port(expose);
+    }
+    if let Some(ips) = allowed {
+        crate::db::set_admin_allowed_ips(state.db(), &ips).await?;
+        state.set_admin_allowed_ips(ips);
+    }
+    state.notify_config_change();
+    Ok(Json(firewall_response(&state)))
 }
 
 #[derive(Serialize)]
@@ -923,6 +1024,12 @@ struct HostRequest {
     /// See `config::ProxyHost::fixed_response`'s doc comment.
     #[serde(default)]
     fixed_response: Option<crate::config::FixedResponse>,
+    /// See `config::ProxyHost::hsts`'s doc comment.
+    #[serde(default)]
+    hsts: bool,
+    /// See `config::ProxyHost::hsts_subdomains`'s doc comment.
+    #[serde(default)]
+    hsts_subdomains: bool,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -938,6 +1045,9 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
     }
     if let Some(fixed) = &req.fixed_response {
         fixed.validate().map_err(ApiError::BadRequest)?;
+    }
+    if req.hsts_subdomains && !req.hsts {
+        return Err(ApiError::BadRequest("hsts_subdomains needs hsts turned on".into()));
     }
     match (&req.redirect, &req.static_root) {
         _ if req.fixed_response.is_some() => {}
@@ -1056,10 +1166,8 @@ struct CreateAclListRequest {
     ip_entries: Vec<String>,
     #[serde(default)]
     credentials: Vec<AclCredentialRequest>,
-    /// Optional even for a `ClientCert`-kind list -- unlike IpAllow/
-    /// Login, an empty `ClientCert` list is a real, meaningful,
-    /// still-supported configuration ("any valid TrustBridge cert"),
-    /// not a useless one, so this is never required to be non-empty.
+    /// Optional for a `ClientCert`-kind list so entries can be added after
+    /// creating it, but a list with none trusts no certificate.
     #[serde(default)]
     client_cert_entries: Vec<AclClientCertEntryRequest>,
 }
@@ -1137,9 +1245,8 @@ async fn create_acl_list(
             crate::db::add_acl_credentials(state.db(), id, &hashed).await?;
         }
         crate::config::AclKind::ClientCert => {
-            // Entries are optional -- see AclKind::ClientCert's doc
-            // comment: zero entries is a real, meaningful "any valid
-            // TrustBridge cert" configuration, not an incomplete one.
+            // Entries are optional at creation so they can be added
+            // afterwards, but a list with none trusts no certificate.
             let subjects: Vec<(String, Option<String>)> = body
                 .client_cert_entries
                 .iter()
@@ -1510,6 +1617,8 @@ async fn create_host(
         locations: body.locations,
         block_exploits: body.block_exploits,
         fixed_response: body.fixed_response,
+        hsts: body.hsts,
+        hsts_subdomains: body.hsts_subdomains,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -1554,6 +1663,8 @@ async fn update_host(
         locations: body.locations,
         block_exploits: body.block_exploits,
         fixed_response: body.fixed_response,
+        hsts: body.hsts,
+        hsts_subdomains: body.hsts_subdomains,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;
@@ -2093,12 +2204,36 @@ struct UpdateUserRequest {
 
 async fn update_user(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<UserSummary>, ApiError> {
     let existing = crate::db::find_user_by_id(state.db(), id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    // An admin can reset operators' and viewers' passwords but never
+    // another admin's; admins change their own at /api/me/password.
+    let is_self = principal.via == "session" && principal.username == existing.username;
+    let is_owner = principal.via == "session"
+        && state
+            .admin_identity()
+            .is_some_and(|i| i.username == principal.username);
+    // Demoting is the way around the rule above (demote, reset, promote),
+    // so only the owner may demote another admin.
+    if existing.role == Role::Admin
+        && !is_self
+        && !is_owner
+        && body.role.is_some_and(|r| r != Role::Admin)
+    {
+        return Err(ApiError::Forbidden(
+            "only the owner can change another admin's role".into(),
+        ));
+    }
+    if body.password.is_some() && existing.role == Role::Admin && !is_self {
+        return Err(ApiError::Forbidden(
+            "an admin cannot change or reset another admin's password".into(),
+        ));
+    }
     let new_hash = match body.password.as_deref() {
         Some(p) if p.chars().count() < MIN_PASSWORD_LEN => {
             return Err(ApiError::BadRequest(format!(
@@ -5528,6 +5663,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_admin_cannot_reset_another_admins_password_but_can_change_their_own() {
+        let (router, owner, id) = router_with_user("alice", "admin").await;
+        let reset = |cookie: String, id: String, pw: &'static str| {
+            let r = router.clone();
+            async move {
+                send(&r, "PUT", &format!("/api/users/{id}"), Some(&cookie), None,
+                    Some(&format!(r#"{{"password":"{pw}"}}"#))).await
+            }
+        };
+        // The owner is an admin too: refused.
+        let resp = reset(owner.clone(), id.clone(), "owner-forced-password").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(login_as(&router, "alice", "a-long-password").await.is_some());
+        // So is a second admin, and a bearer token.
+        let (router2, owner2, id2) = router_with_user("bob", "admin").await;
+        let bob = login_as(&router2, "bob", "a-long-password").await.unwrap();
+        let (_, _, _) = (&owner2, &id2, &bob);
+        let resp = send(&router2, "POST", "/api/users", Some(&owner2), None,
+            Some(r#"{"username":"carol","password":"a-long-password","role":"admin"}"#)).await;
+        let carol = body_json(resp).await["id"].as_str().unwrap().to_string();
+        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), Some(&bob), None,
+            Some(r#"{"password":"bob-forced-password"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(login_as(&router2, "carol", "a-long-password").await.is_some());
+        let tok = body_json(send(&router2, "POST", "/api/tokens", Some(&owner2), None,
+            Some(r#"{"name":"adm","role":"admin"}"#)).await).await["token"].as_str().unwrap().to_string();
+        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), None, Some(&tok),
+            Some(r#"{"password":"token-forced-password"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // A second admin cannot demote an admin to get around that; the
+        // owner can.
+        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), Some(&bob), None,
+            Some(r#"{"role":"viewer"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Non-password edits to an admin still work, and an admin can
+        // reset their own password.
+        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), Some(&bob), None,
+            Some(r#"{"disabled":false}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = send(&router2, "PUT", &format!("/api/users/{id2}"), Some(&bob), None,
+            Some(r#"{"password":"bobs-own-new-password"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(login_as(&router2, "bob", "bobs-own-new-password").await.is_some());
+    }
+
+    #[tokio::test]
     async fn tokens_carry_the_role_they_were_created_with() {
         let router = build_router(test_state().await);
         let owner = logged_in_cookie(&router).await;
@@ -5564,5 +5745,155 @@ mod tests {
         assert_eq!(json["role"], "admin");
         let token = json["token"].as_str().unwrap().to_string();
         assert_eq!(send(&router, "GET", "/api/users", None, Some(&token), None).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn default_site_api_round_trips_and_validates() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let got = body_json(send(&router, "GET", "/api/default-site", Some(&cookie), None, None).await).await;
+        assert_eq!(got["mode"], "not_found");
+
+        let put = |body: &'static str| {
+            let r = router.clone();
+            let c = cookie.clone();
+            async move { send(&r, "PUT", "/api/default-site", Some(&c), None, Some(body)).await }
+        };
+        for bad in [
+            r#"{"mode":"redirect","redirect_url":""}"#,
+            r#"{"mode":"redirect","redirect_url":"javascript:alert(1)"}"#,
+            r#"{"mode":"custom_html","custom_html":"  "}"#,
+            r#"{"mode":"nonsense"}"#,
+        ] {
+            let resp = put(bad).await;
+            assert!(resp.status().is_client_error(), "{bad} -> {}", resp.status());
+        }
+        let unchanged = body_json(send(&router, "GET", "/api/default-site", Some(&cookie), None, None).await).await;
+        assert_eq!(unchanged["mode"], "not_found", "rejected writes must not change the setting");
+
+        let ok = put(r#"{"mode":"redirect","redirect_url":" https://www.example.com "}"#).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let got = body_json(send(&router, "GET", "/api/default-site", Some(&cookie), None, None).await).await;
+        assert_eq!(got["mode"], "redirect");
+        assert_eq!(got["redirect_url"], "https://www.example.com");
+    }
+
+    #[tokio::test]
+    async fn license_api_get_empty_rejects_bad_keys_and_deletes() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let got = body_json(send(&router, "GET", "/api/license", Some(&cookie), None, None).await).await;
+        assert_eq!(got["licensed"], false);
+        assert!(got.get("key_hint").is_none());
+        for bad in [r#"{"license_key":""}"#, r#"{"license_key":"not-a-key"}"#] {
+            let resp = send(&router, "PUT", "/api/license", Some(&cookie), None, Some(bad)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let resp = send(&router, "DELETE", "/api/license", Some(&cookie), None, None).await;
+        assert!(resp.status().is_success(), "{}", resp.status());
+    }
+
+    #[tokio::test]
+    async fn hsts_is_stored_and_subdomains_requires_hsts() {
+        let router = build_router(test_state().await);
+        let cookie = logged_in_cookie(&router).await;
+        let host = |extra: &str| {
+            format!(
+                r#"{{"domain":"h.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,{extra}}}"#
+            )
+        };
+        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some(&host(r#""hsts_subdomains":true"#))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some(&host(r#""hsts":true,"hsts_subdomains":true"#))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hosts = body_json(send(&router, "GET", "/api/hosts", Some(&cookie), None, None).await).await;
+        assert_eq!(hosts[0]["hsts"], true);
+        assert_eq!(hosts[0]["hsts_subdomains"], true);
+    }
+
+    #[tokio::test]
+    async fn license_and_default_site_writes_are_admin_only() {
+        for role in ["operator", "viewer"] {
+            let (router, _owner, _id) = router_with_user("limited", role).await;
+            let cookie = login_as(&router, "limited", "a-long-password").await.unwrap();
+            for (m, uri) in [
+                ("PUT", "/api/license"),
+                ("DELETE", "/api/license"),
+                ("PUT", "/api/default-site"),
+            ] {
+                let resp = send(&router, m, uri, Some(&cookie), None, Some("{}")).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{role} {m} {uri}");
+            }
+            for uri in ["/api/license", "/api/default-site"] {
+                let resp = send(&router, "GET", uri, Some(&cookie), None, None).await;
+                assert_eq!(resp.status(), StatusCode::OK, "{role} GET {uri}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_can_set_the_admin_lock_to_list_and_port_exposure() {
+        let state = unconfigured_test_state().await;
+        let router = build_router(state.clone());
+        let resp = send(
+            &router,
+            "POST",
+            "/api/setup",
+            None,
+            None,
+            Some(r#"{"username":"admin","password":"correct horse","admin_allowed_ips":["192.168.1.0/24"," 10.0.0.5 "],"expose_admin_port":false}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let ips: Vec<String> = state.admin_allowed_ips().iter().map(|n| n.to_string()).collect();
+        assert_eq!(ips, ["192.168.1.0/24", "10.0.0.5/32"]);
+        assert!(!state.expose_admin_port());
+        assert_eq!(crate::db::load_admin_allowed_ips(state.db()).await.unwrap().len(), 2);
+        assert_eq!(crate::db::load_expose_admin_port(state.db()).await.unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_a_malformed_lock_to_entry_without_creating_the_account() {
+        let state = unconfigured_test_state().await;
+        let router = build_router(state.clone());
+        let resp = send(
+            &router,
+            "POST",
+            "/api/setup",
+            None,
+            None,
+            Some(r#"{"username":"admin","password":"correct horse","admin_allowed_ips":["not-an-ip"]}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(state.admin_identity().is_none());
+    }
+
+    #[test]
+    fn lock_to_list_refuses_to_exclude_the_callers_own_address() {
+        let list = vec!["192.168.1.0/24".to_string()];
+        assert!(parse_admin_allowed_ips(&list, Some("192.168.1.9")).is_ok());
+        assert!(parse_admin_allowed_ips(&list, Some("203.0.113.7")).is_err());
+        assert!(parse_admin_allowed_ips(&list, Some("127.0.0.1")).is_ok(), "loopback is always reachable");
+        assert!(parse_admin_allowed_ips(&list, None).is_ok());
+        assert!(parse_admin_allowed_ips(&list, Some("::ffff:192.168.1.9")).is_ok(), "IPv4-mapped addresses are matched as IPv4");
+        assert!(parse_admin_allowed_ips(&list, Some("::ffff:203.0.113.7")).is_err());
+        assert!(parse_admin_allowed_ips(&[], Some("203.0.113.7")).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn firewall_settings_can_update_the_lock_to_list_independently() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+        let resp = send(&router, "PUT", "/api/firewall-settings", Some(&cookie), None, Some(r#"{"admin_allowed_ips":["172.16.0.0/16"]}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["admin_allowed_ips"][0], "172.16.0.0/16");
+        assert_eq!(json["allowed_ips_from_config"], false);
+        assert_eq!(json["expose_admin_port"], true, "an omitted field is left alone");
+        let resp = send(&router, "PUT", "/api/firewall-settings", Some(&cookie), None, Some(r#"{"admin_allowed_ips":[]}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.admin_allowed_ips().is_empty());
     }
 }

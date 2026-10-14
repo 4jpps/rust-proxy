@@ -33,7 +33,7 @@
 # UI/setup wizard is reachable from the network on a genuinely fresh
 # install with zero edits to this file. nftables mirrors that: SSH/80/443
 # are always open unconditionally, and the admin port itself is open to
-# any source until allowed_ips (below) narrows it down. Override
+# any source until allowed_ips (below), or the wizard / Firewall settings page, narrows it down. Override
 # bind_ip_v4/bind_ip_v6/bind_port here only if you want something other
 # than "every interface, port 8084"; at least one of bind_ip_v4/
 # bind_ip_v6 must be set, so only remove one if the other stays.

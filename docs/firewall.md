@@ -25,10 +25,12 @@ host, or accept that port 22 is always open here.
 
 ## The admin port
 
-Narrow the admin port with `admin.allowed_ips` (an IP or CIDR list,
-enforced by nftables), or take it off the wire entirely with
+Narrow the admin port with an allowed-addresses list (IPs or CIDRs,
+enforced by nftables) set in the first-run wizard, under Network, Firewall
+settings, or with `admin.allowed_ips` in `config.toml` (which wins when set),
+or take it off the wire entirely with
 `expose_admin_port = false` (or the UI toggle) and use an SSH tunnel. See
-[Getting started](getting-started.md#2-restrict-the-admin-port).
+[Getting started](getting-started.md#2-run-the-first-run-wizard).
 
 ![The Firewall settings tab with the admin port exposure toggle.](screenshots/firewall-settings.png)
 

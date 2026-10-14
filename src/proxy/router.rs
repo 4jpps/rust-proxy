@@ -39,6 +39,20 @@ pub fn match_host<'a>(
     hosts.iter().find(|h| is_candidate(h, &wildcard))
 }
 
+/// Whether any enabled site is configured for `name` on any bind address
+/// or port (exact name, or a one-label `*.parent` wildcard). The plain-HTTP
+/// listener uses this to tell a known site (redirect to HTTPS) from an
+/// unknown hostname (Default Site).
+pub fn host_is_known(hosts: &[ProxyHost], name: &str) -> bool {
+    let name = strip_port_suffix(name);
+    let wildcard = name.split_once('.').map(|(_, parent)| format!("*.{parent}"));
+    hosts.iter().any(|h| {
+        h.enabled
+            && (h.domain.eq_ignore_ascii_case(name)
+                || wildcard.as_deref().is_some_and(|w| h.domain.eq_ignore_ascii_case(w)))
+    })
+}
+
 /// `Host:` headers (unlike SNI) may carry a `:port` suffix.
 fn strip_port_suffix(name: &str) -> &str {
     match name.rsplit_once(':') {
@@ -118,6 +132,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled,
         }
@@ -256,5 +272,21 @@ mod tests {
         let hosts = vec![host("a.example.com", "10.0.0.2", 443, true, false)];
         assert!(https_listener_keys(&hosts).is_empty());
         assert!(redirect_listener_keys(&hosts).is_empty());
+    }
+
+    #[test]
+    fn host_is_known_matches_exact_wildcard_and_port_suffixed_names() {
+        let hosts = vec![
+            host("app.example.com", "10.0.0.2", 443, true, true),
+            host("*.wild.example.com", "10.0.0.2", 443, true, true),
+            host("off.example.com", "10.0.0.2", 443, true, false),
+        ];
+        assert!(host_is_known(&hosts, "app.example.com"));
+        assert!(host_is_known(&hosts, "APP.example.com"));
+        assert!(host_is_known(&hosts, "app.example.com:8080"));
+        assert!(host_is_known(&hosts, "x.wild.example.com"));
+        assert!(!host_is_known(&hosts, "other.example.com"));
+        assert!(!host_is_known(&hosts, "off.example.com"), "disabled sites do not count");
+        assert!(!host_is_known(&hosts, "10.0.0.2"));
     }
 }

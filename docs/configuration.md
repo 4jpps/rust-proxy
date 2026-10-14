@@ -21,7 +21,7 @@ parts you are most likely to change.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `bind_ip_v4`, `bind_ip_v6`, `bind_port` | `0.0.0.0`, `::`, `8084` | Where the admin UI and API listen. At least one of the two IPs must be set. |
-| `allowed_ips` | `[]` (anyone) | Source IPs/CIDRs allowed to reach the admin port. Enforced in nftables, not just in the app. **Set this.** |
+| `allowed_ips` | `[]` (anyone) | Source IPs/CIDRs allowed to reach the admin port. Enforced in nftables, not just in the app. **Set this**, either here or in the first-run wizard / Network, Firewall settings. A non-empty list here wins over the one saved in the database. |
 | `expose_admin_port` | `true` | `false` removes the firewall accept rule for the admin port entirely, so it is reachable only over loopback (for example an SSH tunnel). |
 | `db_path` | `/var/lib/rust-proxy/rust-proxy.db` | The sqlite database. |
 
@@ -99,6 +99,8 @@ least one of `bind_ip_v4`/`bind_ip_v6`, and one destination (`upstream`,
 | `acl_ids` | `[]` | Named [ACLs](access-control.md) this host selects. |
 | `deny_fallback` | unset | See [deny_fallback](deny-fallback.md). |
 | `locations` | `[]` | Route path prefixes to other upstreams. See [Custom locations](#custom-locations). |
+| `hsts` | `false` | Send `Strict-Transport-Security: max-age=63072000` (two years) on every HTTPS response. See [HSTS](#hsts). |
+| `hsts_subdomains` | `false` | Add `includeSubDomains` to the HSTS header. Needs `hsts`. |
 | `block_exploits` | `false` | Refuse common probe requests. See [Block common exploits](#block-common-exploits). |
 | `fixed_response` | unset | Answer every request with a fixed status and body, no upstream needed. See [Fixed-response hosts](#fixed-response-hosts). |
 | `redirect` | unset | Make this a redirect host instead of a proxy. |
@@ -196,11 +198,81 @@ legitimately receives such strings in URLs should leave it off.
   "fixed_response": { "status": 404, "body": "Nothing here." } }
 ```
 
+Add `"html": true` to serve the body as an HTML page (`text/html`, with
+`X-Content-Type-Options: nosniff`) instead of plain text. That is how you
+**park a site**: point the DNS at the proxy now, give the host a
+`fixed_response` with a "Coming soon" page, and replace it with a real
+upstream when the site is ready.
+
+```json
+{ "domain": "new.example.com", "bind_ip_v4": "0.0.0.0", "bind_port": 443,
+  "fixed_response": { "status": 200, "html": true,
+                      "body": "<h1>Coming soon</h1><p>We are almost ready.</p>" } }
+```
+
+In the site form this is the "Message or landing page" box with a "Serve as an
+HTML page" checkbox. The page is served exactly as written, so only paste
+HTML you trust.
+
 Every request that passes the ACL gate gets this status (200 to 599) and a
 `text/plain` body of up to 64 KiB, and no upstream is needed. This is the
 equivalent of NPM's 404 Host: put it on a name you want to answer
 deliberately, or on a wildcard so unknown subdomains get a clean 404.
 Statuses 204, 205 and 304 take no body.
+
+In the admin UI, **Hosts, Add 404 host** opens the site form with a 404
+response already filled in. You only need a domain (and a certificate, which
+is issued automatically as for any site). For a catch-all, use a wildcard
+such as `*.example.com`: an exact site always wins over the wildcard, so
+only subdomains with no site of their own get the 404.
+
+A request for a hostname that matches no site at all (for example a bare IP
+address or a domain nobody configured) is answered by the
+[Default site](#default-site) setting.
+
+### HSTS
+
+`hsts` makes every HTTPS response from the host carry
+`Strict-Transport-Security: max-age=63072000` (two years), which tells
+browsers to refuse plain HTTP for that name. `hsts_subdomains` adds
+`includeSubDomains`, so the rule covers every subdomain too: only turn it on
+if all of them serve HTTPS. The `preload` flag is deliberately not sent
+(NPM adds it), because preload-list inclusion is very hard to undo; add it
+yourself in the upstream if you have submitted the domain. Turn HSTS on only
+after you have confirmed the site works over HTTPS, since browsers remember
+it for the full period.
+
+### Default site
+
+**System, Default site** (or `GET`/`PUT /api/default-site`, admin only)
+chooses what a request gets when its hostname matches no site. This is NPM's
+Settings, Default Site.
+
+| `mode` | Result |
+|--------|--------|
+| `not_found` (default) | An empty `404` |
+| `congratulations` | A short "rust-proxy is running" page |
+| `no_response` | The connection is dropped without a reply (like NPM's 444) |
+| `redirect` | A redirect to `redirect_url` (an `http://` or `https://` URL) |
+| `custom_html` | Your own page from `custom_html` (up to 64 KiB) |
+
+It applies on plain HTTP (port 80) and on HTTPS for names that have a
+certificate. A TLS connection to a name rust-proxy holds no certificate for,
+or to a bare IP address with no server name, is refused during the handshake,
+before any page can be sent, so those visitors see a browser certificate
+error rather than the default site. A `*.example.com` fixed-response host
+still customises the answer for one domain.
+
+### Commercial license
+
+The About page has an optional field for a Commercial License key from
+store.jpps.us. Saving it checks the key once with the store and, if valid,
+shows "Commercial usage authorized" with the licensee and expiry. The key is
+stored (shown only as its last six characters) and is never re-checked, so
+nothing breaks if the store is unreachable later. It is a record, not a
+gate: rust-proxy works the same with or without it. `GET`, `PUT` (admin)
+and `DELETE` (admin) on `/api/license`; set `RUST_PROXY_LICENSE_SERVER` to
+point validation at a different store.
 
 ### Path rewrite
 

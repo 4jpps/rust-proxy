@@ -134,6 +134,10 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
         acme_contact_email,
         expose_admin_port,
     );
+    state.set_admin_allowed_ips(crate::db::load_admin_allowed_ips(state.db()).await?);
+    if let Some(site) = crate::db::load_default_site(state.db()).await? {
+        state.set_default_site(site);
+    }
     crate::acme::load_certs_from_disk(&state)?;
     let mut hosting_pools = crate::db::load_hosting_pools(state.db()).await?;
     let hosting_allocations = crate::db::load_hosting_allocations(state.db()).await?;
@@ -269,6 +273,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });

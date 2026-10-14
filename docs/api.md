@@ -8,6 +8,13 @@ either of two independent credentials:
 - **Session cookie**: what the web UI uses. `POST /api/login` with `{"username","password"}` sets an HTTP-only, `SameSite=Lax` cookie good for 12 hours. `POST /api/logout` clears it.
 - **API token**: `Authorization: Bearer <token>`, for scripts, CI and other tools.
 
+`GET /api/setup-status` returns `{configured, client_ip}` (`client_ip` only
+while unconfigured). `POST /api/setup` (only until an admin exists) takes
+`{username, password, acme_contact_email?, dns_credential?, admin_allowed_ips?,
+expose_admin_port?}`. `admin_allowed_ips` lists IPs or CIDRs allowed to reach
+the admin port and is rejected if it excludes the caller. Anything
+`config.toml` already sets is left alone.
+
 Every credential carries a **role** (`admin`, `operator` or `viewer`, see
 [Users and roles](users-and-roles.md)) and the role limits what it can
 reach. A token's role is chosen when it is minted and defaults to
@@ -70,7 +77,7 @@ Open to every signed-in role:
 
 ## Endpoints
 
-Errors are `{"error": "message"}` with `400`, `404`, `409` or `500`.
+Errors are `{"error": "message"}` with `400`, `404`, `409`, `500` or `502` (the license store was unreachable).
 `bind_ip_v4`/`bind_ip_v6` are checked against `network.bind_ranges`
 exactly as the UI's own submissions are. There is no separate, looser path
 for the API.
@@ -81,7 +88,7 @@ for the API.
 |--------|------|---------------|
 | GET | `/api/dashboard` | Counts of hosts, port rules and certificates, plus the configured `bind_ranges` |
 | GET | `/api/hosts` | |
-| POST | `/api/hosts` | See the field table in [Configuration](configuration.md#hosts): `domain`, `bind_ip_v4`, `bind_ip_v6`, `bind_port`, `upstream`, `upstream_https`, `upstream_tls_verify`, `upstream_preserve_host`, `websockets`, `force_https`, `acme_enabled`, `acme_challenge_type`, `acl_ids`, `dns_credential_id`, `redirect`, `path_rewrite`, `static_root`, `rewrite_samesite_none_cookies`, `pass_client_cert_header`, `deny_fallback`, `locations`, `block_exploits`, `fixed_response`, `enabled` |
+| POST | `/api/hosts` | See the field table in [Configuration](configuration.md#hosts): `domain`, `bind_ip_v4`, `bind_ip_v6`, `bind_port`, `upstream`, `upstream_https`, `upstream_tls_verify`, `upstream_preserve_host`, `websockets`, `force_https`, `acme_enabled`, `acme_challenge_type`, `acl_ids`, `dns_credential_id`, `redirect`, `path_rewrite`, `static_root`, `rewrite_samesite_none_cookies`, `pass_client_cert_header`, `deny_fallback`, `locations`, `block_exploits`, `fixed_response`, `hsts`, `hsts_subdomains`, `enabled` |
 | PUT | `/api/hosts/:id` | Same shape as POST |
 | DELETE | `/api/hosts/:id` | |
 | GET | `/api/port-rules` | |
@@ -127,7 +134,9 @@ Entries are removed with `DELETE` on the same path plus `/:entry_id` (or
 
 | Method | Path | Notes |
 |--------|------|-------|
-| GET, PUT | `/api/firewall-settings` | `{expose_admin_port, from_config}` |
+| GET, PUT | `/api/firewall-settings` | GET returns `{expose_admin_port, admin_allowed_ips, allowed_ips_from_config, from_config}`. PUT takes `{expose_admin_port?, admin_allowed_ips?}` (both optional, admin only). `admin_allowed_ips` is a list of IPs or CIDRs; empty allows any address. A list that excludes the caller's own non-loopback address is refused with 400. A value that `config.toml` sets is refused with 409. |
+| GET, PUT | `/api/default-site` | `{mode, redirect_url, custom_html}`. See [Default site](configuration.md#default-site) |
+| GET, PUT, DELETE | `/api/license` | PUT `{"license_key"}` validates once against the store. GET returns `{licensed, licensee, key_hint, expires_at, lifetime, validated_at}`, never the full key. See [Commercial license](configuration.md#commercial-license) |
 | GET, PUT | `/api/siem` | See [Logging and SIEM](logging-and-siem.md) |
 | POST | `/api/siem/test` | Sends a `siem_test` event |
 | | `/api/hosting/*` | See [Hosting](hosting.md) |

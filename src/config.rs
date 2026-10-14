@@ -712,6 +712,15 @@ pub struct ProxyHost {
     /// served from disk (the equivalent of NPM's "404 Host").
     #[serde(default)]
     pub fixed_response: Option<FixedResponse>,
+    /// Send `Strict-Transport-Security: max-age=63072000` on every HTTPS
+    /// response from this site (NPM's "HSTS Enabled"). Browsers then refuse
+    /// plain HTTP for it for two years, so only turn it on once HTTPS works.
+    #[serde(default)]
+    pub hsts: bool,
+    /// Adds `includeSubDomains` to the HSTS header (NPM's "HSTS
+    /// Subdomains"). Only valid together with `hsts`.
+    #[serde(default)]
+    pub hsts_subdomains: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -779,6 +788,63 @@ pub fn match_location<'a>(
         .max_by_key(|l| l.path.len())
 }
 
+pub const HSTS_MAX_AGE_SECS: u64 = 63_072_000;
+
+impl ProxyHost {
+    /// The `Strict-Transport-Security` header value, if HSTS is on.
+    pub fn hsts_header_value(&self) -> Option<String> {
+        self.hsts.then(|| {
+            if self.hsts_subdomains {
+                format!("max-age={HSTS_MAX_AGE_SECS}; includeSubDomains")
+            } else {
+                format!("max-age={HSTS_MAX_AGE_SECS}")
+            }
+        })
+    }
+}
+
+/// What a request gets when its hostname matches no site (NPM's
+/// Settings, Default Site).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultSiteMode {
+    Congratulations,
+    #[default]
+    NotFound,
+    NoResponse,
+    Redirect,
+    CustomHtml,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultSite {
+    #[serde(default)]
+    pub mode: DefaultSiteMode,
+    #[serde(default)]
+    pub redirect_url: String,
+    #[serde(default)]
+    pub custom_html: String,
+}
+
+impl DefaultSite {
+    pub const MAX_HTML: usize = 64 * 1024;
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.mode {
+            DefaultSiteMode::Redirect => validate_redirect_target(self.redirect_url.trim())
+                .map_err(|e| e.to_string()),
+            DefaultSiteMode::CustomHtml if self.custom_html.trim().is_empty() => {
+                Err("custom HTML mode needs some HTML".into())
+            }
+            _ if self.custom_html.len() > Self::MAX_HTML => Err(format!(
+                "custom HTML is too large (max {} bytes)",
+                Self::MAX_HTML
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// See `ProxyHost::fixed_response`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FixedResponse {
@@ -786,6 +852,9 @@ pub struct FixedResponse {
     pub status: u16,
     #[serde(default)]
     pub body: String,
+    /// Serve `body` as `text/html` (a landing page) instead of plain text.
+    #[serde(default)]
+    pub html: bool,
 }
 
 fn default_fixed_status() -> u16 {
@@ -956,9 +1025,10 @@ pub enum AclKind {
     /// A list of username/password_hash pairs; a login succeeds if it
     /// matches any entry across every `Login` list a host has selected.
     Login,
-    /// No entries of its own (unlike the other two kinds) -- selecting
-    /// a `ClientCert`-kind list means "a TrustBridge-issued client
-    /// certificate satisfies this host's login gate," checked against
+    /// A list of allowed certificate Subject CNs. A TrustBridge-issued
+    /// client certificate whose subject is on a selected list satisfies
+    /// this host's login gate. A list with no entries trusts no
+    /// certificate. Checked against
     /// the connection-level client cert `proxy::client_cert` already
     /// verified (or didn't -- absence just means this ACL doesn't
     /// match, same as a non-matching IP). See `proxy::mod::
@@ -1574,6 +1644,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1611,6 +1683,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1647,6 +1721,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1680,6 +1756,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1717,6 +1795,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1754,6 +1834,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1854,6 +1936,8 @@ gateway = "172.16.63.1"
                 locations: Vec::new(),
                 block_exploits: false,
                 fixed_response: None,
+                hsts: false,
+                hsts_subdomains: false,
             pass_client_cert_header: false,
                 enabled: true,
             });
@@ -1892,6 +1976,8 @@ gateway = "172.16.63.1"
                 locations: Vec::new(),
                 block_exploits: false,
                 fixed_response: None,
+                hsts: false,
+                hsts_subdomains: false,
             pass_client_cert_header: false,
                 enabled: true,
             });
@@ -1926,6 +2012,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1971,6 +2059,8 @@ gateway = "172.16.63.1"
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -2034,12 +2124,58 @@ gateway = "172.16.63.1"
 
     #[test]
     fn fixed_response_validation() {
-        let fr = |status, body: &str| FixedResponse { status, body: body.into() }.validate();
+        let fr = |status, body: &str| FixedResponse { status, body: body.into(), html: false }.validate();
         assert!(fr(404, "").is_ok());
         assert!(fr(200, "hello").is_ok());
         assert!(fr(99, "").is_err());
         assert!(fr(600, "").is_err());
         assert!(fr(204, "body").is_err());
         assert!(fr(404, &"x".repeat(FixedResponse::MAX_BODY + 1)).is_err());
+    }
+
+    #[test]
+    fn hsts_header_value_follows_the_flags() {
+        let mut h = test_hsts_host();
+        assert_eq!(h.hsts_header_value(), None);
+        h.hsts = true;
+        assert_eq!(h.hsts_header_value().as_deref(), Some("max-age=63072000"));
+        h.hsts_subdomains = true;
+        assert_eq!(
+            h.hsts_header_value().as_deref(),
+            Some("max-age=63072000; includeSubDomains")
+        );
+        // Subdomains alone never emits a header.
+        h.hsts = false;
+        assert_eq!(h.hsts_header_value(), None);
+    }
+
+    fn test_hsts_host() -> ProxyHost {
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "domain": "example.com",
+            "bind_ip_v4": "10.0.0.2",
+            "bind_port": 443,
+            "upstream": "127.0.0.1:8000"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn default_site_validation() {
+        let site = |mode, url: &str, html: &str| DefaultSite {
+            mode,
+            redirect_url: url.into(),
+            custom_html: html.into(),
+        };
+        assert!(site(DefaultSiteMode::NotFound, "", "").validate().is_ok());
+        assert!(site(DefaultSiteMode::Congratulations, "", "").validate().is_ok());
+        assert!(site(DefaultSiteMode::NoResponse, "", "").validate().is_ok());
+        assert!(site(DefaultSiteMode::Redirect, "https://www.example.com", "").validate().is_ok());
+        assert!(site(DefaultSiteMode::Redirect, "", "").validate().is_err());
+        assert!(site(DefaultSiteMode::Redirect, "javascript:alert(1)", "").validate().is_err());
+        assert!(site(DefaultSiteMode::CustomHtml, "", "   ").validate().is_err());
+        assert!(site(DefaultSiteMode::CustomHtml, "", "<p>x</p>").validate().is_ok());
+        let big = "x".repeat(DefaultSite::MAX_HTML + 1);
+        assert!(site(DefaultSiteMode::CustomHtml, "", &big).validate().is_err());
     }
 }

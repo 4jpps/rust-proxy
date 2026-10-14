@@ -96,10 +96,12 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
+    let mut admin = state.admin().clone();
+    admin.allowed_ips = state.admin_allowed_ips();
     let ruleset = generator::generate_ruleset(
         &hosts,
         &port_rules,
-        state.admin(),
+        &admin,
         state.expose_admin_port(),
         &rule_allow_ips,
         &state.network().dedicated_ips,

@@ -135,6 +135,19 @@ main{width:100%;max-width:1280px;margin:0 auto;padding:var(--s-5) var(--s-4) cal
 .list{list-style:none;margin:0;padding:0;display:grid;gap:var(--s-2)}
 .list li{display:flex;align-items:center;justify-content:space-between;gap:var(--s-3);padding:var(--s-2) 0;border-bottom:1px solid var(--border)}
 .list li:last-child{border-bottom:0}
+.entries li{padding:var(--s-3) 0;align-items:center}
+.entries li .grow{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.entries li .m{font-weight:600;overflow-wrap:anywhere}
+.entries li .sub{color:var(--text-faint);font-size:var(--fs-sm);overflow-wrap:anywhere}
+.entries li .btn{flex:none}
+.setup-group{border:1px solid var(--border);border-radius:8px;padding:var(--s-4);margin:0 0 var(--s-4);display:grid;gap:var(--s-3)}
+.setup-group h3{margin:0;font-size:var(--fs-sm);text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted)}
+.setup-group .chk{margin:0}.setup-group .help{display:block;margin-top:calc(var(--s-2) * -1)}
+.addbox{margin-top:var(--s-5);padding:var(--s-4);border:1px solid var(--border);border-radius:var(--radius, 8px);background:var(--surface-2, transparent)}
+.addbox h3{margin:0 0 var(--s-3);font-size:var(--fs-md, 1rem)}
+.entries li.editing{align-items:flex-end;flex-wrap:wrap}
+.entries li.editing .rowedit{flex:1 1 100%;margin-bottom:0}
+@media (max-width:520px){.entries li:not(.editing){flex-wrap:wrap}.entries li .grow{flex:1 1 100%}}
 .banner{display:flex;align-items:flex-start;gap:var(--s-3);padding:var(--s-3) var(--s-3);border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);margin-bottom:var(--s-4);font-size:var(--fs-sm)}
 .banner.error{border-color:var(--error);background:var(--error-soft)}.banner.warn{border-color:var(--warn);background:var(--warn-soft)}.banner.ok{border-color:var(--ok);background:var(--ok-soft)}
 .banner .grow{flex:1;min-width:0}
@@ -315,7 +328,7 @@ footer.foot{margin-top:var(--s-7);color:var(--text-faint);font-size:var(--fs-xs)
     <div class="logo">
       <svg aria-hidden="true"><use href="#rp-mark"/></svg>
       <div class="name">Rust<b>Proxy</b></div>
-      <div class="tag">First-time setup: no admin account exists yet. Create one below. You can add a DNS-01 credential now or later from Sites.</div>
+      <div class="tag">First-time setup: no admin account exists yet. Create one below and choose who can reach this admin page. You can add a DNS-01 credential now or later from Sites.</div>
     </div>
     <form id="setup-form" novalidate>
       <div class="field"><label for="setup-user" class="req">Admin username</label><input id="setup-user" type="text" name="username" value="admin" autocomplete="username" required aria-required="true"></div>
@@ -323,6 +336,14 @@ footer.foot{margin-top:var(--s-7);color:var(--text-faint);font-size:var(--fs-xs)
       <div class="field"><label for="setup-pass2" class="req">Confirm password</label><input id="setup-pass2" type="password" name="password_confirm" autocomplete="new-password" required aria-required="true"></div>
       <div class="field"><label for="setup-email">ACME contact email</label><input id="setup-email" type="email" name="acme_contact_email" placeholder="admin@yourdomain.com" autocomplete="email">
         <span class="help">Sent to Let's Encrypt when registering the ACME account. Required before any certificate can be issued. Can be changed later under System, ACME unless config.toml sets it.</span></div>
+      <div class="setup-group" role="group" aria-labelledby="setup-access-h"><h3 id="setup-access-h">Admin access</h3>
+        <div class="field"><label for="setup-ips">Only allow these addresses to reach the admin page</label>
+          <textarea id="setup-ips" name="admin_allowed_ips" rows="3" class="mono" placeholder="203.0.113.5&#10;10.0.0.0/8" spellcheck="false"></textarea>
+          <span class="help">One IP or CIDR per line. Leave empty to allow any address (the password is then the only gate). Enforced by the firewall, and loopback is always allowed. Admins can change this later under Firewall settings.</span>
+          <button type="button" class="btn sm" id="setup-ips-me" style="align-self:flex-start;margin-top:var(--s-2)" hidden></button></div>
+        <label class="chk"><input type="checkbox" id="setup-expose" name="expose_admin_port" checked> Expose the admin port through the firewall</label>
+        <span class="help">Off keeps the admin page reachable from this machine only.</span>
+      </div>
       <label class="chk"><input type="checkbox" id="setup-add-dns" name="add_dns"> Add a DNS-01 credential now</label>
       <div id="setup-dns-fields" class="fgrid" hidden>
         <div class="field"><label for="setup-dns-name">Credential name</label><input id="setup-dns-name" type="text" name="dns_name" placeholder="default"></div>
@@ -653,6 +674,8 @@ const LOADERS = {
   localIps: () => jget('/api/network/local-ips'),
   acme: () => jget('/api/acme-settings'),
   fw: () => jget('/api/firewall-settings'),
+  defsite: () => jget('/api/default-site'),
+  license: () => jget('/api/license'),
   siem: () => jget('/api/siem'),
   pools: () => jget('/api/hosting/pools'),
   allocs: () => jget('/api/hosting/allocations'),
@@ -720,7 +743,7 @@ const SECTIONS = {
   overview: { label: 'Overview', icon: 'overview', pages: null, render: pOverview, keys: ['dash', 'hosts', 'certs'] },
   sites: {
     label: 'Sites', icon: 'sites', pages: [
-      { id: 'hosts', label: 'Hosts', keys: ['hosts', 'certs', 'acls'], actions: [{ label: 'Add site', act: 'host-add' }], render: pHosts, after: afterHosts },
+      { id: 'hosts', label: 'Hosts', keys: ['hosts', 'certs', 'acls'], actions: [{ label: 'Add site', act: 'host-add' }, { label: 'Add 404 host', act: 'host-add-404', plain: true }], render: pHosts, after: afterHosts },
       { id: 'certs', label: 'Certificates', keys: ['certs', 'standalone', 'dnsCreds'], actions: [{ label: 'Upload certificate', act: 'cert-upload' }, { label: 'Issue DNS-01 certificate', act: 'cert-issue', plain: true }], render: pCerts },
       { id: 'dns', label: 'DNS credentials', write: 'admin', keys: ['dnsCreds'], actions: [{ label: 'Add credential', act: 'dns-add' }], render: pDns },
     ],
@@ -742,9 +765,10 @@ const SECTIONS = {
     label: 'System', icon: 'system', pages: [
       { id: 'users', label: 'Users', only: 'admin', keys: ['users'], actions: [{ label: 'Add user', act: 'user-add' }], render: pUsers },
       { id: 'tokens', label: 'API tokens', only: 'admin', keys: ['tokens'], actions: [{ label: 'New token', act: 'token-add' }], render: pTokens },
+      { id: 'defsite', label: 'Default site', write: 'admin', keys: ['defsite'], render: pDefaultSite, after: afterDefaultSite },
       { id: 'acme', label: 'ACME', write: 'admin', keys: ['acme'], render: pAcme, after: afterAcme },
       { id: 'siem', label: 'SIEM', write: 'admin', keys: ['siem'], render: pSiem, after: afterSiem },
-      { id: 'about', label: 'About', keys: ['dash'], render: pAbout },
+      { id: 'about', label: 'About', keys: ['dash', 'license'], render: pAbout, after: afterAbout },
     ],
   },
 };
@@ -852,6 +876,7 @@ function pOverview() {
 function hostTarget(h) {
   if (h.redirect) return `<span class="m">→ ${esc(h.redirect.target)}</span><span class="sub">redirect ${h.redirect.status === 'temporary' ? '302' : '301'}</span>`;
   if (h.static_root) return `<span class="m">${esc(h.static_root)}</span><span class="sub">static files</span>`;
+  if (h.fixed_response) return `<span class="m">${esc(h.fixed_response.status)} response</span><span class="sub">${h.fixed_response.status === 404 ? '404 host' : 'fixed response'}</span>`;
   return `<span class="m">${esc(h.upstream)}</span>${h.upstream_https ? `<span class="sub">https${h.upstream_tls_verify ? '' : ', unverified'}</span>` : ''}`;
 }
 function hostTls(h) {
@@ -888,6 +913,7 @@ function afterHosts(root) {
   inp.addEventListener('input', apply); apply();
 }
 ACTIONS['host-add'] = () => openHostDrawer(null);
+ACTIONS['host-add-404'] = () => openHostDrawer(null, { fixed_response: { status: 404, body: 'Not found' } });
 ACTIONS['host-edit'] = (el) => openHostDrawer(el.dataset.id);
 ACTIONS['host-del'] = async (el) => {
   const h = (D.hosts || []).find((x) => x.id === el.dataset.id); if (!h) return;
@@ -936,7 +962,10 @@ function hostFormHTML(h) {
       ${sel({ name: 'acme_challenge_type', label: 'Challenge type', value: h.acme_challenge_type, options: [['auto', 'auto (dns-01, falls back to http-01)'], ['http01', 'http-01 (needs port 80 reachable)'], ['dns01', 'dns-01 (needs a DNS credential)']] })}
       ${sel({ name: 'dns_credential_id', label: 'DNS credential (dns-01)', value: h.dns_credential_id || '', options: creds })}
     </div>
-    <div class="checks">${chk({ name: 'acme_enabled', label: 'Issue and renew a certificate automatically', checked: h.acme_enabled, help: 'Turn off to use a certificate you uploaded or one that already exists for this domain.' })}</div>
+    <div class="checks">${chk({ name: 'acme_enabled', label: 'Issue and renew a certificate automatically', checked: h.acme_enabled, help: 'Turn off to use a certificate you uploaded or one that already exists for this domain.' })}
+      ${chk({ name: 'hsts', label: 'HSTS enabled', checked: h.hsts, id: 'host-hsts', help: 'Sends Strict-Transport-Security for two years, so browsers refuse plain HTTP for this site. Turn on only once HTTPS works.' })}
+      <div id="host-hsts-sub-wrap">${chk({ name: 'hsts_subdomains', label: 'HSTS sub-domains', checked: h.hsts_subdomains, help: 'Adds includeSubDomains: every subdomain of this domain must also work over HTTPS.' })}</div>
+    </div>
   </fieldset>
   <fieldset><legend>Access</legend>
     ${acls.length ? `<div class="pick" role="group" aria-label="Access lists">${acls.map((a) => chk({ name: 'acl_ids', value: a.id, label: `${a.name} (${aclKindLabel(a.kind)})`, checked: sel_.has(a.id) })).join('')}</div>
@@ -971,10 +1000,11 @@ function hostFormHTML(h) {
     <fieldset><legend>Custom locations</legend>
       ${ta({ name: 'locations', label: 'Send some paths to a different upstream (one per line)', value: (h.locations || []).map((l) => `${l.path} ${l.upstream}${l.upstream_https ? (l.upstream_tls_verify ? ' https' : ' https-insecure') : ''}`).join('\n'), rows: 3, mono: true, placeholder: '/api 10.0.0.5:9000\n/admin 10.0.0.6:8443 https-insecure', help: 'Format: /path host:port, optionally followed by https or https-insecure (accept a self-signed certificate). The longest matching path wins; everything else goes to the main upstream. The path is forwarded unchanged.' })}
     </fieldset>
-    <fieldset><legend>Fixed response (overrides everything else)</legend>
+    <fieldset><legend>Fixed response / 404 host (overrides everything else)</legend>
       <div class="fgrid">
-        ${fld({ name: 'fr_status', label: 'Status code', type: 'number', value: h.fixed_response ? h.fixed_response.status : '', placeholder: '404', attrs: 'min="200" max="599"', help: 'Leave blank to proxy normally. Visitors who pass the access rules get this status and message instead of the site, like a "404 Host".' })}
-        ${ta({ name: 'fr_body', label: 'Message (plain text)', value: h.fixed_response ? h.fixed_response.body : '', rows: 2, wide: true })}
+        ${fld({ name: 'fr_status', label: 'Status code', type: 'number', value: h.fixed_response ? h.fixed_response.status : '', placeholder: '404', attrs: 'min="200" max="599"', help: 'Leave blank to proxy normally. Visitors who pass the access rules get this status and message instead of the site. Use 404 for a "404 host" (see Add 404 host). A wildcard domain such as *.example.com answers every subdomain that has no site of its own.' })}
+        ${ta({ name: 'fr_body', label: 'Message or landing page', value: h.fixed_response ? h.fixed_response.body : '', rows: 4, wide: true })}
+        <div class="checks">${chk({ name: 'fr_html', label: 'Body is HTML (a landing page)', checked: !!(h.fixed_response && h.fixed_response.html), help: 'Serve the message as a web page instead of plain text. Use this to park a site: a 404 host with an HTML "coming soon" page until the real site is ready.' })}</div>
       </div>
     </fieldset>
     <fieldset><legend>Protection</legend>
@@ -1010,7 +1040,8 @@ function collectHost(form) {
     } : null,
     locations: parseLocations(fd.get('locations') || ''),
     block_exploits: on('block_exploits'),
-    fixed_response: String(fd.get('fr_status') || '').trim() ? { status: Number(fd.get('fr_status')), body: fd.get('fr_body') || '' } : null,
+    hsts: on('hsts'), hsts_subdomains: on('hsts') && on('hsts_subdomains'),
+    fixed_response: String(fd.get('fr_status') || '').trim() ? { status: Number(fd.get('fr_status')), body: fd.get('fr_body') || '', html: on('fr_html') } : null,
     enabled: on('enabled'),
   };
 }
@@ -1020,8 +1051,8 @@ function parseLocations(text) {
     return { path, upstream: upstream || '', upstream_https: mode === 'https' || mode === 'https-insecure', upstream_tls_verify: mode !== 'https-insecure' };
   });
 }
-const HOST_DEFAULTS = { domain: '', bind_ip_v4: '0.0.0.0', bind_ip_v6: '::', bind_port: 443, upstream: '', upstream_https: false, upstream_tls_verify: true, upstream_preserve_host: true, websockets: false, force_https: true, enabled: true, acme_enabled: true, acme_challenge_type: 'auto', acl_ids: [], rewrite_samesite_none_cookies: false, pass_client_cert_header: false, deny_fallback: null, locations: [], block_exploits: false, fixed_response: null };
-async function openHostDrawer(id) {
+const HOST_DEFAULTS = { domain: '', bind_ip_v4: '0.0.0.0', bind_ip_v6: '::', bind_port: 443, upstream: '', upstream_https: false, upstream_tls_verify: true, upstream_preserve_host: true, websockets: false, force_https: true, enabled: true, acme_enabled: true, acme_challenge_type: 'auto', acl_ids: [], rewrite_samesite_none_cookies: false, pass_client_cert_header: false, deny_fallback: null, locations: [], block_exploits: false, fixed_response: null, hsts: false, hsts_subdomains: false };
+async function openHostDrawer(id, preset) {
   await ensure(['localIps', 'dnsCreds', 'acls', 'certs']);
   let host = null;
   if (id) {
@@ -1032,13 +1063,16 @@ async function openHostDrawer(id) {
     } catch (e) { fail(e); return; }
   }
   openDrawer({
-    title: host ? `Edit ${host.domain}` : 'Add site',
-    submitLabel: host ? 'Save changes' : 'Add site',
-    body: hostFormHTML(host || HOST_DEFAULTS),
+    title: host ? `Edit ${host.domain}` : (preset ? 'Add 404 host' : 'Add site'),
+    submitLabel: host ? 'Save changes' : (preset ? 'Add 404 host' : 'Add site'),
+    body: hostFormHTML(host || { ...HOST_DEFAULTS, ...(preset || {}) }),
     onOpen: (root) => {
       const https = $('#host-upstream-https', root), wrap = $('#host-upstream-tls-verify-wrap', root);
       const sync = () => { wrap.hidden = !https.checked; };
       https.addEventListener('change', sync); sync();
+      const hsts = $('#host-hsts', root), hstsSub = $('#host-hsts-sub-wrap', root);
+      const syncHsts = () => { hstsSub.hidden = !hsts.checked; };
+      hsts.addEventListener('change', syncHsts); syncHsts();
       const dom = $('input[name=domain]', root), hint = $('#host-existing-cert-hint', root);
       const showHint = () => {
         const c = certFor(dom.value);
@@ -1452,7 +1486,7 @@ ACTIONS['acl-add'] = () => openDrawer({
     ${sel({ name: 'kind', label: 'Type', wide: true, options: [['ip_allow', 'IP allow (source address)'], ['login', 'Login (username and password)'], ['client_cert', 'Client certificate (TrustBridge)']] })}</div>
     <div id="acl-kind-ip" style="margin-top:var(--s-4)">${ta({ name: 'ip_entries', label: 'Allowed IPs or CIDRs (one per line)', rows: 4, help: 'For example 10.0.0.0/24. Add descriptions later under Manage entries.' })}</div>
     <div id="acl-kind-login" style="margin-top:var(--s-4)" hidden><div id="cred-rows">${credRowHTML()}</div><button type="button" class="btn sm" id="cred-add">${icon('plus')}Add login</button></div>
-    <p class="help" id="acl-kind-cert" style="margin-top:var(--s-4)" hidden>With no entries, any valid TrustBridge-issued client certificate qualifies. Add specific Subject CNs afterwards under Manage entries to restrict it.</p>`,
+    <p class="help" id="acl-kind-cert" style="margin-top:var(--s-4)" hidden>Only certificates whose Subject CN you list are trusted. Add at least one Subject CN under Manage entries after creating the list: with no entries, no certificate is trusted.</p>`,
   onOpen: (root) => {
     const k = $('select[name=kind]', root);
     const sync = () => { $('#acl-kind-ip', root).hidden = k.value !== 'ip_allow'; $('#acl-kind-login', root).hidden = k.value !== 'login'; $('#acl-kind-cert', root).hidden = k.value !== 'client_cert'; };
@@ -1495,14 +1529,14 @@ ACTIONS['acl-manage'] = (el) => {
   MANAGE.id = a.id; MANAGE.kind = a.kind;
   const spec = ENTRY[a.kind];
   const hint = a.kind === 'login' ? 'Each row is one username and password a visitor can sign in with.'
-    : a.kind === 'client_cert' ? 'Each row is one allowed certificate Subject CN (issued from pki.jpps.us). With zero rows, ANY valid TrustBridge-issued client certificate satisfies this list. Add rows to restrict it to specific certificates.'
+    : a.kind === 'client_cert' ? 'Each row is one allowed certificate Subject CN (issued from pki.jpps.us). Only certificates whose Subject CN is listed are trusted. With zero rows, no certificate is trusted.'
     : 'Each row is one allowed source IP or CIDR.';
   openDrawer({
     title: `Manage ${a.name}`,
     body: `<p class="lead">${esc(hint)}</p>
       <ul class="list entries" id="manage-list" aria-live="polite"><li class="faint">Loading…</li></ul>
       <form id="manage-add" class="addbox" novalidate><h3>Add entry</h3><div class="fgrid">
-        <div class="field"><label for="ma-main" class="req">${esc(spec.mainLabel)}</label><input id="ma-main" type="text" name="main" placeholder="${esc(spec.ph)}" required></div>
+        <div class="field wide"><label for="ma-main" class="req">${esc(spec.mainLabel)}</label><input id="ma-main" type="text" name="main" placeholder="${esc(spec.ph)}" required></div>
         ${a.kind === 'login' ? '<div class="field"><label for="ma-pw" class="req">Password</label><input id="ma-pw" type="password" name="password" autocomplete="new-password" required></div>' : ''}
         <div class="field wide"><label for="ma-desc">Description (optional)</label><input id="ma-desc" type="text" name="description"></div></div>
         <p class="form-error" id="manage-error" role="alert" hidden></p>
@@ -1548,15 +1582,41 @@ ACTIONS['acl-manage'] = (el) => {
 /* ------------------------------------------------------------ settings */
 function noteBanner(text) { return text ? `<div class="banner warn"><div class="grow">${esc(text)}</div></div>` : ''; }
 function pFirewall() {
-  const s = D.fw;
-  return `${noteBanner(s.from_config ? "Set via config.toml's admin.expose_admin_port, which always takes precedence. Edit it there instead." : '')}
-  <form id="fw-form" class="card settings" novalidate><h2>Admin port exposure</h2>
+  const s = D.fw, ipsLocked = s.allowed_ips_from_config;
+  return `${noteBanner(s.from_config ? "Set via config.toml's admin.expose_admin_port, which always takes precedence. Edit it there instead." : '')}${noteBanner(ipsLocked ? "The allowed addresses are set in config.toml (admin.allowed_ips), which always takes precedence. Edit them there instead." : '')}
+  <form id="fw-form" class="card settings" novalidate><h2>Admin port</h2>
     <div class="checks">${chk({ name: 'expose_admin_port', label: 'Expose the admin port through the firewall', checked: s.expose_admin_port, help: 'Off keeps the admin API reachable from this machine only.' }).replace('<input', s.from_config ? '<input disabled' : '<input')}</div>
-    <div class="form-actions"><button type="submit" class="btn primary"${s.from_config ? ' disabled' : ''}>Save</button></div></form>`;
+    <div class="fgrid">${ta({ name: 'admin_allowed_ips', label: 'Allowed addresses', value: (s.admin_allowed_ips || []).join('\n'), rows: 5, mono: true, wide: true, help: 'One IP or CIDR per line. Empty allows any address. Loopback is always allowed. Saving a list that excludes your own address is refused so you cannot lock yourself out.' }).replace('<textarea', ipsLocked ? '<textarea disabled' : '<textarea')}</div>
+    <div class="form-actions"><button type="submit" class="btn primary"${s.from_config && ipsLocked ? ' disabled' : ''}>Save</button></div></form>`;
 }
 function afterFirewall(root) {
   const f = $('#fw-form', root); if (!f) return;
-  pageForm(f, async () => { await send('PUT', '/api/firewall-settings', { expose_admin_port: f.expose_admin_port.checked }); toast('Firewall settings saved', 'ok'); await refresh('fw'); });
+  pageForm(f, async () => {
+    const body = {};
+    if (!f.expose_admin_port.disabled) body.expose_admin_port = f.expose_admin_port.checked;
+    if (!f.admin_allowed_ips.disabled) body.admin_allowed_ips = lines(f.admin_allowed_ips.value);
+    await send('PUT', '/api/firewall-settings', body); toast('Firewall settings saved', 'ok'); await refresh('fw');
+  });
+}
+function pDefaultSite() {
+  const s = D.defsite;
+  return `<form id="defsite-form" class="card settings" novalidate><h2>Default site</h2>
+    <p class="lead">What to show when a request arrives for a hostname that matches no site. Plain-HTTP requests and HTTPS requests whose name is covered by one of your certificates reach this. A TLS connection for a name with no certificate at all is refused before any page can be shown.</p>
+    <div class="fgrid">
+      ${sel({ name: 'mode', label: 'Unknown hostname', value: s.mode, wide: true, options: [['not_found', '404 page'], ['congratulations', 'Congratulations page'], ['no_response', 'No response (444, close the connection)'], ['redirect', 'Redirect'], ['custom_html', 'Custom HTML']] })}
+      <div class="wide" id="defsite-redirect">${fld({ name: 'redirect_url', label: 'Redirect to', value: s.redirect_url || '', placeholder: 'https://www.example.com', mono: true, wide: true })}</div>
+      <div class="wide" id="defsite-html">${ta({ name: 'custom_html', label: 'Custom HTML', value: s.custom_html || '', rows: 8, help: 'Served as-is with status 200. Up to 64 KiB.' })}</div>
+    </div>
+    <div class="form-actions"><button type="submit" class="btn primary">Save</button></div></form>`;
+}
+function afterDefaultSite(root) {
+  const f = $('#defsite-form', root); if (!f) return;
+  const sync = () => { $('#defsite-redirect', root).hidden = f.mode.value !== 'redirect'; $('#defsite-html', root).hidden = f.mode.value !== 'custom_html'; };
+  f.mode.addEventListener('change', sync); sync();
+  pageForm(f, async () => {
+    await send('PUT', '/api/default-site', { mode: f.mode.value, redirect_url: f.redirect_url.value.trim(), custom_html: f.custom_html.value });
+    toast('Default site saved', 'ok'); await refresh('defsite');
+  });
 }
 function pAcme() {
   const s = D.acme;
@@ -1687,10 +1747,34 @@ $('#pw-btn').addEventListener('click', () => openDrawer({
   },
 }));
 
+function licenseCard() {
+  const l = D.license;
+  if (!l) return '';
+  const isAdmin = hasRole('admin');
+  if (l.licensed) {
+    const term = l.lifetime ? 'lifetime license' : (l.expires_at ? `valid until ${fmtDate(l.expires_at)}` : '');
+    return `<div class="card" style="margin-top:var(--s-4)"><h2>Commercial License ${pill('ok', 'Commercial usage authorized')}</h2>
+      <p class="lead">Licensed to <b>${esc(l.licensee)}</b>${term ? `, ${esc(term)}` : ''}. Key ${esc(l.key_hint)}, checked ${esc(fmtDate(l.validated_at))}.</p>
+      ${isAdmin ? '<div class="form-actions"><button type="button" class="btn danger" data-act="license-remove">Remove license</button></div>' : ''}</div>`;
+  }
+  if (!isAdmin) return '';
+  return `<form id="license-form" class="card settings" style="margin-top:var(--s-4)" novalidate><h2>Commercial License</h2>
+    <p class="lead">RustProxy is free under the AGPL-3.0. If you bought a Commercial License, enter its key once to record it here. The key is checked a single time against store.jpps.us and nothing in the proxy depends on it.</p>
+    <div class="fgrid">${fld({ name: 'license_key', label: 'License key', placeholder: 'lic-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx', mono: true, wide: true, required: true, attrs: 'autocomplete="off" spellcheck="false"' })}</div>
+    <div class="form-actions"><button type="submit" class="btn primary">Validate license</button></div></form>`;
+}
+ACTIONS['license-remove'] = async () => {
+  if (!await confirmAsync({ title: 'Remove license', body: 'Forget the recorded license key on this proxy? The key stays valid and can be entered again.', confirmLabel: 'Remove license' })) return;
+  try { await send('DELETE', '/api/license'); toast('License removed', 'ok'); await refresh('license'); } catch (e) { fail(e); }
+};
+function afterAbout(root) {
+  const f = $('#license-form', root); if (!f) return;
+  pageForm(f, async () => { await send('PUT', '/api/license', { license_key: f.license_key.value.trim() }); toast('Commercial usage authorized', 'ok'); await refresh('license'); });
+}
 function pAbout() {
   const d = D.dash;
   return `<div class="card"><h2>RustProxy</h2><dl class="kvs">${kv('Version', UI.version ? 'v' + UI.version : 'unknown')}${kv('Sites', `${d.host_count} (${d.enabled_host_count} enabled)`)}${kv('Port rules', d.port_rule_count)}${kv('Certificates', d.cert_count)}${kv('Bind ranges', d.bind_ranges.join(', ') || 'unrestricted')}</dl>
-    <p class="faint" style="margin-top:var(--s-4);font-size:var(--fs-xs)">&copy; 2026 Jeff Parrish PC Services LLC</p></div>`;
+    <p class="faint" style="margin-top:var(--s-4);font-size:var(--fs-xs)">&copy; 2026 Jeff Parrish PC Services LLC</p></div>${licenseCard()}`;
 }
 
 /* ----------------------------------------------------- auth, boot, nav */
@@ -1759,7 +1843,9 @@ setupForm.addEventListener('submit', async (e) => {
   if (!validateForm(setupForm)) return;
   const fd = new FormData(setupForm), password = fd.get('password');
   if (password !== fd.get('password_confirm')) { err.textContent = 'Passwords do not match.'; err.hidden = false; return; }
-  const body = { username: fd.get('username'), password };
+  const body = { username: fd.get('username'), password, expose_admin_port: $('#setup-expose').checked };
+  const ips = lines(fd.get('admin_allowed_ips'));
+  if (ips.length) body.admin_allowed_ips = ips;
   if (fd.get('acme_contact_email')) body.acme_contact_email = fd.get('acme_contact_email');
   if (fd.get('add_dns') === 'on' && fd.get('dns_name')) {
     const provider = fd.get('dns_provider'), token = packDnsCredentialToken($('#setup-dns-cred-fields'), provider);
@@ -1777,7 +1863,10 @@ setupForm.addEventListener('submit', async (e) => {
   if (!location.hash) history.replaceState(null, '', '#/overview');
   try {
     const st = await (await fetch('/api/setup-status')).json();
-    if (!st.configured) { showSetup(); return; }
+    if (!st.configured) {
+      if (st.client_ip) { const b = $('#setup-ips-me'); b.textContent = `Add my address (${st.client_ip})`; b.hidden = false; b.onclick = () => { const t = $('#setup-ips'); if (!lines(t.value).includes(st.client_ip)) t.value = (t.value.trim() ? t.value.trim() + '\n' : '') + st.client_ip; }; }
+      showSetup(); return;
+    }
   } catch (_) { /* fall through to the session probe */ }
   try { await jget('/api/dashboard'); showApp(); } catch (_) { if (!AUTHED && $('#app').hidden && $('#login-screen').hidden) showLogin(); }
 })();

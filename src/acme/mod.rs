@@ -809,6 +809,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         }

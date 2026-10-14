@@ -49,6 +49,8 @@ const ADMIN_WRITE_PATHS: &[&str] = &[
     "/api/acme-settings",
     "/api/firewall-settings",
     "/api/siem",
+    "/api/license",
+    "/api/default-site",
     "/api/hosting/pools",
 ];
 

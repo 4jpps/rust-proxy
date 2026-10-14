@@ -33,7 +33,7 @@ Some areas are admin-only so that an operator cannot widen their own access:
 |------|-------|----------|--------|
 | Users (`/api/users`) | read, write | none | none |
 | API tokens (`/api/tokens`) | read, write | none | none |
-| DNS credentials, ACME settings, firewall settings, SIEM, hosting pools | read, write | read | read |
+| DNS credentials, ACME settings, firewall settings, SIEM, hosting pools, default site, commercial license | read, write | read | read |
 | Everything else (hosts, port rules, ACLs, certificates, allocations) | read, write | read, write | read |
 
 In the web UI, pages a role cannot use are hidden, and a viewer sees the
@@ -56,7 +56,12 @@ curl -b /tmp/cookies -X POST https://proxy.example.com/api/users \
 ```
 
 From the Users tab an admin can also change a user's role, disable or
-re-enable them, reset their password, or delete them.
+re-enable them, reset their password, or delete them. One rule applies:
+**an admin cannot change or reset another admin's password**. The request is
+refused with a 403. An admin changes their own password from the header, and
+operators' and viewers' passwords can be reset by any admin. Only the owner can demote another admin, so the rule cannot be sidestepped
+by demoting first. If an admin is locked out, the owner demotes them, resets the password, and promotes them
+again, or deletes and recreates the account.
 
 ## Changes take effect immediately
 

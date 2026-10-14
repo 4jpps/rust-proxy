@@ -33,30 +33,34 @@ If it is not running, `sudo systemctl enable --now rust-proxy`.
 You can also download a release `.deb` from the project's Releases page
 and `dpkg -i` it, or [build from source](deployment.md).
 
-## 2. Restrict the admin port
+## 2. Run the first-run wizard
 
-On a fresh install the admin UI listens on `0.0.0.0:8084` and the
-firewall leaves that port open to any source. That is what lets the
-setup wizard work with no config edits, and it means anyone who can reach
-the port can claim the admin account until you create it.
+Open `http://<host-ip>:8084/`. On a fresh install the admin UI listens on
+`0.0.0.0:8084` and the firewall leaves that port open to any source, which
+is what lets the wizard work with no config edits. It also means anyone who
+can reach the port could claim the admin account first, so do this promptly.
 
-Two ways to close it:
+There is no default password. The wizard asks you to choose:
 
-- Set `admin.allowed_ips` in `/etc/rust-proxy/config.toml` to your management network, for example `allowed_ips = ["192.168.1.0/24"]`, then `sudo systemctl restart rust-proxy`. This is enforced in nftables, not just in the app.
-- Or turn off "Expose the admin port via the firewall" in the admin UI (or set `admin.expose_admin_port = false`) and reach the UI through an SSH tunnel: `ssh -L 8084:127.0.0.1:8084 you@host`, then browse to `http://127.0.0.1:8084/`.
+- the admin username and password (stored in the runtime database, not the config file),
+- the ACME contact email,
+- **who may reach the admin page**: a list of IPs or CIDRs enforced in nftables, with an "Add my address" button, and whether to expose the admin port through the firewall at all,
+- optionally, a DNS credential.
 
-Do this right after step 3, once the admin account exists.
+A list that leaves out your own address is refused, so you cannot lock
+yourself out. Admins can change both settings later under Network,
+Firewall settings. If `admin.allowed_ips` or `admin.expose_admin_port` is
+set in `config.toml`, that value wins and the wizard leaves it alone.
 
-## 3. Run the first-run wizard
-
-Open `http://<host-ip>:8084/`. The wizard asks you to create the admin
-account, and optionally to add a DNS credential. Your admin identity is
-stored in the runtime database, not the config file.
+If you leave the list empty the admin port stays open to any source, so
+set it. To reach the UI only through an SSH tunnel instead, turn off
+"Expose the admin port through the firewall" and use
+`ssh -L 8084:127.0.0.1:8084 you@host`, then browse to `http://127.0.0.1:8084/`.
 
 Prefer to keep the admin identity in `config.toml`? See
 [Configuration](configuration.md#admin-identity-in-configtoml).
 
-## 4. Add a DNS credential (dns-01 only)
+## 3. Add a DNS credential (dns-01 only)
 
 Skip this if you will use http-01. Otherwise, add one under "DNS
 credentials" in the admin UI. [Configuration](configuration.md#dns-providers)
@@ -66,14 +70,14 @@ zone.
 
 ![The DNS credentials tab, listing one named Cloudflare credential.](screenshots/dns-credentials.png)
 
-## 5. Add your first host
+## 4. Add your first host
 
 On the Hosts tab, under "Add a host":
 
 1. **Domain:** `app.example.com`.
 2. **Upstream:** `127.0.0.1:8000`, the internal service as `host:port`.
 3. Leave "Issue/renew a certificate automatically" checked.
-4. Pick the challenge type (`auto` is a good default) and, for dns-01, the credential from step 4.
+4. Pick the challenge type (`auto` is a good default) and, for dns-01, the credential from step 3.
 5. Click "Add host".
 
 The certificate is requested in the background and renewed
@@ -90,7 +94,7 @@ curl -X POST https://proxy.example.com/api/hosts \
 
 ![The Sites page after adding hosts, each showing a valid certificate.](screenshots/hosts-list.png)
 
-## 6. Check it works
+## 5. Check it works
 
 ```sh
 curl -I https://app.example.com/

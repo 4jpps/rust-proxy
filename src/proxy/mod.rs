@@ -219,7 +219,7 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                     let sni = sni.clone();
                     let client_cert_subject = client_cert_subject.clone();
                     async move {
-                        handle_https_request(
+                        match handle_https_request(
                             state,
                             bind_ip,
                             bind_port,
@@ -229,6 +229,10 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                             req,
                         )
                         .await
+                        {
+                            Ok(resp) => deliver(resp),
+                            Err(never) => match never {},
+                        }
                     }
                 });
                 // `auto::Builder` sniffs the connection preface to pick
@@ -455,6 +459,43 @@ async fn route_https_request(
     client_cert_subject: Option<String>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    // Same precedence as the routing decision below: the request's own
+    // declared host beats the connection's SNI.
+    let lookup_name = req
+        .uri()
+        .host()
+        .map(|s| s.to_string())
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| sni.clone());
+    let hsts = lookup_name.as_deref().and_then(|name| {
+        router::match_host(&state.hosts(), bind_ip, bind_port, name).and_then(|h| h.hsts_header_value())
+    });
+    let mut result =
+        route_https_request_inner(state, bind_ip, bind_port, peer_ip, sni, client_cert_subject, req)
+            .await;
+    if let (Some(value), Ok(resp)) = (hsts, result.as_mut()) {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
+            resp.headers_mut()
+                .insert(hyper::header::STRICT_TRANSPORT_SECURITY, value);
+        }
+    }
+    result
+}
+
+async fn route_https_request_inner(
+    state: AppState,
+    bind_ip: IpAddr,
+    bind_port: u16,
+    peer_ip: IpAddr,
+    sni: Option<String>,
+    client_cert_subject: Option<String>,
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     // Real HTTP/2 clients (every modern browser) send the target host
     // as the `:authority` pseudo-header, not a literal `Host:` header --
     // hyper/h2 surfaces that in `req.uri()`'s authority component, not
@@ -523,7 +564,7 @@ async fn route_https_request(
     );
 
     let Some(host) = matched else {
-        return Ok(not_found());
+        return Ok(default_site_response(&state.default_site()));
     };
 
     // Never let a client set this header itself -- only ever set below,
@@ -564,19 +605,16 @@ async fn route_https_request(
     // by the time client_cert_subject is `Some`, rustls has already
     // verified the cert chains to TrustBridge's root (see
     // client_cert.rs's module doc); this only checks whether the host
-    // actually opted into treating that as sufficient. When the
-    // selected ClientCert ACL(s) have zero subject entries, any
-    // verified cert passes (the original, still-supported behavior);
-    // once entries exist, the presented subject must be one of them --
-    // see `db::ResolvedAcls::allowed_client_cert_subjects`'s doc
-    // comment.
+    // actually opted into treating that as sufficient, and the presented
+    // subject must be one of the listed entries. A list with no entries
+    // trusts no certificate (fail closed) -- see
+    // `db::ResolvedAcls::allowed_client_cert_subjects`'s doc comment.
     let client_cert_ok = resolved_acls.has_client_cert_acl
         && client_cert_subject.as_deref().is_some_and(|subject| {
-            resolved_acls.allowed_client_cert_subjects.is_empty()
-                || resolved_acls
-                    .allowed_client_cert_subjects
-                    .iter()
-                    .any(|s| s == subject)
+            resolved_acls
+                .allowed_client_cert_subjects
+                .iter()
+                .any(|s| s == subject)
         });
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
     if host.block_exploits {
@@ -951,9 +989,18 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
                 let state = state.clone();
                 async move {
                     if let Some(resp) = http::http01_challenge_response(&state, &req) {
-                        return Ok::<_, std::convert::Infallible>(resp);
+                        return Ok::<_, ServiceError>(resp);
                     }
-                    Ok::<_, std::convert::Infallible>(http::https_redirect_response(&req))
+                    let known = req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|h| router::host_is_known(&state.hosts(), h));
+                    if known {
+                        Ok(http::https_redirect_response(&req))
+                    } else {
+                        deliver(default_site_response(&state.default_site()))
+                    }
                 }
             });
             tokio::spawn(async move {
@@ -1050,6 +1097,65 @@ fn resolve_upstream(upstream: &str) -> Result<SocketAddr, std::io::Error> {
     })
 }
 
+/// Marks a response that must not be sent: the connection is closed
+/// instead (NPM's "No Response (444)").
+#[derive(Clone, Copy)]
+struct DropConnection;
+
+type ServiceError = std::io::Error;
+
+fn deliver(resp: Response<BoxBody<Bytes, hyper::Error>>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ServiceError> {
+    if resp.extensions().get::<DropConnection>().is_some() {
+        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "default site: no response (444)"));
+    }
+    Ok(resp)
+}
+
+const HTML_RESPONSE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data: http: https:; font-src data: https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+const CONGRATULATIONS_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Congratulations</title><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:12vh auto;padding:0 1rem;color:#222}h1{font-size:1.6rem}</style></head><body><h1>Congratulations!</h1><p>RustProxy is running. No site is configured for this address yet.</p></body></html>\n";
+
+pub(crate) fn default_site_response(site: &crate::config::DefaultSite) -> Response<BoxBody<Bytes, hyper::Error>> {
+    use crate::config::DefaultSiteMode as M;
+    let html = |status: hyper::StatusCode, body: String| {
+        Response::builder()
+            .status(status)
+            .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(hyper::header::CACHE_CONTROL, "no-store")
+            .header("x-content-type-options", "nosniff")
+            .header("content-security-policy", HTML_RESPONSE_CSP)
+            .body(
+                http_body_util::Full::new(Bytes::from(body))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .expect("default site response is always valid")
+    };
+    match site.mode {
+        M::NotFound => not_found_page(),
+        M::Congratulations => html(hyper::StatusCode::OK, CONGRATULATIONS_HTML.to_string()),
+        M::CustomHtml => html(hyper::StatusCode::OK, site.custom_html.clone()),
+        M::Redirect => match hyper::header::HeaderValue::from_str(site.redirect_url.trim()) {
+            Ok(loc) => Response::builder()
+                .status(hyper::StatusCode::FOUND)
+                .header(hyper::header::LOCATION, loc)
+                .header(hyper::header::CACHE_CONTROL, "no-store")
+                .body(
+                    http_body_util::Empty::new()
+                        .map_err(|e: std::convert::Infallible| match e {})
+                        .boxed(),
+                )
+                .expect("default site redirect is always valid"),
+            Err(_) => not_found_page(),
+        },
+        M::NoResponse => {
+            let mut resp = not_found();
+            resp.extensions_mut().insert(DropConnection);
+            resp
+        }
+    }
+}
+
 fn not_found() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(hyper::StatusCode::NOT_FOUND)
@@ -1072,8 +1178,13 @@ fn fixed_response_page(
     };
     Response::builder()
         .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            hyper::header::CONTENT_TYPE,
+            if fixed.html { "text/html; charset=utf-8" } else { "text/plain; charset=utf-8" },
+        )
         .header(hyper::header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header("content-security-policy", HTML_RESPONSE_CSP)
         .body(
             http_body_util::Full::new(body)
                 .map_err(|never| match never {})
@@ -1506,6 +1617,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1989,6 +2102,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2050,6 +2165,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2080,6 +2197,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: true,
             enabled: true,
         }
@@ -2228,12 +2347,10 @@ mod tests {
         );
     }
 
-    /// The core of Jeff's ask: a valid client cert (verified at the TLS
-    /// layer before this handler ever runs -- see client_cert.rs) skips
-    /// the login gate entirely, even though a Login ACL is also
-    /// selected on this host.
+    /// A ClientCert ACL with no subject entries trusts no certificate: a
+    /// valid cert alone does not skip the login gate.
     #[tokio::test]
-    async fn a_presented_client_cert_bypasses_the_login_gate_when_a_client_cert_acl_is_selected() {
+    async fn a_client_cert_acl_with_no_entries_trusts_no_certificate() {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
         state.set_hosts(vec![host]);
@@ -2244,11 +2361,12 @@ mod tests {
             Some("Jeffs MacBook".to_string()),
         )
         .await;
-        // Upstream is unreachable (127.0.0.1:1), same "proves the gate
-        // let it through" signal send_test_request's own IP-allow tests
-        // use -- a BAD_GATEWAY here means it got past both ACL checks
-        // and tried to actually proxy the request.
-        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        let body = response_text(resp).await;
+        assert!(
+            body.contains("Sign in to example.com"),
+            "an empty client-cert list must not let any certificate bypass the login page"
+        );
     }
 
     /// Same host, but the ClientCert ACL now has one subject entry --
@@ -2444,6 +2562,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2527,12 +2647,38 @@ mod tests {
         host.fixed_response = Some(crate::config::FixedResponse {
             status: 404,
             body: "no such site".into(),
+            html: false,
         });
         let state = test_state_with_host(host).await;
         let resp = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/x", None, None).await;
         assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
         let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
         assert_eq!(&body[..], b"no such site");
+    }
+
+    #[tokio::test]
+    async fn a_parked_site_serves_its_html_landing_page_with_a_404() {
+        let target = crate::config::RedirectTarget {
+            target: "https://unused.example.com".into(),
+            preserve_path: true,
+            status: crate::config::RedirectStatus::Permanent,
+        };
+        let mut host = redirect_host("example.com", target);
+        host.redirect = None;
+        host.fixed_response = Some(crate::config::FixedResponse {
+            status: 404,
+            body: "<h1>Coming soon</h1>".into(),
+            html: true,
+        });
+        let state = test_state_with_host(host).await;
+        let resp = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/x", None, None).await;
+        assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<h1>Coming soon</h1>");
     }
 
     #[tokio::test]
@@ -2770,5 +2916,58 @@ mod tests {
             .unwrap();
         let resp = sender.send_request(req).await.unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    async fn default_site_body(resp: Response<BoxBody<Bytes, hyper::Error>>) -> String {
+        use http_body_util::BodyExt;
+        String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+    }
+
+    fn site(mode: crate::config::DefaultSiteMode, url: &str, html: &str) -> crate::config::DefaultSite {
+        crate::config::DefaultSite { mode, redirect_url: url.into(), custom_html: html.into() }
+    }
+
+    #[tokio::test]
+    async fn default_site_not_found_is_a_plain_404() {
+        use crate::config::DefaultSiteMode as M;
+        let resp = default_site_response(&site(M::NotFound, "", ""));
+        assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+        assert!(resp.extensions().get::<DropConnection>().is_none());
+    }
+
+    #[tokio::test]
+    async fn default_site_congratulations_and_custom_html_are_200_pages() {
+        use crate::config::DefaultSiteMode as M;
+        let resp = default_site_response(&site(M::Congratulations, "", ""));
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(default_site_body(resp).await.contains("RustProxy is running"));
+
+        let resp = default_site_response(&site(M::CustomHtml, "", "<h1>Mine</h1>"));
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert_eq!(default_site_body(resp).await, "<h1>Mine</h1>");
+    }
+
+    #[tokio::test]
+    async fn default_site_redirect_sends_a_302_to_the_configured_url() {
+        use crate::config::DefaultSiteMode as M;
+        let resp = default_site_response(&site(M::Redirect, " https://www.example.com ", ""));
+        assert_eq!(resp.status(), hyper::StatusCode::FOUND);
+        assert_eq!(
+            resp.headers().get(hyper::header::LOCATION).unwrap(),
+            "https://www.example.com"
+        );
+        let bad = default_site_response(&site(M::Redirect, "bad\nurl", ""));
+        assert_eq!(bad.status(), hyper::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn default_site_no_response_marks_the_connection_for_dropping() {
+        use crate::config::DefaultSiteMode as M;
+        let resp = default_site_response(&site(M::NoResponse, "", ""));
+        assert!(resp.extensions().get::<DropConnection>().is_some());
     }
 }

@@ -96,6 +96,11 @@ struct Inner {
     /// original, only-ever behavior) when neither config.toml nor the DB
     /// has ever set it.
     expose_admin_port_db: ArcSwap<bool>,
+    /// DB-backed admin "lock to" list; config.toml's non-empty
+    /// `admin.allowed_ips` wins over it.
+    admin_allowed_ips_db: ArcSwap<Vec<ipnet::IpNet>>,
+    /// Response for a hostname that matches no site (NPM's Default Site).
+    default_site: ArcSwap<crate::config::DefaultSite>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
     /// and `proxy::run`'s listener supervisor can both re-sync immediately
     /// instead of polling on a timer. `notify_waiters` (not `notify_one`)
@@ -150,6 +155,8 @@ impl AppState {
             admin_identity_db: ArcSwap::from_pointee(initial_admin_identity),
             acme_contact_email_db: ArcSwap::from_pointee(initial_acme_contact_email),
             expose_admin_port_db: ArcSwap::from_pointee(initial_expose_admin_port.unwrap_or(true)),
+            admin_allowed_ips_db: ArcSwap::from_pointee(Vec::new()),
+            default_site: ArcSwap::from_pointee(crate::config::DefaultSite::default()),
             config_dirty: Notify::new(),
             db,
             hosts_write_lock: Mutex::new(()),
@@ -318,6 +325,27 @@ impl AppState {
         self.0.expose_admin_port_db.store(Arc::new(value));
     }
 
+    /// Effective admin "lock to" list: config.toml's `admin.allowed_ips`
+    /// if non-empty, else the DB-backed list. Empty means unrestricted.
+    pub fn admin_allowed_ips(&self) -> Vec<ipnet::IpNet> {
+        if !self.0.admin.allowed_ips.is_empty() {
+            return self.0.admin.allowed_ips.clone();
+        }
+        (**self.0.admin_allowed_ips_db.load()).clone()
+    }
+
+    pub fn set_admin_allowed_ips(&self, ips: Vec<ipnet::IpNet>) {
+        self.0.admin_allowed_ips_db.store(Arc::new(ips));
+    }
+
+    pub fn default_site(&self) -> Arc<crate::config::DefaultSite> {
+        self.0.default_site.load_full()
+    }
+
+    pub fn set_default_site(&self, value: crate::config::DefaultSite) {
+        self.0.default_site.store(Arc::new(value));
+    }
+
     pub fn hosts(&self) -> Arc<Vec<ProxyHost>> {
         self.0.hosts.load_full()
     }
@@ -482,6 +510,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         }]);
@@ -571,6 +601,8 @@ mod tests {
                     locations: Vec::new(),
                     block_exploits: false,
                     fixed_response: None,
+                    hsts: false,
+                    hsts_subdomains: false,
             pass_client_cert_header: false,
                     enabled: true,
                 }]);

@@ -192,6 +192,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN fixed_response TEXT")
         .execute(pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN hsts INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN hsts_subdomains INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
     // copied above) and `access_allow_ips`/`access_login_username`/
     // `access_login_password_hash` (superseded by the acl_lists/
@@ -478,6 +484,42 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         CREATE TABLE IF NOT EXISTS firewall_settings (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             expose_admin_port INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    // Admin UI "lock to" list (JSON array of CIDRs), the DB-backed
+    // fallback for `AdminConfig.allowed_ips`. Additive, like host columns.
+    let _ = sqlx::query("ALTER TABLE firewall_settings ADD COLUMN admin_allowed_ips TEXT")
+        .execute(pool)
+        .await;
+
+    // Single-row table holding the Default Site setting as JSON (see
+    // `config::DefaultSite`). No row means the built-in default (404).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS default_site (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            config_json TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Single-row record of a Commercial License key that was validated once
+    // against the license store. Purely informational (it drives the About
+    // page badge); nothing in the daemon is gated on it.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS commercial_license (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            license_key TEXT NOT NULL,
+            licensee TEXT NOT NULL,
+            expires_at TEXT,
+            lifetime INTEGER NOT NULL,
+            validated_at TEXT NOT NULL
         )
         "#,
     )
@@ -1143,9 +1185,7 @@ pub struct AclCredentialSummary {
 /// TLS client-cert Subject CN (as `client_cert::client_cert_subject`
 /// extracts it) that must match for a presented cert to satisfy this
 /// ACL. See `AclKind::ClientCert`'s doc comment: a list with zero of
-/// these still accepts any valid TrustBridge-issued cert (unchanged,
-/// permissive default); adding entries narrows that down to only the
-/// subjects listed.
+/// these trusts no certificate.
 #[derive(Debug, Clone, Serialize)]
 pub struct AclClientCertEntry {
     pub id: Uuid,
@@ -1473,10 +1513,8 @@ pub struct ResolvedAcls {
     /// doc comment.
     pub has_client_cert_acl: bool,
     /// Every subject entry across every selected `ClientCert`-kind
-    /// list. Empty means "no restriction" -- a presented cert's subject
-    /// doesn't need to appear here for `has_client_cert_acl` to grant
-    /// access (the original, still-supported "any valid cert" mode).
-    /// Non-empty means the presented subject must be one of these.
+    /// list. The presented subject must be one of these to satisfy the
+    /// gate, so empty means no certificate is trusted.
     pub allowed_client_cert_subjects: Vec<String>,
 }
 
@@ -1623,6 +1661,111 @@ pub async fn set_expose_admin_port(pool: &SqlitePool, value: bool) -> Result<(),
     Ok(())
 }
 
+/// The DB-backed admin "lock to" list (empty when never set).
+pub async fn load_admin_allowed_ips(
+    pool: &SqlitePool,
+) -> Result<Vec<ipnet::IpNet>, sqlx::Error> {
+    let row = sqlx::query("SELECT admin_allowed_ips FROM firewall_settings WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    let json: Option<String> = row.and_then(|r| r.get("admin_allowed_ips"));
+    Ok(json
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default())
+}
+
+pub async fn set_admin_allowed_ips(
+    pool: &SqlitePool,
+    ips: &[ipnet::IpNet],
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_string(ips).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    sqlx::query("INSERT INTO firewall_settings (id, expose_admin_port, admin_allowed_ips) VALUES (1, 1, ?) ON CONFLICT(id) DO UPDATE SET admin_allowed_ips = excluded.admin_allowed_ips")
+        .bind(json)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn load_default_site(
+    pool: &SqlitePool,
+) -> Result<Option<crate::config::DefaultSite>, sqlx::Error> {
+    let row = sqlx::query("SELECT config_json FROM default_site WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    let json: String = row.get("config_json");
+    match serde_json::from_str(&json) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(err) => {
+            tracing::error!(error = %err, "stored default_site row is unreadable -- using the built-in 404");
+            Ok(None)
+        }
+    }
+}
+
+pub async fn set_default_site(
+    pool: &SqlitePool,
+    cfg: &crate::config::DefaultSite,
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_string(cfg).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    sqlx::query("INSERT INTO default_site (id, config_json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json")
+        .bind(json)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommercialLicense {
+    pub license_key: String,
+    pub licensee: String,
+    pub expires_at: Option<String>,
+    pub lifetime: bool,
+    pub validated_at: String,
+}
+
+pub async fn load_commercial_license(
+    pool: &SqlitePool,
+) -> Result<Option<CommercialLicense>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT license_key, licensee, expires_at, lifetime, validated_at FROM commercial_license WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| CommercialLicense {
+        license_key: row.get("license_key"),
+        licensee: row.get("licensee"),
+        expires_at: row.get("expires_at"),
+        lifetime: row.get::<i64, _>("lifetime") != 0,
+        validated_at: row.get("validated_at"),
+    }))
+}
+
+pub async fn set_commercial_license(
+    pool: &SqlitePool,
+    lic: &CommercialLicense,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO commercial_license (id, license_key, licensee, expires_at, lifetime, validated_at) VALUES (1, ?, ?, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET license_key = excluded.license_key, licensee = excluded.licensee, expires_at = excluded.expires_at, lifetime = excluded.lifetime, validated_at = excluded.validated_at",
+    )
+    .bind(&lic.license_key)
+    .bind(&lic.licensee)
+    .bind(&lic.expires_at)
+    .bind(lic.lifetime as i64)
+    .bind(&lic.validated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_commercial_license(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM commercial_license WHERE id = 1")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn load_siem_settings(
     pool: &SqlitePool,
 ) -> Result<Option<crate::config::SiemConfig>, sqlx::Error> {
@@ -1655,7 +1798,7 @@ pub async fn set_siem_settings(
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -1734,6 +1877,8 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 fixed_response: row
                     .get::<Option<String>, _>("fixed_response")
                     .and_then(|s| serde_json::from_str(&s).ok()),
+                hsts: row.get::<i64, _>("hsts") != 0,
+                hsts_subdomains: row.get::<i64, _>("hsts_subdomains") != 0,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -1772,8 +1917,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -1802,6 +1947,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(if h.locations.is_empty() { None } else { serde_json::to_string(&h.locations).ok() })
         .bind(h.block_exploits as i64)
         .bind(h.fixed_response.as_ref().and_then(|d| serde_json::to_string(d).ok()))
+        .bind(h.hsts as i64)
+        .bind(h.hsts_subdomains as i64)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -2019,6 +2166,8 @@ mod tests {
             locations: Vec::new(),
             block_exploits: false,
             fixed_response: None,
+            hsts: false,
+            hsts_subdomains: false,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2084,6 +2233,7 @@ mod tests {
         host.fixed_response = Some(crate::config::FixedResponse {
             status: 404,
             body: "nothing here".into(),
+            html: false,
         });
         save_hosts(&pool, std::slice::from_ref(&host)).await.unwrap();
         let loaded = load_hosts(&pool).await.unwrap();
@@ -3202,5 +3352,79 @@ mod tests {
             "VACUUM must never lose live data"
         );
         let _ = std::fs::remove_file(&src);
+    }
+
+    #[tokio::test]
+    async fn hsts_flags_round_trip_through_the_hosts_table() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.hsts = true;
+        host.hsts_subdomains = true;
+        save_hosts(&pool, &[host]).await.unwrap();
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert!(loaded[0].hsts && loaded[0].hsts_subdomains);
+
+        let mut plain = sample_host();
+        plain.hsts = true;
+        save_hosts(&pool, &[plain]).await.unwrap();
+        let loaded = load_hosts(&pool).await.unwrap();
+        assert!(loaded[0].hsts && !loaded[0].hsts_subdomains);
+    }
+
+    #[tokio::test]
+    async fn admin_allowed_ips_round_trip_without_disturbing_expose_admin_port() {
+        let pool = memory_pool().await;
+        assert!(load_admin_allowed_ips(&pool).await.unwrap().is_empty());
+        set_admin_allowed_ips(&pool, &["192.168.1.0/24".parse().unwrap(), "2001:db8::1/128".parse().unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(load_admin_allowed_ips(&pool).await.unwrap().len(), 2);
+        set_expose_admin_port(&pool, false).await.unwrap();
+        assert_eq!(load_expose_admin_port(&pool).await.unwrap(), Some(false));
+        assert_eq!(load_admin_allowed_ips(&pool).await.unwrap().len(), 2, "setting expose must not clear the list");
+        set_admin_allowed_ips(&pool, &[]).await.unwrap();
+        assert!(load_admin_allowed_ips(&pool).await.unwrap().is_empty());
+        assert_eq!(load_expose_admin_port(&pool).await.unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn default_site_round_trips_and_is_absent_until_set() {
+        use crate::config::{DefaultSite, DefaultSiteMode};
+        let pool = memory_pool().await;
+        assert!(load_default_site(&pool).await.unwrap().is_none());
+        let site = DefaultSite {
+            mode: DefaultSiteMode::Redirect,
+            redirect_url: "https://www.example.com".into(),
+            custom_html: String::new(),
+        };
+        set_default_site(&pool, &site).await.unwrap();
+        assert_eq!(load_default_site(&pool).await.unwrap(), Some(site));
+        let html = DefaultSite {
+            mode: DefaultSiteMode::CustomHtml,
+            redirect_url: String::new(),
+            custom_html: "<p>hi</p>".into(),
+        };
+        set_default_site(&pool, &html).await.unwrap();
+        assert_eq!(load_default_site(&pool).await.unwrap(), Some(html));
+    }
+
+    #[tokio::test]
+    async fn commercial_license_round_trips_replaces_and_clears() {
+        let pool = memory_pool().await;
+        assert!(load_commercial_license(&pool).await.unwrap().is_none());
+        let lic = CommercialLicense {
+            license_key: "lic-aaaa".into(),
+            licensee: "Acme".into(),
+            expires_at: Some("2126-01-01T00:00:00Z".into()),
+            lifetime: true,
+            validated_at: "2026-10-14T00:00:00Z".into(),
+        };
+        set_commercial_license(&pool, &lic).await.unwrap();
+        assert_eq!(load_commercial_license(&pool).await.unwrap(), Some(lic.clone()));
+        let newer = CommercialLicense { license_key: "lic-bbbb".into(), expires_at: None, lifetime: false, ..lic };
+        set_commercial_license(&pool, &newer).await.unwrap();
+        assert_eq!(load_commercial_license(&pool).await.unwrap(), Some(newer));
+        clear_commercial_license(&pool).await.unwrap();
+        assert!(load_commercial_license(&pool).await.unwrap().is_none());
     }
 }

@@ -1,6 +1,66 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-10-14
+
+- **Default site setting (NPM's Settings, Default Site).** System, Default
+  site (admin only; `GET`/`PUT /api/default-site`) chooses what a request
+  for a hostname with no matching site receives: an empty 404 (the previous
+  behaviour and still the default), a "Congratulations" page, no response
+  (connection dropped, like NPM's 444), a redirect, or custom HTML up to
+  64 KiB. It applies on port 80 and on HTTPS for names that have a
+  certificate. Names with no certificate, and bare IP addresses, are still
+  refused at the TLS handshake and never reach it.
+
+- **HSTS and HSTS for subdomains.** New per-host `hsts` and
+  `hsts_subdomains` options (checkboxes in the site form's TLS section)
+  add `Strict-Transport-Security: max-age=63072000`, with `includeSubDomains`
+  when asked, to every HTTPS response. `preload` is intentionally not sent.
+  `hsts_subdomains` without `hsts` is rejected.
+
+- **Commercial license field on the About page.** Enter the Commercial
+  License key from store.jpps.us once; it is validated a single time against
+  the store (`POST /api/v1/validate`, store 0.10.0 or later) and the page
+  then shows "Commercial usage authorized" with licensee and expiry. The key
+  is kept, shown masked, and never re-checked. Record only: nothing is
+  enforced. `GET`/`PUT`/`DELETE /api/license` (writes are admin only).
+
+- **"Add 404 host" in the Hosts page.** NPM's 404 Hosts were already
+  supported through `fixed_response`, but only as a field buried in the
+  Advanced section of the site form. Hosts now has an **Add 404 host**
+  button that opens the form with a 404 response prefilled, the site list
+  labels such sites "404 host" instead of showing a blank upstream, and the
+  docs explain how wildcard 404 hosts work.
+
+- **Park a site with an HTML landing page.** A `fixed_response` can now set
+  `"html": true` to serve its body as `text/html` (with `nosniff`), so a host
+  can show a "Coming soon" page until its upstream is ready. The site form
+  has a "Serve as an HTML page" checkbox. HTML responses (parked sites and
+  the default site) also carry a strict `Content-Security-Policy` that
+  blocks scripts, so a page cannot run code even if its HTML is hostile.
+
+- **First-run wizard sets the admin lock-to options.** The wizard now also
+  asks which IPs or CIDRs may reach the admin port (with an "Add my address"
+  button) and whether to expose the port through the firewall at all. A list
+  that excludes the caller is refused. The list is stored in the database,
+  and a non-empty `admin.allowed_ips` in `config.toml` still wins. Admins can
+  change both later under Network, Firewall settings
+  (`PUT /api/firewall-settings` takes `admin_allowed_ips`). There is still no
+  default password.
+
+- **An admin cannot change or reset another admin's password.** `PUT
+  /api/users/{id}` with a `password` for an admin account is refused (403)
+  unless it is the caller's own account. Admins can still reset operators'
+  and viewers' passwords, and everyone changes their own at `/api/me/password`.
+
+- **Breaking: a client-certificate access list with no entries now trusts
+  no certificate.** Previously an empty list accepted any valid
+  TrustBridge-issued certificate. Add at least one allowed Subject CN to each
+  client-certificate list before upgrading, or hosts that rely on an empty
+  list will fall back to their IP or login gate.
+
+- **Cleaner access-list entry rows.** The Manage entries drawer lays each IP
+  or CIDR out with its description underneath, aligned buttons, and a styled
+  Add entry box.
 
 ## [0.2.0] - 2026-10-14
 

@@ -50,9 +50,10 @@ curl -X POST https://proxy.example.com/api/acls \
 ### Client certificate
 
 A client-certificate ACL lets a visitor who presents a valid client
-certificate skip the login page. It can list allowed certificate subjects
-(`POST /api/acls/:id/client-cert-entries`, body `{"subject","description"}`);
-with no entries, any verified certificate passes.
+certificate skip the login page. Add the allowed certificate subjects with
+`POST /api/acls/:id/client-cert-entries`, body `{"subject","description"}`.
+A verified certificate passes only if its subject is listed. **A list with
+no entries trusts no certificate.**
 
 > **Current limitation:** the client-certificate verifier trusts a single
 > built-in root, the JPPS TrustBridge CA. It is not yet configurable, so
