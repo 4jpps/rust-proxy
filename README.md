@@ -23,12 +23,12 @@ web UI and a REST API, and it installs from a signed `.deb`.
 
 ![The Sites page lists every host with its upstream, bind address, certificate status and access lists.](docs/screenshots/hosts-list.png)
 
-> **Lock down the admin port.** On a fresh install the admin UI listens on
-> `0.0.0.0:8084` and the firewall leaves that port open, so the setup
-> wizard works without editing any config. Until you create the admin
-> account, anyone who can reach the port can claim it. Set
-> `admin.allowed_ips` in `/etc/rust-proxy/config.toml` to your management
-> network as soon as you can, or reach the port through an SSH tunnel.
+> **The first person to open a new instance becomes its admin.** A fresh
+> install has no accounts. Browsing to `http://<host-ip>:8084/` shows a
+> setup page, and whoever completes it first owns the instance. The admin
+> port is open to any source until then, so open it yourself right after
+> installing, and in the setup page choose which addresses may reach the
+> admin UI (or reach the port through an SSH tunnel instead).
 
 ## Install
 
@@ -40,7 +40,9 @@ sudo apt update
 sudo apt install rust-proxy
 ```
 
-Then open `http://<host-ip>:8084/` and follow the first-run wizard. The
+Then open `http://<host-ip>:8084/`. A new instance takes you straight to the
+setup page (there is no default password); the first person there becomes the
+admin. The
 full walkthrough, from install to your first HTTPS host, is in
 [Getting started](docs/getting-started.md).
 

@@ -35,10 +35,15 @@ and `dpkg -i` it, or [build from source](deployment.md).
 
 ## 2. Run the first-run wizard
 
-Open `http://<host-ip>:8084/`. On a fresh install the admin UI listens on
-`0.0.0.0:8084` and the firewall leaves that port open to any source, which
-is what lets the wizard work with no config edits. It also means anyone who
-can reach the port could claim the admin account first, so do this promptly.
+Open `http://<host-ip>:8084/`. A new instance has no accounts, so it takes
+you straight to a setup page instead of a login screen. **Whoever completes
+that page first becomes the instance's admin (the owner).** On a fresh
+install the admin UI listens on `0.0.0.0:8084` and the firewall leaves that
+port open to any source, which is what lets the wizard work with no config
+edits. That also means anyone who can reach the port could claim the admin
+account before you do, so open the page right after installing, and finish
+it in one sitting. Once an admin exists the setup page is gone for good and
+the same address shows the normal login.
 
 There is no default password. The wizard asks you to choose:
 
