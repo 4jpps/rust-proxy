@@ -474,6 +474,16 @@ async fn route_https_request(
     client_cert_subject: Option<client_cert::ClientCertIdentity>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    // With an org lock set, a cert from another org (or an old one with no
+    // org-id) is treated as no certificate: login fallback, no identity headers.
+    let required_org = state.required_client_cert_org();
+    let client_cert_subject = client_cert_subject.filter(|id| {
+        let ok = client_cert::org_allowed(id, required_org.as_deref());
+        if !ok {
+            tracing::info!(cn = %id.cn, org_id = ?id.org_id, "client cert ignored: org-id does not match the required org");
+        }
+        ok
+    });
     // Same precedence as the routing decision below: the request's own
     // declared host beats the connection's SNI.
     let lookup_name = req
@@ -625,8 +635,7 @@ async fn route_https_request_inner(
     // `db::ResolvedAcls::allowed_client_cert_subjects`'s doc comment.
     let client_cert_ok = resolved_acls.has_client_cert_acl
         && client_cert_subject.as_ref().is_some_and(|id| {
-            // CN only -- org / org-id are carried but not yet enforced
-            // (see `client_cert::ClientCertIdentity`).
+            // The org lock was already applied at the top of this function.
             resolved_acls
                 .allowed_client_cert_subjects
                 .iter()
@@ -2400,11 +2409,9 @@ mod tests {
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
     }
 
-    /// Org name / org-id on a cert are carried but not enforced yet: a
-    /// cert whose CN is allowed still passes whatever org data it has,
-    /// and the allow-list is still matched on CN alone.
+    /// With no org lock set, the allow-list is matched on CN alone.
     #[tokio::test]
-    async fn client_cert_matching_is_on_cn_only_whatever_org_data_is_presented() {
+    async fn without_an_org_lock_client_cert_matching_is_on_cn_only() {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
         let cert_acl_id = host.acl_ids[0];
@@ -2425,6 +2432,44 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    /// With the org lock set, only a cert carrying that org-id passes; the
+    /// same CN without it (an old cert) or from another org falls back to login.
+    #[tokio::test]
+    async fn an_org_lock_rejects_old_and_foreign_certs_and_accepts_the_right_one() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        let cert_acl_id = host.acl_ids[0];
+        crate::db::add_acl_client_cert_entry(state.db(), cert_acl_id, "Jeffs MacBook", None)
+            .await
+            .unwrap();
+        state.set_hosts(vec![host]);
+        state.set_required_client_cert_org(Some("TB-GOOD".into()));
+
+        let ident = |org_id: Option<&str>| client_cert::ClientCertIdentity {
+            cn: "Jeffs MacBook".into(),
+            org: Some("Some Org".into()),
+            org_id: org_id.map(str::to_string),
+        };
+        for (label, id, passes) in [
+            ("old cert, no org-id", client_cert::ClientCertIdentity::cn_only("Jeffs MacBook"), false),
+            ("other org", ident(Some("TB-OTHER")), false),
+            ("right org", ident(Some("TB-GOOD")), true),
+        ] {
+            let resp = send_test_request_with_cert(
+                state.clone(),
+                "203.0.113.7".parse().unwrap(),
+                Some(id),
+            )
+            .await;
+            if passes {
+                assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY, "{label}");
+            } else {
+                assert_eq!(resp.status(), hyper::StatusCode::OK, "{label}");
+                assert!(response_text(resp).await.contains("Sign in to example.com"), "{label}");
+            }
+        }
     }
 
     /// A cert whose subject does NOT match any allowed entry falls back

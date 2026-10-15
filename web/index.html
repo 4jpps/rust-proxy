@@ -1691,6 +1691,16 @@ function pClientCerts() {
     ? `<div class="card"><h2>${esc(org.name)}</h2><dl class="kvs">${kv('Organization ID', org.org_id, true)}${kv('Tier', org.tier)}${kv('Certificates in use', usage)}</dl></div>`
     : '';
   const issued = UI.tbIssued ? tbIssuedCard(UI.tbIssued) : '';
+  const lockedTo = tb.required_org_id;
+  const lockCard = (org || lockedTo)
+    ? `<div class="card"><h2>Require my organization</h2>
+    <p class="help">${lockedTo
+      ? `Locked: only certificates issued to organization <span class="mono">${esc(lockedTo)}</span> are accepted. Older certificates without an organization ID, and certificates from other organizations, are ignored (sites fall back to their login page).`
+      : 'Not locked: any TrustBridge certificate whose name is on an access list is accepted, including older ones with no organization ID.'}</p>
+    <div class="form-actions">${lockedTo
+      ? '<button type="button" class="btn danger" data-act="tb-lock-off">Remove lock</button>'
+      : (org ? `<button type="button" class="btn primary" data-act="tb-lock-on">Lock to ${esc(org.name)}</button>` : '')}</div></div>`
+    : '';
   const conn = `<form id="tb-form" class="card settings" novalidate><h2>TrustBridge connection</h2>
     ${tb.error ? `<div class="banner warn"><div class="grow">${esc(tb.error)}</div></div>` : ''}
     <div class="fgrid">${fld({ name: 'url', label: 'TrustBridge URL', value: tb.url || '', placeholder: tb.default_url || '', wide: true, mono: true, help: 'https only. Leave as the default unless you run your own TrustBridge.' })}
@@ -1707,7 +1717,7 @@ function pClientCerts() {
     + td('Expires', c.expires_at ? esc(fmtDT(c.expires_at)) : '—')
     + td('Status', c.revoked ? pill('error', 'Revoked') : pill('ok', 'Active'))
     + actsTd(c.revoked ? '' : abtn('tb-cert-revoke', c.serial, 'Revoke', 'danger')) + '</tr>'));
-  return issued + orgCard + conn + list;
+  return issued + orgCard + lockCard + conn + list;
 }
 function tbIssuedCard(c) {
   const area = (label, val) => `<div class="field wide"><label>${esc(label)}</label><textarea class="mono" rows="5" readonly spellcheck="false">${esc(val)}</textarea></div>`;
@@ -1729,6 +1739,15 @@ function afterClientCerts(root) {
 ACTIONS['tb-token-clear'] = async () => {
   if (!await confirmAsync({ title: 'Remove org token', body: 'Remove the saved TrustBridge org token? You will not be able to issue or revoke certificates until you save one again.', confirmLabel: 'Remove token' })) return;
   try { await send('PUT', '/api/trustbridge', { token: '' }); toast('Token removed', 'ok'); await refresh('tb', 'tbCerts'); } catch (e) { fail(e); }
+};
+ACTIONS['tb-lock-on'] = async () => {
+  const org = D.tb && D.tb.org; if (!org) return;
+  if (!await confirmAsync({ title: 'Lock to your organization', body: `From now on only certificates issued to <b>${esc(org.name)}</b> (<span class="mono">${esc(org.org_id)}</span>) are accepted. Older certificates with no organization ID stop working everywhere, including admin sign-in with a certificate. Make sure you have already installed a new certificate.`, confirmLabel: 'Lock' })) return;
+  try { await send('PUT', '/api/trustbridge', { required_org_id: org.org_id }); toast('Locked to your organization', 'ok'); await refresh('tb', 'tbCerts'); } catch (e) { fail(e); }
+};
+ACTIONS['tb-lock-off'] = async () => {
+  if (!await confirmAsync({ title: 'Remove lock', body: 'Go back to accepting any TrustBridge certificate whose name is on an access list, including older ones with no organization ID.', confirmLabel: 'Remove lock' })) return;
+  try { await send('PUT', '/api/trustbridge', { required_org_id: '' }); toast('Lock removed', 'ok'); await refresh('tb', 'tbCerts'); } catch (e) { fail(e); }
 };
 ACTIONS['tb-cert-add'] = () => {
   if (!(D.tb && D.tb.token_set)) { toast('Save your TrustBridge org token first.', 'warn'); return; }

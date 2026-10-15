@@ -190,6 +190,7 @@ async fn settings_body(state: &AppState) -> Result<Value, TbError> {
         "token_set": token_set,
         "org": org,
         "error": error,
+        "required_org_id": state.required_client_cert_org(),
     }))
 }
 
@@ -203,15 +204,29 @@ pub struct PutSettings {
     url: Option<String>,
     /// Absent keeps the current token; empty clears it.
     token: Option<String>,
+    /// Absent keeps the current lock; empty removes it; otherwise only
+    /// client certs carrying this org-id are honored.
+    required_org_id: Option<String>,
+}
+
+fn validate_org_id(s: &str) -> Result<String, String> {
+    let ok = (3..=64).contains(&s.len())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok { Ok(s.to_string()) } else { Err("org id must be 3-64 letters, digits, '-' or '_'".into()) }
 }
 
 pub async fn put_settings(
     State(state): State<AppState>,
     Json(body): Json<PutSettings>,
 ) -> Result<Json<Value>, TbError> {
-    if body.url.is_none() && body.token.is_none() {
-        return Err(TbError::bad_request("nothing to change: provide url and/or token"));
+    if body.url.is_none() && body.token.is_none() && body.required_org_id.is_none() {
+        return Err(TbError::bad_request("nothing to change: provide url, token and/or required_org_id"));
     }
+    let new_lock = match body.required_org_id.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(String::new()),
+        Some(o) => Some(validate_org_id(o).map_err(TbError::bad_request)?),
+    };
     let current = load_settings(&state).await?;
     let url = match body.url.as_deref().map(str::trim) {
         None => current.url,
@@ -224,6 +239,10 @@ pub async fn put_settings(
         Some(t) => validate_token(t).map_err(TbError::bad_request)?,
     };
     crate::db::set_trustbridge_settings(state.db(), &url, &token).await?;
+    if let Some(lock) = new_lock {
+        crate::db::set_required_org_id(state.db(), &lock).await?;
+        state.set_required_client_cert_org(Some(lock).filter(|l| !l.is_empty()));
+    }
     Ok(Json(settings_body(&state).await?))
 }
 

@@ -69,11 +69,10 @@ pub fn build_optional_client_cert_verifier() -> Arc<dyn rustls::server::danger::
 
 /// Who a presented client certificate says its holder is.
 ///
-/// ACL matching (`ClientCert` entries, `admin.client_cert_subjects`) is
-/// still on `cn` ALONE. `org` and `org_id` are carried and forwarded to
-/// upstreams (`X-Client-Cert-Org`, `X-Client-Cert-Org-Id`) but NOT yet
-/// enforced anywhere, so a pre-existing CN-only certificate keeps working
-/// while its holder reissues one carrying the same CN plus org data.
+/// ACL matching (`ClientCert` entries, `admin.client_cert_subjects`) is on
+/// `cn`. `org` and `org_id` are forwarded to upstreams (`X-Client-Cert-Org`,
+/// `X-Client-Cert-Org-Id`). When an org lock is set (`org_allowed`), a cert
+/// whose org-id differs is dropped before any of that happens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientCertIdentity {
     pub cn: String,
@@ -90,6 +89,15 @@ impl ClientCertIdentity {
 
 /// X.509 `organizationIdentifier` (2.5.4.97).
 const OID_ORGANIZATION_IDENTIFIER: &[u64] = &[2, 5, 4, 97];
+/// Whether `id` may be honored given the required org-id (`None` = no lock).
+/// A cert without an org-id never passes a lock.
+pub fn org_allowed(id: &ClientCertIdentity, required: Option<&str>) -> bool {
+    match required {
+        None => true,
+        Some(req) => id.org_id.as_deref() == Some(req),
+    }
+}
+
 /// Fallback carrier for the org-id: an OU of the form `org-id:XXXX`.
 const OU_ORG_ID_PREFIX: &str = "org-id:";
 

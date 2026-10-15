@@ -555,6 +555,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // When non-empty, a client cert must carry exactly this TrustBridge
+    // org-id to count as a certificate at all.
+    let _ = sqlx::query("ALTER TABLE trustbridge_settings ADD COLUMN required_org_id TEXT NOT NULL DEFAULT ''")
+        .execute(pool)
+        .await;
+
     // Single-row table holding the admin-UI/API-managed SIEM forwarding
     // settings as a JSON document (see `config::SiemConfig`) -- only
     // consulted when config.toml has no `[siem]` section. No row means
@@ -1813,6 +1819,25 @@ pub async fn set_trustbridge_settings(
     sqlx::query("INSERT INTO trustbridge_settings (id, url, org_token) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET url = excluded.url, org_token = excluded.org_token")
         .bind(url)
         .bind(org_token)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The org-id every client cert must carry; `None` when not locked.
+pub async fn load_required_org_id(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query("SELECT required_org_id FROM trustbridge_settings WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row
+        .map(|r| r.get::<String, _>("required_org_id"))
+        .filter(|s| !s.is_empty()))
+}
+
+/// Needs the settings row to exist (`set_trustbridge_settings` creates it).
+pub async fn set_required_org_id(pool: &SqlitePool, org_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE trustbridge_settings SET required_org_id = ? WHERE id = 1")
+        .bind(org_id)
         .execute(pool)
         .await?;
     Ok(())

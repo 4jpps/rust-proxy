@@ -100,6 +100,9 @@ struct Inner {
     /// DB-backed admin "lock to" list; config.toml's non-empty
     /// `admin.allowed_ips` wins over it.
     admin_allowed_ips_db: ArcSwap<Vec<ipnet::IpNet>>,
+    /// When set, only client certs carrying this TrustBridge org-id are
+    /// honored (see `client_cert::org_allowed`).
+    required_client_cert_org: ArcSwap<Option<String>>,
     /// Response for a hostname that matches no site (NPM's Default Site).
     default_site: ArcSwap<crate::config::DefaultSite>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
@@ -158,6 +161,7 @@ impl AppState {
             acme_contact_email_db: ArcSwap::from_pointee(initial_acme_contact_email),
             expose_admin_port_db: ArcSwap::from_pointee(initial_expose_admin_port.unwrap_or(true)),
             admin_allowed_ips_db: ArcSwap::from_pointee(Vec::new()),
+            required_client_cert_org: ArcSwap::from_pointee(None),
             default_site: ArcSwap::from_pointee(crate::config::DefaultSite::default()),
             config_dirty: Notify::new(),
             db,
@@ -234,6 +238,14 @@ impl AppState {
 
     pub fn siem_config(&self) -> Option<&crate::config::SiemConfig> {
         self.0.siem_config.as_ref()
+    }
+
+    pub fn required_client_cert_org(&self) -> Option<String> {
+        (**self.0.required_client_cert_org.load()).clone()
+    }
+
+    pub fn set_required_client_cert_org(&self, org_id: Option<String>) {
+        self.0.required_client_cert_org.store(Arc::new(org_id));
     }
 
     pub fn client_cert_forward_token(&self) -> Option<&str> {

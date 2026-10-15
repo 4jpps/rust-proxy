@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- **Organization lock for client certificates.** New System, Client
+  certificates card "Require my organization" (`required_org_id` on
+  `PUT /api/trustbridge`; an empty string removes it). When set, only client
+  certificates whose organization id matches are honored anywhere: ACL
+  matching, the identity headers passed to backends, and admin certificate
+  login. Older CN-only certificates and certificates from other
+  organizations are treated as if no certificate was presented (sites fall
+  back to their login page). Unset keeps the previous CN-only behavior.
+
 - **TrustBridge client certificates from the admin UI, and org identity on
   client certs.** New System, Client certificates page (and
   `GET/PUT /api/trustbridge`, `GET/POST /api/trustbridge/certs`,

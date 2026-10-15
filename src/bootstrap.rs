@@ -134,6 +134,7 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
         acme_contact_email,
         expose_admin_port,
     );
+    state.set_required_client_cert_org(crate::db::load_required_org_id(state.db()).await?);
     state.set_admin_allowed_ips(crate::db::load_admin_allowed_ips(state.db()).await?);
     if let Some(site) = crate::db::load_default_site(state.db()).await? {
         state.set_default_site(site);
