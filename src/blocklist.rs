@@ -77,12 +77,38 @@ impl NetSet {
 pub struct BlockIndex {
     lists: HashMap<Uuid, NetSet>,
     global: NetSet,
+    /// Aggregated prefixes for the firewall layer, which blocks the
+    /// non-HTTP paths (passthrough listeners, port rules, hosted VMs).
+    list_nets: HashMap<Uuid, Vec<IpNet>>,
+    global_nets: Vec<IpNet>,
 }
 
 impl BlockIndex {
     #[cfg(test)]
     pub fn global_prefix_count(&self) -> usize {
         self.global.len()
+    }
+
+    /// Prefixes every global list blocks, aggregated.
+    pub fn global_nets(&self) -> &[IpNet] {
+        &self.global_nets
+    }
+
+    /// Union of the prefixes in the given lists, aggregated.
+    pub fn nets_for(&self, acl_ids: &[Uuid]) -> Vec<IpNet> {
+        let all: Vec<IpNet> = acl_ids
+            .iter()
+            .filter_map(|id| self.list_nets.get(id))
+            .flatten()
+            .copied()
+            .collect();
+        IpNet::aggregate(&all)
+    }
+
+    /// Whether the firewall-visible data is identical, so a refresh that
+    /// changed nothing does not rewrite the ruleset.
+    pub fn firewall_equal(&self, other: &BlockIndex) -> bool {
+        self.global_nets == other.global_nets && self.list_nets == other.list_nets
     }
 
     pub fn is_globally_blocked(&self, ip: IpAddr) -> bool {
@@ -117,8 +143,10 @@ impl BlockIndex {
             if global {
                 global_nets.extend(nets.iter().copied());
             }
+            index.list_nets.insert(id, IpNet::aggregate(&nets));
             index.lists.insert(id, NetSet::from_nets(nets));
         }
+        index.global_nets = IpNet::aggregate(&global_nets);
         index.global = NetSet::from_nets(global_nets);
         index
     }
@@ -132,7 +160,13 @@ pub async fn build_index(pool: &sqlx::SqlitePool) -> Result<BlockIndex, sqlx::Er
 
 pub async fn rebuild(state: &AppState) {
     match build_index(state.db()).await {
-        Ok(index) => state.set_block_index(index),
+        Ok(index) => {
+            let changed = !state.block_index().firewall_equal(&index);
+            state.set_block_index(index);
+            if changed {
+                state.notify_config_change();
+            }
+        }
         Err(err) => tracing::error!(error = %err, "failed to rebuild the block index"),
     }
 }

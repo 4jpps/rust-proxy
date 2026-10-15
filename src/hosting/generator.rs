@@ -16,6 +16,19 @@ use crate::config::Protocol;
 
 pub const TABLE: &str = "rust_proxy_hosting";
 
+/// IPv4 source networks to refuse for hosted addresses: `global` for every
+/// hosted VM, `acl` per block list, which a forwarded port can select.
+#[derive(Debug, Default, Clone)]
+pub struct HostingBlocks {
+    pub global: Vec<Ipv4Net>,
+    pub acl: HashMap<Uuid, Vec<Ipv4Net>>,
+}
+
+fn net_set(nets: &[Ipv4Net]) -> String {
+    let items: Vec<String> = nets.iter().map(Ipv4Net::to_string).collect();
+    format!("{{ {} }}", items.join(", "))
+}
+
 const PRIVATE_NETS: &str = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10";
 
 fn port_set(ports: &[&PortSpec], protocol: Protocol) -> Option<String> {
@@ -67,7 +80,7 @@ pub fn generate_ruleset(allocations: &[Allocation]) -> String {
 /// answer on an address whose other ports still belong to the VM.
 #[cfg(test)]
 pub fn generate_ruleset_with_served(allocations: &[Allocation], proxy_served: &[(Ipv4Addr, u16)]) -> String {
-    generate_ruleset_full(allocations, proxy_served, &HashMap::new())
+    generate_ruleset_full(allocations, proxy_served, &HashMap::new(), &HostingBlocks::default())
 }
 
 /// As [`generate_ruleset_with_served`], plus `acl_sources`: the IPv4 source
@@ -81,6 +94,7 @@ pub fn generate_ruleset_full(
     allocations: &[Allocation],
     proxy_served: &[(Ipv4Addr, u16)],
     acl_sources: &HashMap<Uuid, Vec<Ipv4Net>>,
+    blocks: &HostingBlocks,
 ) -> String {
     let mut active: Vec<&Allocation> = allocations.iter().filter(|a| a.is_active()).collect();
     active.sort_by_key(|a| a.public_ip);
@@ -122,8 +136,21 @@ pub fn generate_ruleset_full(
                         let items: Vec<String> = nets.iter().map(Ipv4Net::to_string).collect();
                         format!("ip saddr {{ {} }} ", items.join(", "))
                     };
+                    let mut blocked: Vec<Ipv4Net> = acls
+                        .iter()
+                        .flat_map(|id| blocks.acl.get(id).into_iter().flatten().copied())
+                        .collect();
+                    blocked.sort();
+                    blocked.dedup();
                     for (proto, name) in [(Protocol::Tcp, "tcp"), (Protocol::Udp, "udp")] {
                         if let Some(set) = port_set(specs, proto) {
+                            if !blocked.is_empty() {
+                                let _ = writeln!(
+                                    out,
+                                    "        ip daddr {public} ip saddr {} {name} dport {set} drop",
+                                    net_set(&blocked)
+                                );
+                            }
                             let _ = writeln!(
                                 out,
                                 "        ip daddr {public} {source}{name} dport {set} dnat to {vm}"
@@ -171,6 +198,14 @@ pub fn generate_ruleset_full(
     let _ = writeln!(out, "        type filter hook forward priority -10; policy accept;");
     if !active.is_empty() {
         let vms: Vec<Ipv4Addr> = active.iter().filter_map(|a| a.vm_ip).collect();
+        if !blocks.global.is_empty() && !vms.is_empty() {
+            let _ = writeln!(
+                out,
+                "        ip saddr {} ip daddr {} drop",
+                net_set(&blocks.global),
+                ip_set(&vms)
+            );
+        }
         let _ = writeln!(
             out,
             "        ip saddr {} ip daddr {{ {PRIVATE_NETS} }} ct state new drop",
@@ -337,6 +372,14 @@ mod tests {
     }
 
     #[test]
+    fn global_block_drops_forwarded_traffic_to_hosted_vms() {
+        let blocks = HostingBlocks { global: vec!["203.0.113.0/24".parse().unwrap()], acl: HashMap::new() };
+        let a = alloc("204.52.221.226", Some("172.16.63.10"), ForwardMode::All, vec![]);
+        let out = generate_ruleset_full(&[a], &[], &HashMap::new(), &blocks);
+        assert!(out.contains("ip saddr { 203.0.113.0/24 } ip daddr { 172.16.63.10 } drop"), "{out}");
+    }
+
+    #[test]
     fn address_plan_adds_missing_and_removes_only_stale_pool_addresses() {
         let pools: Vec<Ipv4Net> = vec!["204.52.221.224/28".parse().unwrap()];
         let ip = |s: &str| -> Ipv4Addr { s.parse().unwrap() };
@@ -374,7 +417,7 @@ mod tests {
         let a = alloc("44.30.51.254", Some("100.64.244.254"), ForwardMode::Ports, vec![ssh, open]);
         let mut sources = HashMap::new();
         sources.insert(acl, vec!["172.16.0.0/16".parse().unwrap(), "10.1.2.3/32".parse().unwrap()]);
-        let out = generate_ruleset_full(&[a], &[], &sources);
+        let out = generate_ruleset_full(&[a], &[], &sources, &HostingBlocks::default());
         assert!(out.contains(
             "ip daddr 44.30.51.254 ip saddr { 10.1.2.3/32, 172.16.0.0/16 } tcp dport { 22 } dnat to 100.64.244.254\n"
         ), "{out}");
@@ -388,7 +431,7 @@ mod tests {
         ssh.acl_ids = vec![acl];
         let a = alloc("44.30.51.254", Some("100.64.244.254"), ForwardMode::Ports, vec![ssh]);
         for sources in [HashMap::new(), HashMap::from([(acl, vec![])])] {
-            let out = generate_ruleset_full(&[a.clone()], &[], &sources);
+            let out = generate_ruleset_full(&[a.clone()], &[], &sources, &HostingBlocks::default());
             assert!(!out.contains("dnat"), "fail closed: {out}");
             assert!(out.contains("meta l4proto != icmp drop"), "own sshd stays shut: {out}");
         }

@@ -1443,7 +1443,7 @@ function pRules() {
 }
 ACTIONS['rule-add'] = async () => {
   await ensure(['localIps', 'acls']);
-  const acls = (D.acls || []).filter((a) => a.kind === 'ip_allow');
+  const acls = (D.acls || []).filter((a) => a.kind === 'ip_allow' || a.kind === 'ip_block');
   openDrawer({
     title: 'New port rule', submitLabel: 'Add rule',
     body: `<fieldset><legend>Listen</legend><div class="fgrid">
@@ -1457,7 +1457,7 @@ ACTIONS['rule-add'] = async () => {
       ${fld({ name: 'description', label: 'Description', placeholder: 'rustdesk tcp', wide: true })}
     </div></fieldset>
     <fieldset><legend>Access</legend>${aclPicker(acls, new Set())}
-      <p class="help" style="margin-top:var(--s-2)">Only IP-allow lists apply here, enforced at the firewall. Select none to leave the rule unrestricted.</p>
+      <p class="help" style="margin-top:var(--s-2)">Only IP-allow and IP/ASN-block lists apply here, enforced at the firewall. Global block lists always apply. Select none to leave the rule unrestricted.</p>
       <div class="checks">${chk({ name: 'enabled', label: 'Enabled', checked: true })}</div></fieldset>`,
     onSubmit: async (form) => {
       const fd = new FormData(form), start = Number(fd.get('port_start'));

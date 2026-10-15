@@ -143,7 +143,28 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
             acl_sources.insert(acl_id, nets);
         }
     }
-    apply_ruleset(&generator::generate_ruleset_full(&allocations, &proxy_served, &acl_sources)).await?;
+    let index = state.block_index();
+    let v4 = |nets: &[ipnet::IpNet]| -> Vec<Ipv4Net> {
+        nets.iter()
+            .filter_map(|n| match n {
+                ipnet::IpNet::V4(v4) => Some(*v4),
+                ipnet::IpNet::V6(_) => None,
+            })
+            .collect()
+    };
+    let mut blocks = generator::HostingBlocks { global: v4(index.global_nets()), ..Default::default() };
+    for acl_id in allocations
+        .iter()
+        .filter(|a| a.is_active())
+        .flat_map(|a| a.ports.iter().flat_map(|p| p.acl_ids.iter().copied()))
+        .collect::<BTreeSet<Uuid>>()
+    {
+        let nets = v4(&index.nets_for(&[acl_id]));
+        if !nets.is_empty() {
+            blocks.acl.insert(acl_id, nets);
+        }
+    }
+    apply_ruleset(&generator::generate_ruleset_full(&allocations, &proxy_served, &acl_sources, &blocks)).await?;
     EVER_APPLIED.store(true, Ordering::Relaxed);
     for ip in &remove {
         run_checked("ip", &["addr", "del", &format!("{ip}/32"), "dev", "lo"]).await?;

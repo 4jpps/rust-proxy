@@ -10,8 +10,12 @@
   event) before any allow, login or client-certificate check; a list marked
   global (`PUT /api/acls/:id/global`) is dropped at accept time on every
   HTTPS and port-80 listener. Matching uses an in-memory index, so there is no
-  per-request database work. Not covered: raw TCP/UDP passthrough listeners
-  and firewall port rules.
+  per-request database work. The firewall layer enforces them too: global
+  lists are dropped ahead of every accept rule in the `inet rust_proxy` input
+  chain (raw TCP/UDP passthrough, SSH, the admin port, established flows
+  included; loopback exempt) and in front of hosted VMs; a list selected on a
+  port rule or on a hosted VM's forwarded port drops just that traffic. The
+  ruleset is rewritten only when the resolved prefixes actually change.
 
 - **Organization lock for client certificates.** New System, Client
   certificates card "Require my organization" (`required_org_id` on

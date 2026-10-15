@@ -83,8 +83,9 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
     // a source restriction of its own. A raw TCP/UDP port rule has no
     // such application layer to fall back to, so an IP-allow ACL
     // selected on one *is* enforced here, directly at the firewall.
-    // Only AclKind::IpAllow contributes; a Login-kind list selected on a
-    // port rule is silently ignored (see PortRule::acl_ids' doc comment).
+    // Only AclKind::IpAllow contributes here (IpBlock lists are handled
+    // separately below); a Login-kind list selected on a port rule is
+    // silently ignored (see PortRule::acl_ids' doc comment).
     let mut rule_allow_ips = std::collections::HashMap::new();
     for rule in port_rules
         .iter()
@@ -93,6 +94,22 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
         let resolved = crate::db::resolve_acl_ids(state.db(), &rule.acl_ids).await?;
         if resolved.has_ip_allow_acl {
             rule_allow_ips.insert(rule.id, resolved.allow_ips);
+        }
+    }
+
+    // IP/ASN block lists: global ones drop everything, and any selected on a
+    // port rule drop just that rule's traffic. This is what covers raw
+    // TCP/UDP passthrough and firewall-only rules, which have no
+    // application layer to refuse a request.
+    let index = state.block_index();
+    let mut blocks = generator::NftBlocks {
+        global: index.global_nets().to_vec(),
+        rule: std::collections::HashMap::new(),
+    };
+    for rule in port_rules.iter().filter(|r| r.enabled && !r.acl_ids.is_empty()) {
+        let nets = index.nets_for(&rule.acl_ids);
+        if !nets.is_empty() {
+            blocks.rule.insert(rule.id, nets);
         }
     }
 
@@ -106,6 +123,7 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
         &rule_allow_ips,
         &state.network().dedicated_ips,
         &state.network().dhcp_interfaces,
+        &blocks,
     );
     apply(&ruleset).await
 }
