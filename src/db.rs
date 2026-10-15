@@ -271,6 +271,33 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE acl_ip_entries ADD COLUMN description TEXT")
         .execute(pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE acl_lists ADD COLUMN global_block INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS asn_prefixes (
+            asn INTEGER NOT NULL,
+            cidr TEXT NOT NULL,
+            PRIMARY KEY (asn, cidr)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS asn_status (
+            asn INTEGER PRIMARY KEY,
+            attempted_at TEXT NOT NULL,
+            fetched_at TEXT,
+            prefix_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS acl_credentials (
@@ -1111,6 +1138,7 @@ fn acl_kind_to_str(kind: AclKind) -> &'static str {
         AclKind::IpAllow => "ip_allow",
         AclKind::Login => "login",
         AclKind::ClientCert => "client_cert",
+        AclKind::IpBlock => "ip_block",
     }
 }
 
@@ -1118,6 +1146,7 @@ fn acl_kind_from_str(s: &str) -> AclKind {
     match s {
         "login" => AclKind::Login,
         "client_cert" => AclKind::ClientCert,
+        "ip_block" => AclKind::IpBlock,
         _ => AclKind::IpAllow,
     }
 }
@@ -1229,7 +1258,7 @@ pub struct AclClientCertEntry {
 }
 
 pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>, sqlx::Error> {
-    let row = sqlx::query("SELECT id, name, kind, created_at FROM acl_lists WHERE id = ?")
+    let row = sqlx::query("SELECT id, name, kind, created_at, global_block FROM acl_lists WHERE id = ?")
         .bind(id.to_string())
         .fetch_optional(pool)
         .await?;
@@ -1240,6 +1269,7 @@ pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>
         created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
+        global: row.get::<i64, _>("global_block") != 0,
     }))
 }
 
@@ -1474,7 +1504,7 @@ pub async fn delete_acl_client_cert_entry(pool: &SqlitePool, entry_id: Uuid) -> 
 
 pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Error> {
     let rows =
-        sqlx::query("SELECT id, name, kind, created_at FROM acl_lists ORDER BY created_at ASC")
+        sqlx::query("SELECT id, name, kind, created_at, global_block FROM acl_lists ORDER BY created_at ASC")
             .fetch_all(pool)
             .await?;
     rows.into_iter()
@@ -1486,9 +1516,124 @@ pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Err
                 created_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),
+                global: row.get::<i64, _>("global_block") != 0,
             })
         })
         .collect()
+}
+
+pub async fn set_acl_global(pool: &SqlitePool, id: Uuid, global: bool) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE acl_lists SET global_block = ? WHERE id = ?")
+        .bind(global as i64)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Every `IpBlock` list as `(id, global, entries)`, entries being the raw
+/// CIDR / `AS<n>` strings.
+pub async fn load_block_lists(
+    pool: &SqlitePool,
+) -> Result<Vec<(Uuid, bool, Vec<String>)>, sqlx::Error> {
+    let lists = sqlx::query("SELECT id, global_block FROM acl_lists WHERE kind = 'ip_block'")
+        .fetch_all(pool)
+        .await?;
+    let mut out = Vec::with_capacity(lists.len());
+    for row in lists {
+        let Ok(id) = Uuid::parse_str(&row.get::<String, _>("id")) else { continue };
+        let entries = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?")
+            .bind(id.to_string())
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|r| r.get::<String, _>("cidr"))
+            .collect();
+        out.push((id, row.get::<i64, _>("global_block") != 0, entries));
+    }
+    Ok(out)
+}
+
+pub async fn load_asn_prefixes(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<u32, Vec<String>>, sqlx::Error> {
+    let rows = sqlx::query("SELECT asn, cidr FROM asn_prefixes").fetch_all(pool).await?;
+    let mut map: std::collections::HashMap<u32, Vec<String>> = std::collections::HashMap::new();
+    for r in rows {
+        map.entry(r.get::<i64, _>("asn") as u32).or_default().push(r.get("cidr"));
+    }
+    Ok(map)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AsnStatus {
+    pub asn: u32,
+    pub prefix_count: i64,
+    pub fetched_at: Option<String>,
+    pub attempted_at: String,
+    pub error: Option<String>,
+}
+
+pub async fn load_asn_status(pool: &SqlitePool) -> Result<Vec<AsnStatus>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT asn, attempted_at, fetched_at, prefix_count, error FROM asn_status ORDER BY asn",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| AsnStatus {
+            asn: r.get::<i64, _>("asn") as u32,
+            prefix_count: r.get("prefix_count"),
+            fetched_at: r.get("fetched_at"),
+            attempted_at: r.get("attempted_at"),
+            error: r.get("error"),
+        })
+        .collect())
+}
+
+/// Replaces an AS's stored prefixes with a fresh, non-empty fetch.
+pub async fn store_asn_prefixes(
+    pool: &SqlitePool,
+    asn: u32,
+    prefixes: &[String],
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM asn_prefixes WHERE asn = ?").bind(asn as i64).execute(&mut *tx).await?;
+    for p in prefixes {
+        sqlx::query("INSERT OR IGNORE INTO asn_prefixes (asn, cidr) VALUES (?, ?)")
+            .bind(asn as i64)
+            .bind(p)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO asn_status (asn, attempted_at, fetched_at, prefix_count, error) VALUES (?, ?, ?, ?, NULL)
+         ON CONFLICT(asn) DO UPDATE SET attempted_at = excluded.attempted_at, fetched_at = excluded.fetched_at,
+         prefix_count = excluded.prefix_count, error = NULL",
+    )
+    .bind(asn as i64)
+    .bind(&now)
+    .bind(&now)
+    .bind(prefixes.len() as i64)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// A failed fetch keeps whatever prefixes were stored before.
+pub async fn record_asn_failure(pool: &SqlitePool, asn: u32, error: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO asn_status (asn, attempted_at, fetched_at, prefix_count, error) VALUES (?, ?, NULL, 0, ?)
+         ON CONFLICT(asn) DO UPDATE SET attempted_at = excluded.attempted_at, error = excluded.error",
+    )
+    .bind(asn as i64)
+    .bind(Utc::now().to_rfc3339())
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn acl_list_name_exists(pool: &SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
@@ -1598,6 +1743,8 @@ pub async fn resolve_acl_ids(
                         password_hash: r.get("password_hash"),
                     }));
             }
+            // Deny lists are evaluated from the in-memory block index.
+            AclKind::IpBlock => {}
             AclKind::ClientCert => {
                 resolved.has_client_cert_acl = true;
                 let rows = sqlx::query("SELECT subject FROM acl_client_cert_entries WHERE acl_list_id = ?")

@@ -1,5 +1,6 @@
 mod acme;
 mod api;
+mod blocklist;
 mod bootstrap;
 mod config;
 mod db;
@@ -120,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = nftables::validate_environment().await {
         tracing::error!(error = %err, "nftables is not usable -- the firewall will not be enforced until this is fixed");
     }
+
+    tokio::spawn(blocklist::run_refresh_loop(state.clone()));
 
     tokio::try_join!(
         proxy::run(state.clone()),

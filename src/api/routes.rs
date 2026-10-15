@@ -64,6 +64,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/acls/:id",
             get(get_acl_list_detail).delete(delete_acl_list),
         )
+        .route("/api/acls/:id/global", axum::routing::put(set_acl_global))
         .route("/api/acls/:id/ip-entries", post(add_acl_ip_entry))
         .route(
             "/api/acls/:id/ip-entries/:entry_id",
@@ -1149,12 +1150,37 @@ fn normalize_cidr(s: &str) -> Result<String, ApiError> {
     )))
 }
 
+/// Block lists additionally take `AS<n>` entries.
+fn normalize_block_entry(s: &str) -> Result<String, ApiError> {
+    match crate::blocklist::parse_asn(s) {
+        Some(asn) => Ok(format!("AS{asn}")),
+        None => normalize_cidr(s.trim()),
+    }
+}
+
+fn normalize_entry_for(kind: crate::config::AclKind, s: &str) -> Result<String, ApiError> {
+    if kind == crate::config::AclKind::IpBlock {
+        normalize_block_entry(s)
+    } else {
+        normalize_cidr(s)
+    }
+}
+
+/// Re-expands the block index after any change that can affect it and
+/// starts a background fetch for ASNs not yet cached.
+async fn block_lists_changed(state: &AppState) {
+    crate::blocklist::rebuild(state).await;
+    let bg = state.clone();
+    tokio::spawn(async move { crate::blocklist::refresh_stale(&bg).await });
+}
+
 #[derive(Serialize)]
 struct AclListSummary {
     id: Uuid,
     name: String,
     kind: crate::config::AclKind,
     created_at: chrono::DateTime<chrono::Utc>,
+    global: bool,
 }
 
 #[derive(Deserialize)]
@@ -1194,6 +1220,7 @@ async fn list_acls(State(state): State<AppState>) -> Result<Json<Vec<AclListSumm
                 name: a.name,
                 kind: a.kind,
                 created_at: a.created_at,
+                global: a.global,
             })
             .collect(),
     ))
@@ -1222,16 +1249,16 @@ async fn create_acl_list(
     let created_at = chrono::Utc::now();
 
     match body.kind {
-        crate::config::AclKind::IpAllow => {
+        crate::config::AclKind::IpAllow | crate::config::AclKind::IpBlock => {
             if body.ip_entries.is_empty() {
                 return Err(ApiError::BadRequest(
-                    "ip_entries must not be empty for an IP allow list".into(),
+                    "ip_entries must not be empty for an IP list".into(),
                 ));
             }
             let normalized: Vec<String> = body
                 .ip_entries
                 .iter()
-                .map(|s| normalize_cidr(s))
+                .map(|s| normalize_entry_for(body.kind, s))
                 .collect::<Result<_, _>>()?;
             crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
             crate::db::add_acl_ip_entries(state.db(), id, &normalized).await?;
@@ -1275,11 +1302,15 @@ async fn create_acl_list(
         }
     }
 
+    if body.kind == crate::config::AclKind::IpBlock {
+        block_lists_changed(&state).await;
+    }
     Ok(Json(AclListSummary {
         id,
         name: name.to_string(),
         kind: body.kind,
         created_at,
+        global: false,
     }))
 }
 
@@ -1301,6 +1332,7 @@ async fn delete_acl_list(
     if !found {
         return Err(ApiError::NotFound);
     }
+    crate::blocklist::rebuild(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1313,6 +1345,32 @@ struct AclListDetail {
     ip_entries: Vec<crate::db::AclIpEntry>,
     credentials: Vec<crate::db::AclCredentialSummary>,
     client_cert_entries: Vec<crate::db::AclClientCertEntry>,
+    global: bool,
+    /// Prefix-fetch state for each `AS<n>` entry (block lists only).
+    asn_status: Vec<crate::db::AsnStatus>,
+}
+
+#[derive(Deserialize)]
+struct SetGlobalRequest {
+    global: bool,
+}
+
+/// Marks a block list as global (applies to every host and listener) or
+/// back to per-host.
+async fn set_acl_global(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetGlobalRequest>,
+) -> Result<StatusCode, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::IpBlock {
+        return Err(ApiError::BadRequest("only an IP block list can be global".into()));
+    }
+    crate::db::set_acl_global(state.db(), id, body.global).await?;
+    crate::blocklist::rebuild(&state).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Full detail for a single existing ACL, including its individual
@@ -1329,6 +1387,19 @@ async fn get_acl_list_detail(
     let ip_entries = crate::db::list_acl_ip_entries(state.db(), id).await?;
     let credentials = crate::db::list_acl_credentials(state.db(), id).await?;
     let client_cert_entries = crate::db::list_acl_client_cert_entries(state.db(), id).await?;
+    let asn_status = if list.kind == crate::config::AclKind::IpBlock {
+        let wanted: std::collections::HashSet<u32> = ip_entries
+            .iter()
+            .filter_map(|e| crate::blocklist::parse_asn(&e.cidr))
+            .collect();
+        crate::db::load_asn_status(state.db())
+            .await?
+            .into_iter()
+            .filter(|s| wanted.contains(&s.asn))
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Json(AclListDetail {
         id: list.id,
         name: list.name,
@@ -1337,6 +1408,8 @@ async fn get_acl_list_detail(
         ip_entries,
         credentials,
         client_cert_entries,
+        global: list.global,
+        asn_status,
     }))
 }
 
@@ -1364,16 +1437,22 @@ async fn add_acl_ip_entry(
     let list = crate::db::get_acl_list(state.db(), id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if list.kind != crate::config::AclKind::IpAllow {
+    if !matches!(
+        list.kind,
+        crate::config::AclKind::IpAllow | crate::config::AclKind::IpBlock
+    ) {
         return Err(ApiError::BadRequest(
-            "this ACL is not an IP allow list".into(),
+            "this ACL is not an IP list".into(),
         ));
     }
-    let cidr = normalize_cidr(&body.cidr)?;
+    let cidr = normalize_entry_for(list.kind, &body.cidr)?;
     let description = normalize_description(body.description);
     let entry_id =
         crate::db::add_acl_ip_entry(state.db(), id, &cidr, description.as_deref()).await?;
     state.notify_config_change();
+    if list.kind == crate::config::AclKind::IpBlock {
+        block_lists_changed(&state).await;
+    }
     Ok(Json(crate::db::AclIpEntry {
         id: entry_id,
         cidr,
@@ -1389,12 +1468,15 @@ async fn update_acl_ip_entry(
     let list = crate::db::get_acl_list(state.db(), id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if list.kind != crate::config::AclKind::IpAllow {
+    if !matches!(
+        list.kind,
+        crate::config::AclKind::IpAllow | crate::config::AclKind::IpBlock
+    ) {
         return Err(ApiError::BadRequest(
-            "this ACL is not an IP allow list".into(),
+            "this ACL is not an IP list".into(),
         ));
     }
-    let cidr = normalize_cidr(&body.cidr)?;
+    let cidr = normalize_entry_for(list.kind, &body.cidr)?;
     let description = normalize_description(body.description);
     let found =
         crate::db::update_acl_ip_entry(state.db(), entry_id, &cidr, description.as_deref()).await?;
@@ -1402,6 +1484,9 @@ async fn update_acl_ip_entry(
         return Err(ApiError::NotFound);
     }
     state.notify_config_change();
+    if list.kind == crate::config::AclKind::IpBlock {
+        block_lists_changed(&state).await;
+    }
     Ok(Json(crate::db::AclIpEntry {
         id: entry_id,
         cidr,
@@ -1418,6 +1503,7 @@ async fn delete_acl_ip_entry(
         return Err(ApiError::NotFound);
     }
     state.notify_config_change();
+    crate::blocklist::rebuild(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4224,6 +4310,81 @@ mod tests {
             .unwrap();
         let json = body_json(list_resp).await;
         assert_eq!(json[0]["name"], "office");
+    }
+
+    #[tokio::test]
+    async fn ip_block_acl_accepts_asn_entries_toggles_global_and_feeds_the_index() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+        let call = |method: &'static str, uri: String, body: &'static str| {
+            let router = router.clone();
+            let cookie = cookie.clone();
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(header::COOKIE, cookie)
+                            .body(axum::body::Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let resp = call(
+            "POST",
+            "/api/acls".into(),
+            r#"{"name":"bad-actors","kind":"ip_block","ip_entries":["203.0.113.7","as13238","198.51.100.0/24"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created = body_json(resp).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["global"], false);
+
+        let detail = body_json(call("GET", format!("/api/acls/{id}"), "").await).await;
+        let cidrs: Vec<&str> = detail["ip_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["cidr"].as_str().unwrap())
+            .collect();
+        assert!(cidrs.contains(&"AS13238"), "{cidrs:?}");
+        assert!(cidrs.contains(&"203.0.113.7/32"), "{cidrs:?}");
+
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let list_id: Uuid = id.parse().unwrap();
+        assert!(state.block_index().is_blocked_for(&[list_id], ip));
+        assert!(!state.block_index().is_globally_blocked(ip));
+
+        let resp = call("PUT", format!("/api/acls/{id}/global"), r#"{"global":true}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state.block_index().is_globally_blocked(ip));
+
+        let bad = call("POST", format!("/api/acls/{id}/ip-entries"), r#"{"cidr":"ASx"}"#).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let allow = body_json(
+            call(
+                "POST",
+                "/api/acls".into(),
+                r#"{"name":"office2","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#,
+            )
+            .await,
+        )
+        .await;
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{}/global", allow["id"].as_str().unwrap()),
+            r#"{"global":true}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

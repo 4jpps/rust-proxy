@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- **IP and ASN block lists.** New access list type `ip_block` (deny) that
+  takes single IPs, CIDRs and AS numbers (`AS13238`). An ASN expands to every
+  prefix it announces, fetched from RIPEstat, cached in the database,
+  refreshed daily, and kept at the last good copy if a refresh fails. A list
+  selected on a site blocks that site (403, logged as an `ip_blocked` denied
+  event) before any allow, login or client-certificate check; a list marked
+  global (`PUT /api/acls/:id/global`) is dropped at accept time on every
+  HTTPS and port-80 listener. Matching uses an in-memory index, so there is no
+  per-request database work. Not covered: raw TCP/UDP passthrough listeners
+  and firewall port rules.
+
 - **Organization lock for client certificates.** New System, Client
   certificates card "Require my organization" (`required_org_id` on
   `PUT /api/trustbridge`; an empty string removes it). When set, only client

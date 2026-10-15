@@ -103,6 +103,7 @@ struct Inner {
     /// When set, only client certs carrying this TrustBridge org-id are
     /// honored (see `client_cert::org_allowed`).
     required_client_cert_org: ArcSwap<Option<String>>,
+    block_index: ArcSwap<crate::blocklist::BlockIndex>,
     /// Response for a hostname that matches no site (NPM's Default Site).
     default_site: ArcSwap<crate::config::DefaultSite>,
     /// Fires whenever `hosts`/`port_rules` change, so `nftables::run_sync_loop`
@@ -162,6 +163,7 @@ impl AppState {
             expose_admin_port_db: ArcSwap::from_pointee(initial_expose_admin_port.unwrap_or(true)),
             admin_allowed_ips_db: ArcSwap::from_pointee(Vec::new()),
             required_client_cert_org: ArcSwap::from_pointee(None),
+            block_index: ArcSwap::from_pointee(crate::blocklist::BlockIndex::default()),
             default_site: ArcSwap::from_pointee(crate::config::DefaultSite::default()),
             config_dirty: Notify::new(),
             db,
@@ -242,6 +244,14 @@ impl AppState {
 
     pub fn required_client_cert_org(&self) -> Option<String> {
         (**self.0.required_client_cert_org.load()).clone()
+    }
+
+    pub fn block_index(&self) -> Arc<crate::blocklist::BlockIndex> {
+        self.0.block_index.load_full()
+    }
+
+    pub fn set_block_index(&self, index: crate::blocklist::BlockIndex) {
+        self.0.block_index.store(Arc::new(index));
     }
 
     pub fn set_required_client_cert_org(&self, org_id: Option<String>) {

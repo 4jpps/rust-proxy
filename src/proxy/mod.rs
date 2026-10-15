@@ -173,6 +173,10 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 continue;
             }
             let peer_ip = peer.ip();
+            if state.block_index().is_globally_blocked(peer_ip) {
+                tracing::debug!(%peer_ip, "connection dropped: globally blocked");
+                continue;
+            }
             let config_with_client_auth = config_with_client_auth.clone();
             let config_no_client_auth = config_no_client_auth.clone();
             let state = state.clone();
@@ -592,6 +596,24 @@ async fn route_https_request_inner(
         return Ok(default_site_response(&state.default_site()));
     };
 
+    if state.block_index().is_blocked_for(&host.acl_ids, peer_ip) {
+        if crate::siem::wants(crate::siem::Category::Denied) {
+            let client_ip = peer_ip.to_string();
+            crate::siem::emit(
+                crate::siem::Category::Denied,
+                crate::siem::Severity::Warning,
+                "ip_blocked",
+                "request refused: source IP is on a block list",
+                &[
+                    ("client_ip", client_ip.as_str()),
+                    ("domain", host.domain.as_str()),
+                    ("path", req.uri().path()),
+                ],
+            );
+        }
+        return Ok(forbidden_page(&host.domain));
+    }
+
     // Never let a client set this header itself -- only ever set below,
     // from a TLS-layer-verified cert, once we know whether this host
     // actually wants it forwarded. Stripped unconditionally (even for
@@ -987,7 +1009,7 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
         tracing::info!(%addr, "http redirect listener started");
 
         loop {
-            let (stream, _peer) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(err) => {
                     tracing::warn!(error = %err, "redirect listener accept failed");
@@ -1000,11 +1022,28 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
             if wildcard_listener_got_dedicated_ip(&state, bind_ip, &stream) {
                 continue;
             }
+            let peer_ip = peer.ip();
+            if state.block_index().is_globally_blocked(peer_ip) {
+                tracing::debug!(%peer_ip, "connection dropped: globally blocked");
+                continue;
+            }
             let io = TokioIo::new(stream);
             let state = state.clone();
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                 let state = state.clone();
                 async move {
+                    let host_name = req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|v| v.to_str().ok());
+                    if let Some(name) = host_name {
+                        let index = state.block_index();
+                        let blocked = router::known_hosts(&state.hosts(), name)
+                            .any(|h| index.is_blocked_for(&h.acl_ids, peer_ip));
+                        if blocked {
+                            return deliver(forbidden_page(name));
+                        }
+                    }
                     if let Some(resp) = http::http01_challenge_response(&state, &req) {
                         return Ok::<_, ServiceError>(resp);
                     }

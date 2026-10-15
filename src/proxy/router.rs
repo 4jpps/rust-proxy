@@ -53,6 +53,18 @@ pub fn host_is_known(hosts: &[ProxyHost], name: &str) -> bool {
     })
 }
 
+/// Enabled hosts a plain-HTTP `Host:` name resolves to on any bind
+/// address (exact name, plus a one-label `*.parent` wildcard).
+pub fn known_hosts<'a>(hosts: &'a [ProxyHost], name: &str) -> impl Iterator<Item = &'a ProxyHost> {
+    let name = strip_port_suffix(name).to_string();
+    let wildcard = name.split_once('.').map(|(_, parent)| format!("*.{parent}"));
+    hosts.iter().filter(move |h| {
+        h.enabled
+            && (h.domain.eq_ignore_ascii_case(&name)
+                || wildcard.as_deref().is_some_and(|w| h.domain.eq_ignore_ascii_case(w)))
+    })
+}
+
 /// `Host:` headers (unlike SNI) may carry a `:port` suffix.
 fn strip_port_suffix(name: &str) -> &str {
     match name.rsplit_once(':') {

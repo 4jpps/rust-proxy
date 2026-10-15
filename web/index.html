@@ -738,7 +738,7 @@ const actsTd = (html) => `<td class="acts" data-label="Actions">${html}</td>`;
 const abtn = (act, id, label, cls = '', extra = '') => `<button type="button" class="btn sm ${cls}" data-act="${act}" data-id="${esc(id)}"${extra}>${esc(label)}</button>`;
 const bindText = (o) => [o.bind_ip_v4, o.bind_ip_v6].filter(Boolean).map(esc).join(' / ') || '—';
 const aclNames = (ids) => (ids || []).map((id) => (aclById()[id] ? esc(aclById()[id].name) : '(deleted)')).join(', ');
-const aclKindLabel = (k) => (k === 'login' ? 'Login' : k === 'client_cert' ? 'Client cert' : 'IP allow');
+const aclKindLabel = (k) => (k === 'login' ? 'Login' : k === 'client_cert' ? 'Client cert' : k === 'ip_block' ? 'IP block' : 'IP allow');
 function certPill(days) {
   if (days <= 0) return pill('error', 'Expired');
   if (days <= 30) return pill('warn', `Expiring · ${days}d`);
@@ -1479,7 +1479,7 @@ function pAcls() {
   const acls = D.acls || [];
   if (!acls.length) return emptyState({ ic: 'network', title: 'No access lists', text: 'Access lists restrict a site or port rule by source IP, login or client certificate.', cta: { label: 'New access list', act: 'acl-add' } });
   return table([{ l: 'Name' }, { l: 'Type' }, { l: 'Created' }, { l: 'Actions', sr: true }], acls.map((a) =>
-    '<tr>' + td('Name', `<span class="dom">${esc(a.name)}</span>`) + td('Type', esc(aclKindLabel(a.kind))) + td('Created', esc(fmtDT(a.created_at))) +
+    '<tr>' + td('Name', `<span class="dom">${esc(a.name)}</span>`) + td('Type', esc(aclKindLabel(a.kind)) + (a.global ? ' ' + pill('warn', 'Global') : '')) + td('Created', esc(fmtDT(a.created_at))) +
     actsTd(abtn('acl-manage', a.id, 'Manage entries') + abtn('acl-del', a.id, 'Delete', 'danger')) + '</tr>'));
 }
 ACTIONS['acl-del'] = async (el) => {
@@ -1491,13 +1491,14 @@ const credRowHTML = () => `<div class="rowedit cols3" data-cred-row><div class="
 ACTIONS['acl-add'] = () => openDrawer({
   title: 'New access list', submitLabel: 'Create list',
   body: `<div class="fgrid">${fld({ name: 'name', label: 'Name', required: true, wide: true })}
-    ${sel({ name: 'kind', label: 'Type', wide: true, options: [['ip_allow', 'IP allow (source address)'], ['login', 'Login (username and password)'], ['client_cert', 'Client certificate (TrustBridge)']] })}</div>
+    ${sel({ name: 'kind', label: 'Type', wide: true, options: [['ip_allow', 'IP allow (source address)'], ['ip_block', 'IP / ASN block (deny)'], ['login', 'Login (username and password)'], ['client_cert', 'Client certificate (TrustBridge)']] })}</div>
     <div id="acl-kind-ip" style="margin-top:var(--s-4)">${ta({ name: 'ip_entries', label: 'Allowed IPs or CIDRs (one per line)', rows: 4, help: 'For example 10.0.0.0/24. Add descriptions later under Manage entries.' })}</div>
+    <div id="acl-kind-block" style="margin-top:var(--s-4)" hidden>${ta({ name: 'block_entries', label: 'Blocked IPs, CIDRs or ASNs (one per line)', rows: 5, mono: true, help: 'For example 203.0.113.7, 198.51.100.0/24 or AS13238. An ASN blocks every prefix that AS announces (refreshed daily from RIPEstat). Select the list on a site to block it there, or mark it global under Manage entries to block it everywhere.' })}</div>
     <div id="acl-kind-login" style="margin-top:var(--s-4)" hidden><div id="cred-rows">${credRowHTML()}</div><button type="button" class="btn sm" id="cred-add">${icon('plus')}Add login</button></div>
     <p class="help" id="acl-kind-cert" style="margin-top:var(--s-4)" hidden>Only certificates whose Subject CN you list are trusted. Add at least one Subject CN under Manage entries after creating the list: with no entries, no certificate is trusted.</p>`,
   onOpen: (root) => {
     const k = $('select[name=kind]', root);
-    const sync = () => { $('#acl-kind-ip', root).hidden = k.value !== 'ip_allow'; $('#acl-kind-login', root).hidden = k.value !== 'login'; $('#acl-kind-cert', root).hidden = k.value !== 'client_cert'; };
+    const sync = () => { $('#acl-kind-ip', root).hidden = k.value !== 'ip_allow'; $('#acl-kind-block', root).hidden = k.value !== 'ip_block'; $('#acl-kind-login', root).hidden = k.value !== 'login'; $('#acl-kind-cert', root).hidden = k.value !== 'client_cert'; };
     k.addEventListener('change', sync); sync();
     wireRows(root, '#cred-rows', '#cred-add', credRowHTML);
   },
@@ -1506,6 +1507,7 @@ ACTIONS['acl-add'] = () => openDrawer({
     const body = { name: fd.get('name').trim(), kind };
     if (kind === 'login') body.credentials = $$('[data-cred-row]', form).map((r) => ({ username: r.querySelector('[data-c=username]').value, password: r.querySelector('[data-c=password]').value })).filter((c) => c.username || c.password);
     else if (kind === 'ip_allow') body.ip_entries = lines(fd.get('ip_entries'));
+    else if (kind === 'ip_block') body.ip_entries = lines(fd.get('block_entries'));
     await send('POST', '/api/acls', body);
     toast('Access list created', 'ok'); refresh('acls');
   },
@@ -1514,6 +1516,7 @@ ACTIONS['acl-add'] = () => openDrawer({
 const MANAGE = { id: null, kind: null };
 const ENTRY = {
   ip_allow: { path: 'ip-entries', list: 'ip_entries', main: 'cidr', mainLabel: 'IP or CIDR', ph: '10.0.0.0/24', del: 'entry' },
+  ip_block: { path: 'ip-entries', list: 'ip_entries', main: 'cidr', mainLabel: 'IP, CIDR or ASN', ph: 'AS13238 or 203.0.113.0/24', del: 'entry' },
   client_cert: { path: 'client-cert-entries', list: 'client_cert_entries', main: 'subject', mainLabel: 'Subject CN', ph: 'Jeffs MacBook', del: 'entry' },
   login: { path: 'credentials', list: 'credentials', main: 'username', mainLabel: 'Username', ph: 'username', del: 'credential' },
 };
@@ -1530,6 +1533,8 @@ async function loadManage(root) {
     const d = await jget(`/api/acls/${MANAGE.id}`);
     MANAGE.entries = d[spec.list] || [];
     box.innerHTML = MANAGE.entries.length ? MANAGE.entries.map((e) => entryRow(e, spec)).join('') : '<li class="faint">No entries yet.</li>';
+    const st = $('#asn-status', root);
+    if (st) st.innerHTML = (d.asn_status || []).map((a) => `<li><span class="grow"><span class="m mono">AS${esc(a.asn)}</span><span class="sub">${a.fetched_at ? `${esc(a.prefix_count)} prefixes, fetched ${esc(fmtDT(a.fetched_at))}` : 'not fetched yet'}${a.error ? ` — last error: ${esc(a.error)}` : ''}</span></span></li>`).join('');
   } catch (e) { if (e.message !== 'unauthenticated') box.innerHTML = `<li class="faint">${esc(e.message)}</li>`; }
 }
 ACTIONS['acl-manage'] = (el) => {
@@ -1538,10 +1543,12 @@ ACTIONS['acl-manage'] = (el) => {
   const spec = ENTRY[a.kind];
   const hint = a.kind === 'login' ? 'Each row is one username and password a visitor can sign in with.'
     : a.kind === 'client_cert' ? 'Each row is one allowed certificate Subject CN (issued from pki.jpps.us). Only certificates whose Subject CN is listed are trusted. With zero rows, no certificate is trusted.'
+    : a.kind === 'ip_block' ? 'Each row is one blocked source IP, CIDR or ASN (for example AS13238). Blocked sources are refused before any allow, login or certificate check.'
     : 'Each row is one allowed source IP or CIDR.';
   openDrawer({
     title: `Manage ${a.name}`,
     body: `<p class="lead">${esc(hint)}</p>
+      ${a.kind === 'ip_block' ? `<div class="checks" style="margin-bottom:var(--s-3)">${chk({ name: 'blk-global', label: 'Global: block on every site and listener', checked: !!a.global, help: 'Off applies the list only to sites that select it.' })}</div><ul class="list" id="asn-status" aria-live="polite"></ul>` : ''}
       <ul class="list entries" id="manage-list" aria-live="polite"><li class="faint">Loading…</li></ul>
       <form id="manage-add" class="addbox" novalidate><h3>Add entry</h3><div class="fgrid">
         <div class="field wide"><label for="ma-main" class="req">${esc(spec.mainLabel)}</label><input id="ma-main" type="text" name="main" placeholder="${esc(spec.ph)}" required></div>
@@ -1553,6 +1560,10 @@ ACTIONS['acl-manage'] = (el) => {
       document.getElementById('drawer').addEventListener('close', () => refresh('acls', 'hosts', 'rules'), { once: true });
       const err = (m) => { const p = $('#manage-error', root); p.textContent = m || ''; p.hidden = !m; };
       loadManage(root);
+      const gl = $('input[name=blk-global]', root);
+      if (gl) gl.addEventListener('change', async () => {
+        try { await send('PUT', `/api/acls/${MANAGE.id}/global`, { global: gl.checked }); toast(gl.checked ? 'List is now global' : 'List is now per-site', 'ok'); } catch (x) { gl.checked = !gl.checked; if (x.message !== 'unauthenticated') err(x.message); }
+      });
       const add = $('#manage-add', root);
       wireForm(add);
       add.addEventListener('submit', async (e) => {

@@ -1014,6 +1014,10 @@ pub struct AclList {
     pub name: String,
     pub kind: AclKind,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Only meaningful for `AclKind::IpBlock`: when set, the list applies
+    /// to every host and listener rather than only hosts that select it.
+    #[serde(default)]
+    pub global: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1035,6 +1039,12 @@ pub enum AclKind {
     /// handle_https_request`'s ACL-gate logic for exactly how this
     /// combines with `IpAllow`/`Login` lists on the same host.
     ClientCert,
+    /// A deny list of CIDRs, single IPs and autonomous systems (`AS12345`,
+    /// expanded to the prefixes the AS announces). A source IP inside any
+    /// entry of a selected list is refused outright, before the allow,
+    /// login and client-cert gates. A list marked global applies to every
+    /// host without being selected.
+    IpBlock,
 }
 
 fn default_https_port() -> u16 {
