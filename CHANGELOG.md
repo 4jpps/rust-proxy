@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+- **Per-port source ACLs on hosted addresses.** A hosting allocation's
+  forwarded ports (`ports[].acl_ids`) can be limited to the sources of one
+  or more IP-allow ACLs, e.g. SSH (tcp/22) to a VM from a trusted list only.
+  Omitted means any source (the default for client VMs); an ACL with no IPv4
+  entries forwards nothing. Everything not forwarded still hits the hosting
+  input drop, so the proxy's own sshd never answers on a hosted address.
+  Editing an ACL re-syncs hosting immediately. Patching an allocation no
+  longer re-runs the dedicated/bound-address checks on its unchanged
+  public IP.
+
 ## [0.3.0] - 2026-10-14
 
 - **Client certificate revocation (OCSP).** TrustBridge client certificates

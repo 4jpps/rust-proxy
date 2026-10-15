@@ -531,14 +531,19 @@ pub async fn patch_allocation(
         .find(|p| p.name == updated.pool)
         .ok_or_else(|| ApiError::Internal("allocation refers to a missing pool".into()))?;
     let others: Vec<Allocation> = allocations.iter().filter(|a| a.id != id).cloned().collect();
+    // `public_ip` can't change in a patch, so the address-identity checks
+    // (dedicated / already bound) were settled at creation. Re-running them
+    // would lock out any allocation whose address was later added to
+    // `dedicated_ips` or bound to a proxy host -- exactly what an operator
+    // does to serve a site on a hosted address.
     model::validate_allocation(
         &updated,
         &AllocationContext {
             pool,
             all_pools: &pools,
             others: &others,
-            dedicated: &state.network().dedicated_ips,
-            bound_ips: &bound_ips(&state),
+            dedicated: &[],
+            bound_ips: &HashSet::new(),
         },
     )?;
     validate_port_acls(&state, &updated).await?;
