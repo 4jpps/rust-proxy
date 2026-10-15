@@ -1220,7 +1220,7 @@ async function copyText(text, what = 'Copied') {
   try { await navigator.clipboard.writeText(text); toast(what, 'ok'); }
   catch (_) { toast('Copy failed: select the text and copy it manually.', 'warn'); }
 }
-$('#drawer-main').addEventListener('click', (e) => {
+document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-copy]');
   if (b) copyText(b.dataset.copy);
 });
