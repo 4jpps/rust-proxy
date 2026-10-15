@@ -104,6 +104,18 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/siem/test", post(send_siem_test))
         .route(
+            "/api/trustbridge",
+            get(super::trustbridge::get_settings).put(super::trustbridge::put_settings),
+        )
+        .route(
+            "/api/trustbridge/certs",
+            get(super::trustbridge::list_certs).post(super::trustbridge::create_cert),
+        )
+        .route(
+            "/api/trustbridge/certs/:serial/revoke",
+            post(super::trustbridge::revoke_cert),
+        )
+        .route(
             "/api/default-site",
             get(super::default_site::get_default_site).put(super::default_site::put_default_site),
         )
@@ -5895,5 +5907,96 @@ mod tests {
         let resp = send(&router, "PUT", "/api/firewall-settings", Some(&cookie), None, Some(r#"{"admin_allowed_ips":[]}"#)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(state.admin_allowed_ips().is_empty());
+    }
+
+    /// Spins up a fake TrustBridge on loopback that checks the bearer
+    /// token and echoes the org contract, then drives the real handlers.
+    #[tokio::test]
+    async fn trustbridge_settings_and_cert_passthrough_against_a_fake_server() {
+        use super::super::trustbridge as tb;
+        use axum::routing::{get, post};
+        use serde_json::{json, Value};
+
+        fn authed(h: &axum::http::HeaderMap) -> bool {
+            h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer tbo_secret")
+        }
+        let fake = Router::new()
+            .route("/api/v1/org", get(|h: axum::http::HeaderMap| async move {
+                if !authed(&h) { return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad token"}))); }
+                (StatusCode::OK, Json(json!({"org_id": "O-1", "name": "Acme", "tier": "free", "cert_limit": 5, "active_certs": 1})))
+            }))
+            .route("/api/v1/org/certs", get(|h: axum::http::HeaderMap| async move {
+                if !authed(&h) { return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad token"}))); }
+                (StatusCode::OK, Json(json!({"certs": []})))
+            }).post(|h: axum::http::HeaderMap, Json(b): Json<Value>| async move {
+                if !authed(&h) { return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad token"}))); }
+                if b["common_name"] == "limit" {
+                    return (StatusCode::FORBIDDEN, Json(json!({"error": "certificate limit reached"})));
+                }
+                (StatusCode::CREATED, Json(json!({"serial": "42", "common_name": b["common_name"], "days": b["days"], "key_pem": "KEY"})))
+            }))
+            .route("/api/v1/org/certs/:serial/revoke", post(|axum::extract::Path(s): axum::extract::Path<String>| async move {
+                Json(json!({"serial": s, "revoked": true}))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap(); });
+
+        let state = test_state().await;
+        let st = || State(state.clone());
+
+        // Default: public TrustBridge, no token, nothing queried.
+        let Json(v) = tb::get_settings(st()).await.ok().unwrap();
+        assert_eq!(v["url"], "https://pki.jpps.us");
+        assert_eq!(v["token_set"], false);
+        assert!(v["org"].is_null());
+
+        // Bad URL / empty update are rejected.
+        assert!(tb::put_settings(st(), Json(serde_json::from_value(json!({"url": "http://example.com"})).unwrap())).await.is_err());
+        assert!(tb::put_settings(st(), Json(serde_json::from_value(json!({})).unwrap())).await.is_err());
+        // Cert calls without a token are refused before any network use.
+        assert!(tb::list_certs(st()).await.is_err());
+
+        // A wrong token reports an error string but the endpoint itself is 200.
+        let body = json!({"url": format!("http://127.0.0.1:{port}/"), "token": "tbo_wrong"});
+        let Json(v) = tb::put_settings(st(), Json(serde_json::from_value(body).unwrap())).await.ok().unwrap();
+        assert_eq!(v["token_set"], true);
+        assert!(v["error"].as_str().unwrap().contains("rejected the org token"));
+        assert!(!v.to_string().contains("tbo_wrong"), "token must never be echoed");
+
+        // Right token: org info comes back, still no token in the body.
+        let Json(v) = tb::put_settings(st(), Json(serde_json::from_value(json!({"token": "tbo_secret"})).unwrap())).await.ok().unwrap();
+        assert_eq!(v["org"]["org_id"], "O-1");
+        assert_eq!(v["url"], format!("http://127.0.0.1:{port}"));
+        assert!(!v.to_string().contains("tbo_secret"));
+
+        let Json(v) = tb::list_certs(st()).await.ok().unwrap();
+        assert_eq!(v["certs"], json!([]));
+
+        // Create passes fields through, returns 201 + no-store.
+        let resp = tb::create_cert(st(), Json(serde_json::from_value(json!({"common_name": " Jeff ", "days": 30})).unwrap())).await.ok().unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!((v["common_name"].as_str(), v["days"].as_u64()), (Some("Jeff"), Some(30)));
+
+        // Upstream 4xx keeps its status and message.
+        let err = tb::create_cert(st(), Json(serde_json::from_value(json!({"common_name": "limit"})).unwrap())).await.err().unwrap();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"], "certificate limit reached");
+
+        // Bad input never reaches upstream.
+        assert!(tb::create_cert(st(), Json(serde_json::from_value(json!({"common_name": "x", "days": 0})).unwrap())).await.is_err());
+        assert!(tb::revoke_cert(st(), Path("../etc".into())).await.is_err());
+
+        let Json(v) = tb::revoke_cert(st(), Path("42".into())).await.ok().unwrap();
+        assert_eq!(v, json!({"serial": "42", "revoked": true}));
+
+        // Empty token clears it.
+        let Json(v) = tb::put_settings(st(), Json(serde_json::from_value(json!({"token": ""})).unwrap())).await.ok().unwrap();
+        assert_eq!(v["token_set"], false);
     }
 }

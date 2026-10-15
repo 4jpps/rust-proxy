@@ -124,6 +124,13 @@ impl RevocationChecker {
         }
     }
 
+    /// Drops every cached OCSP verdict so the next request for any cert
+    /// asks the responder again. Called after an admin revokes a cert
+    /// through TrustBridge, so a cached "good" doesn't outlive the revoke.
+    pub fn forget_cached_verdicts(&self) {
+        self.cache.lock().unwrap().clear();
+    }
+
     /// True if this leaf certificate is known to be revoked. Never errors:
     /// every failure to find out is treated as "not revoked" (fail open).
     pub async fn is_revoked(&self, leaf_der: &[u8]) -> bool {

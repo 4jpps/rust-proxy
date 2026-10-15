@@ -52,6 +52,7 @@ const ADMIN_WRITE_PATHS: &[&str] = &[
     "/api/license",
     "/api/default-site",
     "/api/hosting/pools",
+    "/api/trustbridge",
 ];
 
 fn path_is_under(path: &str, prefix: &str) -> bool {
@@ -214,6 +215,23 @@ mod tests {
     use super::*;
 
     use axum::http::Method;
+
+    #[test]
+    fn only_admins_manage_trustbridge_certs_but_anyone_may_read() {
+        for (m, p) in [
+            (Method::PUT, "/api/trustbridge"),
+            (Method::POST, "/api/trustbridge/certs"),
+            (Method::POST, "/api/trustbridge/certs/123/revoke"),
+        ] {
+            assert!(Role::Admin.allows(&m, p), "{m} {p}");
+            assert!(!Role::Operator.allows(&m, p), "{m} {p}");
+            assert!(!Role::Viewer.allows(&m, p), "{m} {p}");
+        }
+        for p in ["/api/trustbridge", "/api/trustbridge/certs"] {
+            assert!(Role::Operator.allows(&Method::GET, p));
+            assert!(Role::Viewer.allows(&Method::GET, p));
+        }
+    }
 
     #[test]
     fn admin_may_do_anything() {

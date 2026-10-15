@@ -10,6 +10,7 @@ pub mod default_site;
 pub mod hosting;
 pub mod license;
 pub mod routes;
+pub mod trustbridge;
 
 use std::net::{IpAddr, SocketAddr};
 

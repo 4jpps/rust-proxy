@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- **TrustBridge client certificates from the admin UI, and org identity on
+  client certs.** New System, Client certificates page (and
+  `GET/PUT /api/trustbridge`, `GET/POST /api/trustbridge/certs`,
+  `POST /api/trustbridge/certs/:serial/revoke`) to connect to a TrustBridge
+  organization (URL defaults to `https://pki.jpps.us`, https only except
+  loopback; the org token is write-only and never returned), see the org's
+  tier and usage, list certificates, issue one (the key and `.p12` are shown
+  once, never stored) and revoke one (the OCSP verdict cache is cleared so a
+  revoke takes effect immediately). Writes are admin only. The proxy now
+  also reads the client certificate's organization (O) and organization id
+  (`organizationIdentifier`, OID 2.5.4.97, falling back to an `org-id:` OU)
+  and forwards them as `X-Client-Cert-Org` and `X-Client-Cert-Org-Id`
+  alongside the existing subject header; inbound copies of all identity
+  headers are stripped. Org data is carried and forwarded but **not yet
+  enforced**: client-certificate ACLs still match on the common name only, so
+  existing CN-only certificates keep working.
 - **Per-port source ACLs on hosted addresses.** A hosting allocation's
   forwarded ports (`ports[].acl_ids`) can be limited to the sources of one
   or more IP-allow ACLs, e.g. SSH (tcp/22) to a VM from a trusted list only.

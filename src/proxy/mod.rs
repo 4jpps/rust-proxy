@@ -213,7 +213,7 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                     }
                 };
                 let client_cert_subject =
-                    client_cert::client_cert_subject(tls_stream.get_ref().1.peer_certificates());
+                    client_cert::client_cert_identity(tls_stream.get_ref().1.peer_certificates());
                 let client_cert_leaf: Option<Vec<u8>> = tls_stream
                     .get_ref()
                     .1
@@ -387,7 +387,7 @@ async fn handle_https_request(
     bind_port: u16,
     peer_ip: IpAddr,
     sni: Option<String>,
-    client_cert_subject: Option<String>,
+    client_cert_subject: Option<client_cert::ClientCertIdentity>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     if !crate::siem::wants(crate::siem::Category::Access) {
@@ -471,7 +471,7 @@ async fn route_https_request(
     bind_port: u16,
     peer_ip: IpAddr,
     sni: Option<String>,
-    client_cert_subject: Option<String>,
+    client_cert_subject: Option<client_cert::ClientCertIdentity>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     // Same precedence as the routing decision below: the request's own
@@ -508,7 +508,7 @@ async fn route_https_request_inner(
     bind_port: u16,
     peer_ip: IpAddr,
     sni: Option<String>,
-    client_cert_subject: Option<String>,
+    client_cert_subject: Option<client_cert::ClientCertIdentity>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     // Real HTTP/2 clients (every modern browser) send the target host
@@ -589,8 +589,7 @@ async fn route_https_request_inner(
     // difference between "stripped" and "never set" to tell whether an
     // upstream is watching for it.
     let mut req = req;
-    req.headers_mut().remove("x-client-cert-subject");
-    req.headers_mut().remove("x-rustproxy-client-cert-token");
+    client_cert::strip_identity_headers(req.headers_mut());
 
     let resolved_acls = if host.acl_ids.is_empty() {
         crate::db::ResolvedAcls::default()
@@ -625,11 +624,13 @@ async fn route_https_request_inner(
     // trusts no certificate (fail closed) -- see
     // `db::ResolvedAcls::allowed_client_cert_subjects`'s doc comment.
     let client_cert_ok = resolved_acls.has_client_cert_acl
-        && client_cert_subject.as_deref().is_some_and(|subject| {
+        && client_cert_subject.as_ref().is_some_and(|id| {
+            // CN only -- org / org-id are carried but not yet enforced
+            // (see `client_cert::ClientCertIdentity`).
             resolved_acls
                 .allowed_client_cert_subjects
                 .iter()
-                .any(|s| s == subject)
+                .any(|s| *s == id.cn)
         });
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
     if host.block_exploits {
@@ -741,18 +742,10 @@ async fn route_https_request_inner(
     // means this feature is silently inert regardless of any host's
     // pass_client_cert_header setting.
     if host.pass_client_cert_header {
-        if let (Some(subject), Some(token)) =
+        if let (Some(identity), Some(token)) =
             (&client_cert_subject, state.client_cert_forward_token())
         {
-            if let (Ok(subject_value), Ok(token_value)) = (
-                hyper::header::HeaderValue::from_str(subject),
-                hyper::header::HeaderValue::from_str(token),
-            ) {
-                req.headers_mut()
-                    .insert("x-client-cert-subject", subject_value);
-                req.headers_mut()
-                    .insert("x-rustproxy-client-cert-token", token_value);
-            }
+            client_cert::set_identity_headers(req.headers_mut(), identity, token);
         }
     }
 
@@ -1712,7 +1705,7 @@ mod tests {
     async fn send_test_request_with_cert(
         state: AppState,
         peer_ip: IpAddr,
-        client_cert_subject: Option<String>,
+        client_cert_subject: Option<client_cert::ClientCertIdentity>,
     ) -> Response<Incoming> {
         let bind_ip: IpAddr = "10.0.0.2".parse().unwrap();
         let bind_port = 443;
@@ -2373,7 +2366,7 @@ mod tests {
         let resp = send_test_request_with_cert(
             state,
             "203.0.113.7".parse().unwrap(),
-            Some("Jeffs MacBook".to_string()),
+            Some(client_cert::ClientCertIdentity::cn_only("Jeffs MacBook")),
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);
@@ -2401,7 +2394,34 @@ mod tests {
         let resp = send_test_request_with_cert(
             state,
             "203.0.113.7".parse().unwrap(),
-            Some("Jeffs MacBook".to_string()),
+            Some(client_cert::ClientCertIdentity::cn_only("Jeffs MacBook")),
+        )
+        .await;
+        assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
+    }
+
+    /// Org name / org-id on a cert are carried but not enforced yet: a
+    /// cert whose CN is allowed still passes whatever org data it has,
+    /// and the allow-list is still matched on CN alone.
+    #[tokio::test]
+    async fn client_cert_matching_is_on_cn_only_whatever_org_data_is_presented() {
+        let state = test_state_with_cert("example.com").await;
+        let host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        let cert_acl_id = host.acl_ids[0];
+        crate::db::add_acl_client_cert_entry(state.db(), cert_acl_id, "Jeffs MacBook", None)
+            .await
+            .unwrap();
+        state.set_hosts(vec![host]);
+
+        let with_org = client_cert::ClientCertIdentity {
+            cn: "Jeffs MacBook".into(),
+            org: Some("Some Other Org".into()),
+            org_id: Some("NOT-THE-ORG-ID".into()),
+        };
+        let resp = send_test_request_with_cert(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            Some(with_org),
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
@@ -2425,7 +2445,7 @@ mod tests {
         let resp = send_test_request_with_cert(
             state,
             "203.0.113.7".parse().unwrap(),
-            Some("Someone Else's Phone".to_string()),
+            Some(client_cert::ClientCertIdentity::cn_only("Someone Else's Phone")),
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);

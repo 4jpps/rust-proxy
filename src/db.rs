@@ -540,6 +540,21 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Single-row table: where this instance's TrustBridge org lives and
+    // the org token that authenticates it (write-only through the API).
+    // No row means defaults (public TrustBridge, no token).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS trustbridge_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            url TEXT NOT NULL,
+            org_token TEXT NOT NULL DEFAULT ''
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Single-row table holding the admin-UI/API-managed SIEM forwarding
     // settings as a JSON document (see `config::SiemConfig`) -- only
     // consulted when config.toml has no `[siem]` section. No row means
@@ -1775,6 +1790,29 @@ pub async fn set_commercial_license(
 
 pub async fn clear_commercial_license(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM commercial_license WHERE id = 1")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `(url, org_token)`; `None` when never configured.
+pub async fn load_trustbridge_settings(
+    pool: &SqlitePool,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    let row = sqlx::query("SELECT url, org_token FROM trustbridge_settings WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| (r.get("url"), r.get("org_token"))))
+}
+
+pub async fn set_trustbridge_settings(
+    pool: &SqlitePool,
+    url: &str,
+    org_token: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO trustbridge_settings (id, url, org_token) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET url = excluded.url, org_token = excluded.org_token")
+        .bind(url)
+        .bind(org_token)
         .execute(pool)
         .await?;
     Ok(())

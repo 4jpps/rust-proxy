@@ -660,7 +660,7 @@ $('#drawer').addEventListener('click', (e) => {
 const D = {};            // fetched data, keyed by LOADERS name
 const ERR = {};          // last load error per key
 const TRIED = new Set(); // keys whose first load has finished
-const UI = { hostFilter: '', allocPool: '', reveal: null, hostingSyncing: false };
+const UI = { hostFilter: '', allocPool: '', reveal: null, tbIssued: null, hostingSyncing: false };
 const LOADERS = {
   dash: () => jget('/api/dashboard'),
   hosts: () => jget('/api/hosts'),
@@ -680,13 +680,20 @@ const LOADERS = {
   pools: () => jget('/api/hosting/pools'),
   allocs: () => jget('/api/hosting/allocations'),
   hstatus: () => jget('/api/hosting/status'),
+  tb: () => jget('/api/trustbridge'),
+  tbCerts: async () => {
+    try { return await jget('/api/trustbridge/certs'); }
+    catch (e) { if (e.message === 'unauthenticated') throw e; return { certs: [], error: e.message }; }
+  },
 };
+// Loaded only when their page is opened: they call out to TrustBridge.
+const LAZY_KEYS = new Set(['tb', 'tbCerts']);
 const ADMIN_KEYS = new Set(['tokens', 'users']);
 const ME = { username: '', role: 'viewer', via: '', primary: false };
 const ROLE_RANK = { viewer: 0, operator: 1, admin: 2 };
 const hasRole = (min) => (ROLE_RANK[ME.role] ?? 0) >= ROLE_RANK[min];
 const ALL_KEYS = Object.keys(LOADERS);
-const allKeys = () => ALL_KEYS.filter((k) => !ADMIN_KEYS.has(k) || hasRole('admin'));
+const allKeys = () => ALL_KEYS.filter((k) => !LAZY_KEYS.has(k) && (!ADMIN_KEYS.has(k) || hasRole('admin')));
 async function load(keys) {
   await Promise.all(keys.map(async (k) => {
     try { D[k] = await LOADERS[k](); delete ERR[k]; }
@@ -767,6 +774,7 @@ const SECTIONS = {
       { id: 'tokens', label: 'API tokens', only: 'admin', keys: ['tokens'], actions: [{ label: 'New token', act: 'token-add' }], render: pTokens },
       { id: 'defsite', label: 'Default site', write: 'admin', keys: ['defsite'], render: pDefaultSite, after: afterDefaultSite },
       { id: 'acme', label: 'ACME', write: 'admin', keys: ['acme'], render: pAcme, after: afterAcme },
+      { id: 'clientcerts', label: 'Client certificates', write: 'admin', keys: ['tb', 'tbCerts'], actions: [{ label: 'Issue certificate', act: 'tb-cert-add' }], render: pClientCerts, after: afterClientCerts },
       { id: 'siem', label: 'SIEM', write: 'admin', keys: ['siem'], render: pSiem, after: afterSiem },
       { id: 'about', label: 'About', keys: ['dash', 'license'], render: pAbout, after: afterAbout },
     ],
@@ -1672,6 +1680,87 @@ ACTIONS['siem-test'] = async (el) => {
   } catch (e) { fail(e); } finally { setBusy(el, false); }
 };
 
+/* --------------------------------------------- TrustBridge client certs */
+// Every value below comes from the TrustBridge API (names, serials,
+// PEM text), so all of it goes through esc() before reaching innerHTML.
+function pClientCerts() {
+  const tb = D.tb || {}, org = tb.org, certs = (D.tbCerts && D.tbCerts.certs) || [];
+  const listErr = D.tbCerts && D.tbCerts.error;
+  const usage = org ? `${org.active_certs} of ${org.cert_limit == null ? 'unlimited' : org.cert_limit}` : '';
+  const orgCard = org
+    ? `<div class="card"><h2>${esc(org.name)}</h2><dl class="kvs">${kv('Organization ID', org.org_id, true)}${kv('Tier', org.tier)}${kv('Certificates in use', usage)}</dl></div>`
+    : '';
+  const issued = UI.tbIssued ? tbIssuedCard(UI.tbIssued) : '';
+  const conn = `<form id="tb-form" class="card settings" novalidate><h2>TrustBridge connection</h2>
+    ${tb.error ? `<div class="banner warn"><div class="grow">${esc(tb.error)}</div></div>` : ''}
+    <div class="fgrid">${fld({ name: 'url', label: 'TrustBridge URL', value: tb.url || '', placeholder: tb.default_url || '', wide: true, mono: true, help: 'https only. Leave as the default unless you run your own TrustBridge.' })}
+    ${fld({ name: 'token', label: 'Org token', type: 'password', wide: true, mono: true, placeholder: tb.token_set ? 'A token is saved — enter a new one to replace it' : 'tbo_…', attrs: 'autocomplete="off"', help: 'Issued by TrustBridge for your organization. It is stored here and never shown again.' })}</div>
+    <div class="form-actions"><button type="submit" class="btn primary">Save</button>${tb.token_set ? '<button type="button" class="btn danger" data-act="tb-token-clear">Remove token</button>' : ''}</div></form>`;
+  let list;
+  if (!tb.token_set) list = emptyState({ ic: 'system', title: 'Not connected', text: 'Save your TrustBridge org token above to issue and revoke client certificates.' });
+  else if (listErr) list = `<div class="banner warn"><div class="grow">${esc(listErr)}</div></div>`;
+  else if (!certs.length) list = emptyState({ ic: 'inbox', title: 'No client certificates yet', text: 'Issue one to give a person or device access to hosts that require a client certificate.', cta: { label: 'Issue certificate', act: 'tb-cert-add' } });
+  else list = table([{ l: 'Name' }, { l: 'Serial' }, { l: 'Issued' }, { l: 'Expires' }, { l: 'Status' }, { l: 'Actions', sr: true }], certs.map((c) => '<tr>'
+    + td('Name', `<span class="dom">${esc(c.common_name)}</span>`)
+    + td('Serial', `<span class="mono">${esc(c.serial)}</span>`)
+    + td('Issued', c.issued_at ? esc(fmtDT(c.issued_at)) : '—')
+    + td('Expires', c.expires_at ? esc(fmtDT(c.expires_at)) : '—')
+    + td('Status', c.revoked ? pill('error', 'Revoked') : pill('ok', 'Active'))
+    + actsTd(c.revoked ? '' : abtn('tb-cert-revoke', c.serial, 'Revoke', 'danger')) + '</tr>'));
+  return issued + orgCard + conn + list;
+}
+function tbIssuedCard(c) {
+  const area = (label, val) => `<div class="field wide"><label>${esc(label)}</label><textarea class="mono" rows="5" readonly spellcheck="false">${esc(val)}</textarea></div>`;
+  return `<div class="reveal" role="status"><b>Save this certificate now.</b> The private key and .p12 password are shown only once.
+    <dl class="kvs">${kv('Name', c.common_name)}${kv('Serial', c.serial)}${kv('.p12 password', c.p12_password, true)}</dl>
+    <div style="display:flex;gap:var(--s-2);flex-wrap:wrap;margin:var(--s-3) 0"><button type="button" class="btn primary" data-act="tb-dl-p12">Download .p12</button><button type="button" class="btn" data-act="tb-dl-pem">Download certificate (.pem)</button><button type="button" class="btn" data-act="tb-dl-key">Download key (.pem)</button><button type="button" class="btn" data-act="tb-issued-done">Done</button></div>
+    <div class="fgrid">${area('Certificate (PEM)', c.cert_pem)}${area('Private key (PEM)', c.key_pem)}</div></div>`;
+}
+function afterClientCerts(root) {
+  const f = $('#tb-form', root); if (!f) return;
+  pageForm(f, async () => {
+    const body = { url: f.url.value.trim() };
+    const tok = f.token.value.trim();
+    if (tok) body.token = tok;
+    await send('PUT', '/api/trustbridge', body);
+    toast('TrustBridge settings saved', 'ok'); await refresh('tb', 'tbCerts');
+  });
+}
+ACTIONS['tb-token-clear'] = async () => {
+  if (!await confirmAsync({ title: 'Remove org token', body: 'Remove the saved TrustBridge org token? You will not be able to issue or revoke certificates until you save one again.', confirmLabel: 'Remove token' })) return;
+  try { await send('PUT', '/api/trustbridge', { token: '' }); toast('Token removed', 'ok'); await refresh('tb', 'tbCerts'); } catch (e) { fail(e); }
+};
+ACTIONS['tb-cert-add'] = () => {
+  if (!(D.tb && D.tb.token_set)) { toast('Save your TrustBridge org token first.', 'warn'); return; }
+  openDrawer({
+    title: 'Issue client certificate', submitLabel: 'Issue certificate',
+    body: `<div class="fgrid">${fld({ name: 'common_name', label: 'Name', required: true, wide: true, placeholder: 'Jeff Parrish', help: 'Shown to sites as the certificate name (CN). Access lists match on this name.' })}${fld({ name: 'days', label: 'Valid for (days)', type: 'number', value: '365', wide: true, attrs: 'min="1" max="730"', help: 'TrustBridge caps this at 730 days.' })}</div>`,
+    onSubmit: async (form) => {
+      const body = { common_name: form.elements.common_name.value.trim() };
+      const d = Number(form.elements.days.value); if (d) body.days = d;
+      UI.tbIssued = await send('POST', '/api/trustbridge/certs', body);
+      await refresh('tb', 'tbCerts');
+    },
+  });
+};
+ACTIONS['tb-cert-revoke'] = async (el) => {
+  const c = ((D.tbCerts && D.tbCerts.certs) || []).find((x) => String(x.serial) === el.dataset.id); if (!c) return;
+  if (!await confirmAsync({ title: 'Revoke certificate', body: `Revoke the certificate <b>${esc(c.common_name)}</b> (serial <span class="mono">${esc(c.serial)}</span>)? It will stop being accepted. This cannot be undone.`, confirmLabel: 'Revoke certificate' })) return;
+  try { await send('POST', `/api/trustbridge/certs/${encodeURIComponent(c.serial)}/revoke`); toast('Certificate revoked', 'ok'); await refresh('tb', 'tbCerts'); } catch (e) { fail(e); }
+};
+ACTIONS['tb-issued-done'] = () => { UI.tbIssued = null; renderPage(); };
+function tbDownload(text, name, type, b64) {
+  let part = text;
+  if (b64) { const bin = atob(text); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); part = u; }
+  const url = URL.createObjectURL(new Blob([part], { type }));
+  const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+const tbFileBase = () => String((UI.tbIssued && UI.tbIssued.common_name) || 'client').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60) || 'client';
+ACTIONS['tb-dl-p12'] = () => { if (UI.tbIssued) tbDownload(UI.tbIssued.p12_base64, tbFileBase() + '.p12', 'application/x-pkcs12', true); };
+ACTIONS['tb-dl-pem'] = () => { if (UI.tbIssued) tbDownload(UI.tbIssued.cert_pem, tbFileBase() + '.pem', 'application/x-pem-file', false); };
+ACTIONS['tb-dl-key'] = () => { if (UI.tbIssued) tbDownload(UI.tbIssued.key_pem, tbFileBase() + '-key.pem', 'application/x-pem-file', false); };
+
 /* -------------------------------------------------------------- tokens */
 function pTokens() {
   const toks = D.tokens || [];
@@ -1791,7 +1880,7 @@ async function enter() {
   await load(keys);
   if (route === r) safeRender();
 }
-function resetState() { for (const k of Object.keys(D)) delete D[k]; for (const k of Object.keys(ERR)) delete ERR[k]; TRIED.clear(); UI.reveal = null; }
+function resetState() { for (const k of Object.keys(D)) delete D[k]; for (const k of Object.keys(ERR)) delete ERR[k]; TRIED.clear(); UI.reveal = null; UI.tbIssued = null; }
 function show(id) { for (const x of ['login-screen', 'setup-screen', 'app']) $('#' + x).hidden = x !== id; }
 function showLogin() {
   AUTHED = false; resetState();
