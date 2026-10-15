@@ -114,7 +114,16 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
     for net in &pool_nets {
         run_checked("ip", &["route", "replace", "blackhole", &net.to_string()]).await?;
     }
-    apply_ruleset(&generator::generate_ruleset(&allocations)).await?;
+    let hosts = state.hosts();
+    let mut proxy_served: Vec<(Ipv4Addr, u16)> = Vec::new();
+    for host in hosts.iter().filter(|h| h.enabled) {
+        let Some(ip) = host.bind_ip_v4.filter(|ip| !ip.is_unspecified()) else { continue };
+        proxy_served.push((ip, host.bind_port));
+        if host.force_https || crate::acme::opens_port_80_for_acme(host) {
+            proxy_served.push((ip, 80));
+        }
+    }
+    apply_ruleset(&generator::generate_ruleset_with_served(&allocations, &proxy_served)).await?;
     EVER_APPLIED.store(true, Ordering::Relaxed);
     for ip in &remove {
         run_checked("ip", &["addr", "del", &format!("{ip}/32"), "dev", "lo"]).await?;

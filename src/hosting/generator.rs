@@ -56,6 +56,14 @@ fn ip_set(ips: &[Ipv4Addr]) -> String {
 /// - `forward`: a hosted VM may not open new connections to private or CGNAT ranges,
 ///   which keeps customer VMs off the internal networks.
 pub fn generate_ruleset(allocations: &[Allocation]) -> String {
+    generate_ruleset_with_served(allocations, &[])
+}
+
+/// As [`generate_ruleset`], plus `proxy_served`: `(public ip, tcp port)` pairs
+/// that a rust-proxy host is deliberately bound to on a hosted address. Those
+/// ports are accepted at `input` ahead of the blanket drop, so the proxy can
+/// answer on an address whose other ports still belong to the VM.
+pub fn generate_ruleset_with_served(allocations: &[Allocation], proxy_served: &[(Ipv4Addr, u16)]) -> String {
     let mut active: Vec<&Allocation> = allocations.iter().filter(|a| a.is_active()).collect();
     active.sort_by_key(|a| a.public_ip);
 
@@ -103,6 +111,12 @@ pub fn generate_ruleset(allocations: &[Allocation]) -> String {
     let _ = writeln!(out, "        type filter hook input priority -10; policy accept;");
     if !active.is_empty() {
         let publics: Vec<Ipv4Addr> = active.iter().map(|a| a.public_ip).collect();
+        let mut served: Vec<&(Ipv4Addr, u16)> = proxy_served.iter().filter(|(ip, _)| publics.contains(ip)).collect();
+        served.sort();
+        served.dedup();
+        for (ip, port) in served {
+            let _ = writeln!(out, "        ip daddr {ip} tcp dport {port} accept");
+        }
         let _ = writeln!(
             out,
             "        ip daddr {} meta l4proto != icmp drop",
@@ -209,6 +223,26 @@ mod tests {
         assert!(out.contains(
             "ip saddr { 172.16.63.10 } ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } ct state new drop\n"
         ));
+    }
+
+    #[test]
+    fn proxy_served_ports_are_accepted_before_the_blanket_drop() {
+        let hosted = alloc("44.30.51.254", Some("100.64.244.254"), ForwardMode::All, vec![]);
+        let other = alloc("204.52.221.226", Some("172.16.63.10"), ForwardMode::All, vec![]);
+        let served = [
+            ("44.30.51.254".parse().unwrap(), 443),
+            ("44.30.51.254".parse().unwrap(), 80),
+            ("44.30.51.254".parse().unwrap(), 443),
+            ("9.9.9.9".parse().unwrap(), 443),
+        ];
+        let out = generate_ruleset_with_served(&[hosted, other], &served);
+        let accept80 = out.find("ip daddr 44.30.51.254 tcp dport 80 accept\n").unwrap();
+        let accept443 = out.find("ip daddr 44.30.51.254 tcp dport 443 accept\n").unwrap();
+        let drop = out.find("meta l4proto != icmp drop").unwrap();
+        assert!(accept80 < accept443 && accept443 < drop);
+        assert_eq!(out.matches("tcp dport 443 accept").count(), 1, "duplicates collapse: {out}");
+        assert!(!out.contains("9.9.9.9"), "only addresses that are actually hosted: {out}");
+        assert!(!out.contains("ip daddr 204.52.221.226 tcp dport"), "unserved hosted IPs stay fully dropped");
     }
 
     #[test]

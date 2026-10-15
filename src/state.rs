@@ -359,6 +359,7 @@ impl AppState {
     pub fn set_hosts(&self, hosts: Vec<ProxyHost>) {
         self.0.hosts.store(Arc::new(hosts));
         self.0.config_dirty.notify_waiters();
+        self.0.hosting_dirty.notify_one();
     }
 
     pub fn port_rules(&self) -> Arc<Vec<PortRule>> {
