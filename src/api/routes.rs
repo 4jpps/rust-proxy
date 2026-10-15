@@ -1102,7 +1102,7 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
 /// only to silently fail to restrict anything at request time. Same
 /// "reject at config time, not discovered hours later" reasoning as
 /// `validate_dns_credential_choice`.
-async fn validate_acl_ids(state: &AppState, acl_ids: &[Uuid]) -> Result<(), ApiError> {
+pub(super) async fn validate_acl_ids(state: &AppState, acl_ids: &[Uuid]) -> Result<(), ApiError> {
     if acl_ids.is_empty() {
         return Ok(());
     }

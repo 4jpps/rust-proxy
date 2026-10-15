@@ -123,7 +123,27 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
             proxy_served.push((ip, 80));
         }
     }
-    apply_ruleset(&generator::generate_ruleset_with_served(&allocations, &proxy_served)).await?;
+    let mut acl_sources: std::collections::HashMap<Uuid, Vec<Ipv4Net>> = std::collections::HashMap::new();
+    for acl_id in allocations
+        .iter()
+        .filter(|a| a.is_active())
+        .flat_map(|a| a.ports.iter().flat_map(|p| p.acl_ids.iter().copied()))
+        .collect::<BTreeSet<Uuid>>()
+    {
+        let resolved = crate::db::resolve_acl_ids(state.db(), &[acl_id]).await?;
+        if resolved.has_ip_allow_acl {
+            let nets = resolved
+                .allow_ips
+                .into_iter()
+                .filter_map(|n| match n {
+                    ipnet::IpNet::V4(v4) => Some(v4),
+                    ipnet::IpNet::V6(_) => None,
+                })
+                .collect();
+            acl_sources.insert(acl_id, nets);
+        }
+    }
+    apply_ruleset(&generator::generate_ruleset_full(&allocations, &proxy_served, &acl_sources)).await?;
     EVER_APPLIED.store(true, Ordering::Relaxed);
     for ip in &remove {
         run_checked("ip", &["addr", "del", &format!("{ip}/32"), "dev", "lo"]).await?;

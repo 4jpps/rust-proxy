@@ -388,6 +388,8 @@ impl AppState {
     /// after the 5-minute `FALLBACK_RESYNC_INTERVAL` catches up.
     pub fn notify_config_change(&self) {
         self.0.config_dirty.notify_waiters();
+        // Hosted-port ACLs are resolved by the hosting sync as well.
+        self.0.hosting_dirty.notify_one();
     }
 
     pub fn certs(&self) -> Arc<HashMap<String, CertEntry>> {

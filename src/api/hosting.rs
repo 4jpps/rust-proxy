@@ -313,6 +313,9 @@ pub struct PortRequest {
     /// Defaults to `port_start` (a single port).
     #[serde(default)]
     port_end: Option<u16>,
+    /// `IpAllow` ACLs limiting which source addresses may reach this port.
+    #[serde(default)]
+    acl_ids: Vec<Uuid>,
 }
 
 fn to_specs(ports: Vec<PortRequest>) -> Vec<PortSpec> {
@@ -322,6 +325,7 @@ fn to_specs(ports: Vec<PortRequest>) -> Vec<PortSpec> {
             protocol: p.protocol,
             port_start: p.port_start,
             port_end: p.port_end.unwrap_or(p.port_start),
+            acl_ids: p.acl_ids,
         })
         .collect()
 }
@@ -466,10 +470,18 @@ pub async fn create_allocation(
             bound_ips: &bound_ips(&state),
         },
     )?;
+    validate_port_acls(&state, &allocation).await?;
     allocations.push(allocation.clone());
     let view = allocation_view(&allocation, &pools);
     commit(&state, pools, allocations).await?;
     Ok((StatusCode::CREATED, Json(view)))
+}
+
+async fn validate_port_acls(state: &AppState, a: &Allocation) -> Result<(), ApiError> {
+    for p in &a.ports {
+        super::routes::validate_acl_ids(state, &p.acl_ids).await?;
+    }
+    Ok(())
 }
 
 pub async fn patch_allocation(
@@ -529,6 +541,7 @@ pub async fn patch_allocation(
             bound_ips: &bound_ips(&state),
         },
     )?;
+    validate_port_acls(&state, &updated).await?;
     allocations[idx] = updated.clone();
     let view = allocation_view(&updated, &pools);
     commit(&state, pools, allocations).await?;

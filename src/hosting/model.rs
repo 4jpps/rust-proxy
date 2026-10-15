@@ -63,11 +63,16 @@ pub enum ForwardMode {
     Ports,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortSpec {
     pub protocol: Protocol,
     pub port_start: u16,
     pub port_end: u16,
+    /// `IpAllow` ACLs restricting which sources may reach this port. Empty
+    /// means any source. A non-empty list whose ACLs resolve to no entries
+    /// forwards nothing (fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -668,8 +673,8 @@ mod tests {
 
     #[test]
     fn port_forward_rules() {
-        let tcp = |s, e| PortSpec { protocol: Protocol::Tcp, port_start: s, port_end: e };
-        let udp = |s, e| PortSpec { protocol: Protocol::Udp, port_start: s, port_end: e };
+        let tcp = |s, e| PortSpec { protocol: Protocol::Tcp, port_start: s, port_end: e, acl_ids: vec![] };
+        let udp = |s, e| PortSpec { protocol: Protocol::Udp, port_start: s, port_end: e, acl_ids: vec![] };
         assert!(validate_ports(ForwardMode::All, &[]).is_ok());
         assert!(validate_ports(ForwardMode::All, &[tcp(22, 22)]).is_err());
         assert!(validate_ports(ForwardMode::Ports, &[]).is_err());
