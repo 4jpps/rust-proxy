@@ -120,10 +120,11 @@ curl -X POST https://proxy.example.com/api/hosts \
 
 | Method | Path | Body or notes |
 |--------|------|---------------|
-| GET | `/api/acls` | `{id, name, kind, created_at}`. Never entries or credentials |
-| POST | `/api/acls` | `{"name","kind"}` with `kind` one of `ip_allow`, `login`, `client_cert`, plus `ip_entries` or `credentials` |
+| GET | `/api/acls` | `{id, name, kind, created_at, global}`, plus `asn_status` for block lists. Never entries or credentials |
+| POST | `/api/acls` | `{"name","kind"}` with `kind` one of `ip_allow`, `ip_block`, `login`, `client_cert`, plus `ip_entries` (IPs, CIDRs, and `AS<n>` for `ip_block`) or `credentials` |
 | GET, DELETE | `/api/acls/:id` | DELETE is refused (409) while any host selects it |
-| POST | `/api/acls/:id/ip-entries` | `{"cidr","description"}` |
+| POST | `/api/acls/:id/ip-entries` | `{"cidr","description"}`. For an `ip_block` list `cidr` may be `AS<n>` |
+| PUT | `/api/acls/:id/global` | `{"global":true}` makes an `ip_block` list apply to every host and the whole firewall |
 | POST | `/api/acls/:id/credentials` | `{"username","password"}` |
 | POST | `/api/acls/:id/client-cert-entries` | `{"subject","description"}` |
 

@@ -16,6 +16,8 @@ web UI and a REST API, and it installs from a signed `.deb`.
 - **Default-DROP nftables firewall** generated from your hosts and port rules. Only what you configure is reachable.
 - **TCP/UDP port passthrough** for non-HTTP services.
 - **Per-host access control**: IP allow lists, a built-in login page, and client-certificate auth, combined with OR.
+- **IP and ASN blocking**: deny lists that take IPs, CIDRs or whole AS numbers (`AS13238`), per host or global, enforced in the web layer *and* the firewall. See [Access control](docs/access-control.md#ip-and-asn-block).
+- **Client certificates, managed for you**: issue and revoke them from the admin UI through TrustBridge, with OCSP revocation checking and an organization lock that rejects certificates from anyone else.
 - **Per-host `deny_fallback`**: send blocked visitors to a public page, or lock a host to a path allow-list (for example only `/guest/`). See [deny_fallback](docs/deny-fallback.md).
 - **Redirect hosts, static-file hosts, fixed-response hosts and path rewrites** alongside normal proxy hosts, plus **custom locations** (different upstreams per path) and an optional **block-common-exploits** filter.
 - **Public-address hosting** (optional): 1:1 forward a routed public IP to a private customer VM.
@@ -80,6 +82,9 @@ with automatic certificates. The differences, stated plainly:
 - **Different shape.** One native binary and sqlite, installed from a `.deb` and run by systemd. No Docker, no separate nginx, no MariaDB.
 - **It manages the firewall.** The host's nftables ruleset is generated from your configuration, default-DROP.
 - **Access lists are reusable and named**, and a host can combine IP allow, login and client-certificate lists.
+- **ASN blocking.** Enter an AS number and every prefix it announces is blocked, refreshed daily from RIPEstat. NPM has no ASN support; its access lists take individual addresses and ranges only.
+- **Blocking reaches past HTTP.** NPM's access lists can deny addresses on a proxy host. rust-proxy's block lists can also be global (one switch covers every site) and are enforced in the firewall, so they stop TCP/UDP passthrough, SSH and hosted VMs too, with a SIEM event for every refused web request.
+- **Client certificates are built in.** NPM has no client-certificate option in its UI or access lists (mutual TLS there means hand-written nginx config and your own CA). rust-proxy issues certificates for you through TrustBridge, checks revocation by OCSP, can lock every certificate-protected site to your organization, and can pass the verified identity to the backend.
 - **Users have three fixed roles**: admin, operator (changes proxy config, cannot touch users, tokens or system settings) and viewer (read-only). API tokens carry a role too. See [Users and roles](docs/users-and-roles.md).
 - **What NPM has that rust-proxy does not:** per-section permissions finer than those three roles, and a larger community.
 
@@ -91,7 +96,7 @@ If you are moving over, see [Migrating from Nginx Proxy Manager](docs/migration-
 |------|----------------|
 | [Getting started](docs/getting-started.md) | Install, first-run wizard, DNS credential, first host, verifying it works |
 | [Configuration](docs/configuration.md) | `config.toml`, every host field, ACME, DNS providers, redirect/static hosts |
-| [Access control](docs/access-control.md) | IP allow, login and client-cert ACLs, and how they combine |
+| [Access control](docs/access-control.md) | IP allow, IP/ASN block, login and client-cert ACLs, and how they combine |
 | [deny_fallback](docs/deny-fallback.md) | Blocked-visitor redirects, path locks and allow-lists |
 | [Firewall](docs/firewall.md) | What the nftables ruleset does, always-open ports, port rules |
 | [Hosting](docs/hosting.md) | Public IP pools and 1:1 forwards to customer VMs |

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-10-15
 
 - **IP and ASN block lists.** New access list type `ip_block` (deny) that
   takes single IPs, CIDRs and AS numbers (`AS13238`). An ASN expands to every

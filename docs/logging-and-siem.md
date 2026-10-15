@@ -49,7 +49,7 @@ queue_size     = 4096
 
 | Category | Events |
 |----------|--------|
-| `denied` | `acl_ip_denied`, `host_login_failure` |
+| `denied` | `acl_ip_denied`, `ip_blocked`, `host_login_failure` |
 | `admin` | `admin_auth_failure`, `admin_login`, `admin_access_denied` (a role was refused), `admin_change` (every non-GET admin API call, warning severity when it fails), `host_login_success` |
 | `cert` | `cert_issued`, `cert_issue_failed` |
 | `system` | `daemon_start`, `siem_test` |

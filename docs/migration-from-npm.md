@@ -24,6 +24,7 @@ short script against the [API](api.md).
 | Streams (TCP/UDP) | A [port rule](firewall.md#port-rules-tcpudp-passthrough) with a `passthrough_target` |
 | Access List (IP allow) | An [IP allow ACL](access-control.md#ip-allow) |
 | Access List (username and password) | A [login ACL](access-control.md#login). It shows an HTML login page, not a browser Basic Auth prompt |
+| Access List (deny addresses) | An [IP block list](access-control.md#ip-and-asn-block). It also takes AS numbers and can be made global |
 | Access List "Satisfy Any" | The default. IP allow, client cert and login are alternatives (OR) |
 | Let's Encrypt certificate (HTTP challenge) | `acme_enabled` with `acme_challenge_type: http01` |
 | Let's Encrypt certificate (DNS challenge) | `dns01`, with a [DNS credential](configuration.md#dns-providers) |
@@ -32,6 +33,7 @@ short script against the [API](api.md).
 | Websockets Support | `websockets` |
 | Scheme / Forward host and port | `upstream`, `upstream_https` |
 | Block Common Exploits | `block_exploits` (see [Configuration](configuration.md#block-common-exploits)) |
+| Client certificates (hand-written nginx config) | A [client-certificate ACL](access-control.md#client-certificate), with issuing, revocation and an organization lock in System, Client certificates |
 | Advanced tab (custom nginx config) | No equivalent. Closest are `path_rewrite` and `rewrite_samesite_none_cookies` |
 | Custom Locations (different upstream per path) | `locations` (see [Configuration](configuration.md#custom-locations)) |
 | 404 Hosts | **Hosts, Add 404 host** in the UI, or `fixed_response` in the API (see [Configuration](configuration.md#fixed-response-hosts)) |
@@ -39,7 +41,7 @@ short script against the [API](api.md).
 | HSTS Enabled, HSTS Sub-domains | `hsts`, `hsts_subdomains` (see [Configuration](configuration.md#hsts)). No `preload` flag |
 | Users and roles | Users tab with `admin`, `operator` and `viewer` roles (see [Users and roles](users-and-roles.md)). NPM's finer per-section permissions have no equivalent |
 
-rust-proxy also does things NPM does not, such as [`deny_fallback`](deny-fallback.md) path locks and the [firewall](firewall.md); the [README](../README.md#how-it-compares-to-nginx-proxy-manager) summarizes the differences.
+rust-proxy also does things NPM does not: [ASN blocking and global block lists](access-control.md#ip-and-asn-block) (also enforced in the [firewall](firewall.md#block-lists)), built-in [client certificates](access-control.md#client-certificate) with revocation checking, [`deny_fallback`](deny-fallback.md) path locks and the firewall itself; the [README](../README.md#how-it-compares-to-nginx-proxy-manager) summarizes the differences.
 
 ## Before you move
 

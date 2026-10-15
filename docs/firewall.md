@@ -47,10 +47,33 @@ non-HTTP services (a game server, a VoIP port, a database).
 ```
 
 Port rules can select IP-allow [ACLs](access-control.md#port-rules) to
-restrict who may connect. Passthrough connections have no HTTP layer, so
+restrict who may connect, and IP-block lists to refuse specific sources. Passthrough connections have no HTTP layer, so
 they produce no application-level events.
 
 ![The Port rules tab showing a TCP rule that forwards port 2222 to an internal SSH server, limited to an access list.](screenshots/port-rules.png)
+
+## Block lists
+
+[IP and ASN block lists](access-control.md#ip-and-asn-block) are enforced in
+the firewall as well as in the web layer, so they cover every way in:
+
+- **Global lists** are dropped at the top of the input chain, before every
+  accept rule. That includes raw TCP/UDP passthrough, SSH, the admin port
+  and connections that were already established. Only the loopback
+  interface is exempt. The same lists are dropped in front of every hosted
+  VM (IPv4 only).
+- **A list selected on a port rule** drops only that rule's traffic from the
+  listed sources.
+- **A list selected on a hosted VM's forwarded port** drops only traffic to
+  that port, before it is forwarded.
+
+The ruleset is rewritten only when the set of blocked prefixes actually
+changes, for example when an AS announces a new range, not on every daily
+refresh. A very large AS makes a long rule list because its prefixes are
+written into the ruleset.
+
+**Do not globally block an address you manage the host from.** The drop
+comes before the SSH and admin accepts.
 
 ## Hosts open ports too
 

@@ -313,7 +313,7 @@ pub struct PortRequest {
     /// Defaults to `port_start` (a single port).
     #[serde(default)]
     port_end: Option<u16>,
-    /// `IpAllow` ACLs limiting which source addresses may reach this port.
+    /// `IpAllow` ACLs limiting which sources may reach this port, and/or `IpBlock` ACLs refusing some.
     #[serde(default)]
     acl_ids: Vec<Uuid>,
 }

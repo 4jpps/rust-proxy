@@ -31,6 +31,50 @@ curl -X POST https://proxy.example.com/api/acls/$ID/ip-entries \
   -d '{"cidr":"192.0.2.0/24","description":"branch office"}'
 ```
 
+### IP and ASN block
+
+A deny list. Entries are single IPs, CIDRs (IPv4 or IPv6) or **AS numbers**
+(`AS13238` or `13238`). An AS number expands to every prefix that network
+announces, so you can shut out an entire provider with one entry instead of
+copying hundreds of ranges by hand.
+
+```sh
+curl -X POST https://proxy.example.com/api/acls \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"blocked","kind":"ip_block","ip_entries":["AS13238","203.0.113.9","198.51.100.0/24"]}'
+```
+
+How ASN entries work:
+
+- Prefixes come from RIPEstat's announced-prefixes data and are stored in
+  the database. They are refreshed daily. A failed refresh is retried after
+  15 minutes and the last good copy stays in force, so a lookup outage never
+  unblocks anything.
+- The list's response includes `asn_status` (prefix count, last successful
+  fetch, last error per AS), and the Access lists tab shows the same.
+- Matching uses an in-memory index, so there is no per-request database work.
+
+**Block always wins.** A visitor on a block list is refused even if they
+are in an IP-allow list, hold a login session or present a valid client
+certificate. A blocked request gets the "Access denied" page (HTTP 403)
+and an `ip_blocked` [SIEM event](logging-and-siem.md); the host's
+`deny_fallback` does not apply.
+
+**Per host or global.** Select a block list on a host (`acl_ids`) to block
+it there only. To block a list everywhere, mark it global:
+
+```sh
+curl -X PUT https://proxy.example.com/api/acls/$ID/global \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"global":true}'
+```
+
+A global list is dropped before any host is looked up, on every HTTPS and
+port-80 listener, and also in the [firewall](firewall.md#block-lists), so it
+covers TCP/UDP passthrough, SSH and hosted addresses too. **Do not put your
+own management address on a global list.** Only the loopback interface is
+exempt, so it would cut your SSH and admin access.
+
 ### Login
 
 A list of username and password pairs. A visitor without a valid session
@@ -69,6 +113,23 @@ forwarded. If the responder cannot be reached, the certificate is allowed
 is remembered in the database and stays in force even if the responder later
 fails to answer.
 
+**Issuing and revoking.** System, Client certificates connects the proxy to
+your TrustBridge organization (the organization token is write-only and
+never shown again). From there an admin can see the organization's tier and
+usage, issue a certificate (the key and `.p12` file are shown once and never
+stored) and revoke one, which takes effect immediately. The same actions are
+available as `GET/PUT /api/trustbridge`, `GET/POST /api/trustbridge/certs`
+and `POST /api/trustbridge/certs/:serial/revoke` (writes are admin only).
+
+**Organization lock.** Set "Require my organization"
+(`required_org_id` on `PUT /api/trustbridge`; an empty string removes it) and
+only certificates carrying that organization id are honored anywhere: ACL
+matching, the identity headers passed to backends, and admin certificate
+login. Certificates without it, such as older CN-only ones or ones from
+another organization, are treated as if the visitor presented none, and the
+site falls back to its login page. The proxy forwards the certificate's
+organization and id as `X-Client-Cert-Org` and `X-Client-Cert-Org-Id`.
+
 If you want to hand the verified subject to your upstream (so an app can
 skip its own login), turn on a host's `pass_client_cert_header` and set
 the top-level `client_cert_forward_token` in `config.toml`
@@ -89,7 +150,8 @@ is true:
 
 In other words IP allow, client cert and login are alternatives (OR), not
 a chain. The common pattern is IP allow plus login: people on the trusted
-network walk straight in, everyone else sees the login page.
+network walk straight in, everyone else sees the login page. A block list
+is not part of this OR: it is checked first and overrides all of them.
 
 What a visitor who fails every gate sees depends on what is selected:
 
@@ -107,11 +169,12 @@ it from every host first.
 ## Port rules
 
 A port rule (TCP/UDP passthrough) can also select ACLs, but only IP-allow
-lists have any effect there. A login list is accepted but contributes
+and IP-block lists have any effect there. A block list drops that rule's
+traffic from the listed sources in the firewall. A login list is accepted but contributes
 nothing, because passthrough has no HTTP layer to show a login page on.
 Passthrough produces no application-level events either.
 
 ## Denials are logged
 
-Refused requests are emitted as `acl_ip_denied` and `host_login_failure`
+Refused requests are emitted as `acl_ip_denied`, `ip_blocked` and `host_login_failure`
 events when [SIEM forwarding](logging-and-siem.md) is on.
