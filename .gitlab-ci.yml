@@ -49,6 +49,7 @@ validate:
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Clink-arg=-fuse-ld=mold
   script:
     - cargo build
+    - cargo fmt --all --check
     - cargo test
 
 package:amd64-deb:

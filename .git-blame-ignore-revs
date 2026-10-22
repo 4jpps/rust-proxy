@@ -1,0 +1,5 @@
+# Formatting-only commits, skipped by git blame when
+# blame.ignoreRevsFile is set to this file.
+
+# Apply cargo fmt (2024 style edition)
+49b35e54fd3d6006345d1564bf87f126adc5a421
