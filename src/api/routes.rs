@@ -230,8 +230,8 @@ fn client_ip_from(
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()?
         .0
         .ip();
-    if peer.is_loopback() {
-        if let Some(last) = headers
+    if peer.is_loopback()
+        && let Some(last) = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit(',').next())
@@ -240,7 +240,6 @@ fn client_ip_from(
         {
             return Some(last.to_string());
         }
-    }
     Some(peer.to_string())
 }
 
@@ -640,13 +639,12 @@ fn parse_admin_allowed_ips(
             .map_err(|_| ApiError::BadRequest(format!("'{entry}' is not an IP address or CIDR")))?;
         out.push(net);
     }
-    if let Some(ip) = client_ip.and_then(|c| c.parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_canonical()) {
-        if !out.is_empty() && !ip.is_loopback() && !out.iter().any(|n| n.contains(&ip)) {
+    if let Some(ip) = client_ip.and_then(|c| c.parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_canonical())
+        && !out.is_empty() && !ip.is_loopback() && !out.iter().any(|n| n.contains(&ip)) {
             return Err(ApiError::BadRequest(format!(
                 "your own address ({ip}) is not in this list, which would lock you out of the admin UI"
             )));
         }
-    }
     Ok(out)
 }
 
@@ -727,12 +725,11 @@ async fn setup(
         crate::db::set_admin_allowed_ips(state.db(), &allowed_ips).await?;
         state.set_admin_allowed_ips(allowed_ips);
     }
-    if let Some(expose) = body.expose_admin_port {
-        if state.admin().expose_admin_port.is_none() {
+    if let Some(expose) = body.expose_admin_port
+        && state.admin().expose_admin_port.is_none() {
             crate::db::set_expose_admin_port(state.db(), expose).await?;
             state.set_expose_admin_port(expose);
         }
-    }
     state.notify_config_change();
     Ok(StatusCode::CREATED)
 }
@@ -2520,8 +2517,8 @@ async fn create_standalone_cert(
             "a standalone certificate for \"{domain}\" is already tracked"
         )));
     }
-    if let Some(id) = body.dns_credential_id {
-        if crate::db::get_dns_credential(state.db(), id)
+    if let Some(id) = body.dns_credential_id
+        && crate::db::get_dns_credential(state.db(), id)
             .await?
             .is_none()
         {
@@ -2529,7 +2526,6 @@ async fn create_standalone_cert(
                 "dns_credential_id does not reference an existing DNS credential".into(),
             ));
         }
-    }
 
     // Explicit per-cert override wins; otherwise fall back to the
     // global config.toml default -- same "explicit wins, else a

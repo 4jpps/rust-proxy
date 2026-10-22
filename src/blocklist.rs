@@ -247,11 +247,11 @@ pub async fn refresh_stale(state: &AppState) {
         match fetch_announced_prefixes(&client, asn).await {
             Ok(prefixes) => {
                 tracing::info!(asn, prefixes = prefixes.len(), "asn prefixes refreshed");
-                if let Err(err) = crate::db::store_asn_prefixes(state.db(), asn, &prefixes).await {
+                match crate::db::store_asn_prefixes(state.db(), asn, &prefixes).await { Err(err) => {
                     tracing::error!(asn, error = %err, "asn refresh: failed to store prefixes");
-                } else {
+                } _ => {
                     changed = true;
-                }
+                }}
             }
             Err(err) => {
                 tracing::warn!(asn, error = %err, "asn prefix fetch failed; keeping previous prefixes");

@@ -507,12 +507,11 @@ async fn route_https_request(
     let mut result =
         route_https_request_inner(state, bind_ip, bind_port, peer_ip, sni, client_cert_subject, req)
             .await;
-    if let (Some(value), Ok(resp)) = (hsts, result.as_mut()) {
-        if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
+    if let (Some(value), Ok(resp)) = (hsts, result.as_mut())
+        && let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
             resp.headers_mut()
                 .insert(hyper::header::STRICT_TRANSPORT_SECURITY, value);
         }
-    }
     result
 }
 
@@ -659,9 +658,7 @@ async fn route_https_request_inner(
         && client_cert_subject.as_ref().is_some_and(|id| {
             // The org lock was already applied at the top of this function.
             resolved_acls
-                .allowed_client_cert_subjects
-                .iter()
-                .any(|s| *s == id.cn)
+                .allowed_client_cert_subjects.contains(&id.cn)
         });
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
     if host.block_exploits {
@@ -772,13 +769,12 @@ async fn route_https_request_inner(
     // otherwise forge the subject header itself). No configured token
     // means this feature is silently inert regardless of any host's
     // pass_client_cert_header setting.
-    if host.pass_client_cert_header {
-        if let (Some(identity), Some(token)) =
+    if host.pass_client_cert_header
+        && let (Some(identity), Some(token)) =
             (&client_cert_subject, state.client_cert_forward_token())
         {
             client_cert::set_identity_headers(req.headers_mut(), identity, token);
         }
-    }
 
     if let Some(path_rewrite) = &host.path_rewrite {
         apply_path_rewrite(&mut req, path_rewrite);
@@ -1132,11 +1128,10 @@ fn passthrough_target_for_port(target: &str, port: u16) -> String {
     if target.parse::<SocketAddr>().is_ok() {
         return target.to_string();
     }
-    if let Some((host, p)) = target.rsplit_once(':') {
-        if !host.contains(':') && p.parse::<u16>().is_ok() {
+    if let Some((host, p)) = target.rsplit_once(':')
+        && !host.contains(':') && p.parse::<u16>().is_ok() {
             return target.to_string();
         }
-    }
     if target.parse::<std::net::Ipv6Addr>().is_ok() {
         return format!("[{target}]:{port}");
     }

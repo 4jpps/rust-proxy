@@ -234,13 +234,12 @@ impl SiemConfig {
                 "siem.app_name must be 1-48 printable ASCII characters with no spaces".into(),
             );
         }
-        if let Some(h) = &self.hostname {
-            if h.is_empty() || h.len() > 255 || !h.chars().all(|c| c.is_ascii_graphic()) {
+        if let Some(h) = &self.hostname
+            && (h.is_empty() || h.len() > 255 || !h.chars().all(|c| c.is_ascii_graphic())) {
                 return Err(
                     "siem.hostname must be 1-255 printable ASCII characters with no spaces".into(),
                 );
             }
-        }
         for c in &self.categories {
             if !SIEM_CATEGORIES.contains(&c.as_str()) {
                 return Err(format!(
@@ -1171,27 +1170,24 @@ impl Config {
                 "admin.session_secret, admin.admin_username, and admin.admin_password_hash must either all be set or all omitted -- a partial admin identity in config.toml is not allowed".into(),
             ));
         }
-        if let Some(secret) = &self.admin.session_secret {
-            if secret.trim().is_empty() {
+        if let Some(secret) = &self.admin.session_secret
+            && secret.trim().is_empty() {
                 return Err(ConfigError::Validation(
                     "admin.session_secret must not be empty if set".into(),
                 ));
             }
-        }
-        if let Some(username) = &self.admin.admin_username {
-            if username.trim().is_empty() {
+        if let Some(username) = &self.admin.admin_username
+            && username.trim().is_empty() {
                 return Err(ConfigError::Validation(
                     "admin.admin_username must not be empty if set".into(),
                 ));
             }
-        }
-        if let Some(hash) = &self.admin.admin_password_hash {
-            if hash.trim().is_empty() {
+        if let Some(hash) = &self.admin.admin_password_hash
+            && hash.trim().is_empty() {
                 return Err(ConfigError::Validation(
                     "admin.admin_password_hash must not be empty if set".into(),
                 ));
             }
-        }
 
         // `seen_socket_binds` tracks exclusive claims on a raw (ip, port,
         // protocol) socket -- a host implicitly claims one for TCP, and a

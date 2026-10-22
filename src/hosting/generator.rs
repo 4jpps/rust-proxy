@@ -143,15 +143,14 @@ pub fn generate_ruleset_full(
                     blocked.sort();
                     blocked.dedup();
                     for (proto, name) in [(Protocol::Tcp, "tcp"), (Protocol::Udp, "udp")] {
-                        if let Some(set) = port_set(specs, proto) {
-                            if !blocked.is_empty() {
+                        if let Some(set) = port_set(specs, proto)
+                            && !blocked.is_empty() {
                                 let _ = writeln!(
                                     out,
                                     "        ip daddr {public} ip saddr {} {name} dport {set} drop",
                                     net_set(&blocked)
                                 );
                             }
-                        }
                         let mut targets: BTreeMap<Option<u16>, Vec<&PortSpec>> = BTreeMap::new();
                         for p in specs.iter().filter(|p| p.protocol == proto) {
                             targets.entry(p.vm_port).or_default().push(p);
@@ -460,7 +459,7 @@ mod tests {
         ssh.acl_ids = vec![acl];
         let a = alloc("44.30.51.254", Some("100.64.244.254"), ForwardMode::Ports, vec![ssh]);
         for sources in [HashMap::new(), HashMap::from([(acl, vec![])])] {
-            let out = generate_ruleset_full(&[a.clone()], &[], &sources, &HostingBlocks::default());
+            let out = generate_ruleset_full(std::slice::from_ref(&a), &[], &sources, &HostingBlocks::default());
             assert!(!out.contains("dnat"), "fail closed: {out}");
             assert!(out.contains("meta l4proto != icmp drop"), "own sshd stays shut: {out}");
         }

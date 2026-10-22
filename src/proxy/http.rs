@@ -285,11 +285,10 @@ pub async fn forward_http(
         "x-forwarded-proto",
         hyper::header::HeaderValue::from_static("https"),
     );
-    if let Some(host) = original_host {
-        if let Ok(value) = hyper::header::HeaderValue::from_str(&host) {
+    if let Some(host) = original_host
+        && let Ok(value) = hyper::header::HeaderValue::from_str(&host) {
             req.headers_mut().insert("x-forwarded-host", value);
         }
-    }
 
     // A genuine HTTP/2 request's `req.uri()` is absolute-form (hyper/h2
     // builds it from the `:scheme`/`:authority`/`:path` pseudo-headers,
@@ -308,15 +307,14 @@ pub async fn forward_http(
     // uri") -- nginx (another real upstream, gitlab.jpps.us) tolerates
     // an absolute-form request line silently, which is exactly why
     // this went unnoticed until a POST to a stricter upstream hit it.
-    if req.uri().authority().is_some() {
-        if let Some(path_and_query) = req.uri().path_and_query().cloned() {
+    if req.uri().authority().is_some()
+        && let Some(path_and_query) = req.uri().path_and_query().cloned() {
             let mut parts = hyper::http::uri::Parts::default();
             parts.path_and_query = Some(path_and_query);
             if let Ok(origin_form) = hyper::Uri::from_parts(parts) {
                 *req.uri_mut() = origin_form;
             }
         }
-    }
 
     let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
     let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));

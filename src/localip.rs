@@ -50,11 +50,10 @@ pub fn list_local_ips() -> Vec<LocalIp> {
             // Skip link-local IPv6 (fe80::/10) -- not usable as a bind
             // address without an explicit scope id, which this UI has no
             // way to collect.
-            if let IpAddr::V6(v6) = address {
-                if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+            if let IpAddr::V6(v6) = address
+                && (v6.segments()[0] & 0xffc0) == 0xfe80 {
                     continue;
                 }
-            }
             ips.push(LocalIp {
                 address,
                 interface: name.clone(),
