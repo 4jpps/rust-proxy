@@ -68,6 +68,11 @@ pub struct PortSpec {
     pub protocol: Protocol,
     pub port_start: u16,
     pub port_end: u16,
+    /// Port on the VM to translate to (DNAT port remap). `None` keeps the
+    /// public port number. Every public port in `port_start..=port_end`
+    /// maps to this one VM port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_port: Option<u16>,
     /// `IpAllow` ACLs restricting which sources may reach this port. Empty
     /// means any source. A non-empty list whose ACLs resolve to no entries
     /// forwards nothing (fail closed).
@@ -322,6 +327,9 @@ pub fn validate_ports(forward: ForwardMode, ports: &[PortSpec]) -> Check {
                 }
                 if p.port_start > p.port_end {
                     return invalid("port_start must be <= port_end");
+                }
+                if p.vm_port == Some(0) {
+                    return invalid("vm_port must not be 0");
                 }
             }
             // Overlapping intervals in one nft set are a hard load error, so
@@ -673,13 +681,18 @@ mod tests {
 
     #[test]
     fn port_forward_rules() {
-        let tcp = |s, e| PortSpec { protocol: Protocol::Tcp, port_start: s, port_end: e, acl_ids: vec![] };
-        let udp = |s, e| PortSpec { protocol: Protocol::Udp, port_start: s, port_end: e, acl_ids: vec![] };
+        let tcp = |s, e| PortSpec { protocol: Protocol::Tcp, port_start: s, port_end: e, vm_port: None, acl_ids: vec![] };
+        let udp = |s, e| PortSpec { protocol: Protocol::Udp, port_start: s, port_end: e, vm_port: None, acl_ids: vec![] };
         assert!(validate_ports(ForwardMode::All, &[]).is_ok());
         assert!(validate_ports(ForwardMode::All, &[tcp(22, 22)]).is_err());
         assert!(validate_ports(ForwardMode::Ports, &[]).is_err());
         assert!(validate_ports(ForwardMode::Ports, &[tcp(22, 22), tcp(80, 443), udp(53, 53)]).is_ok());
         assert!(validate_ports(ForwardMode::Ports, &[tcp(0, 10)]).is_err());
+        let mut remap = tcp(443, 443);
+        remap.vm_port = Some(11443);
+        assert!(validate_ports(ForwardMode::Ports, &[remap.clone()]).is_ok());
+        remap.vm_port = Some(0);
+        assert!(validate_ports(ForwardMode::Ports, &[remap]).is_err());
         assert!(validate_ports(ForwardMode::Ports, &[tcp(10, 5)]).is_err());
         assert!(validate_ports(ForwardMode::Ports, &[tcp(80, 90), tcp(90, 100)]).is_err());
         assert!(validate_ports(ForwardMode::Ports, &[tcp(53, 53), udp(53, 53)]).is_ok());

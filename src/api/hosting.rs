@@ -313,6 +313,9 @@ pub struct PortRequest {
     /// Defaults to `port_start` (a single port).
     #[serde(default)]
     port_end: Option<u16>,
+    /// Port on the VM to translate to; defaults to keeping the public port.
+    #[serde(default)]
+    vm_port: Option<u16>,
     /// `IpAllow` ACLs limiting which sources may reach this port, and/or `IpBlock` ACLs refusing some.
     #[serde(default)]
     acl_ids: Vec<Uuid>,
@@ -325,6 +328,7 @@ fn to_specs(ports: Vec<PortRequest>) -> Vec<PortSpec> {
             protocol: p.protocol,
             port_start: p.port_start,
             port_end: p.port_end.unwrap_or(p.port_start),
+            vm_port: p.vm_port,
             acl_ids: p.acl_ids,
         })
         .collect()

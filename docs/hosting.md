@@ -9,7 +9,7 @@ Nothing happens until you create a pool.
 
 - A **pool** is a class of address space: a public CIDR, a private VM network, and a gateway. `standard` and `ham` are just names you choose.
 - An **allocation** assigns one public address from a pool to one VM, with the next free private address. Allocating also hands back provisioning hints for configuring the VM.
-- `forward` is `"all"` (every protocol and port) or `"ports"` with a `ports` list.
+- `forward` is `"all"` (every protocol and port) or `"ports"` with a `ports` list. Each port entry can set an optional `vm_port` to translate to a different port on the VM (DNAT port remap), for example public 443 to VM 11443.
 
 ![The Hosting page, Allocations tab: two public addresses forwarded to customer VMs.](screenshots/hosting-allocations.png)
 
@@ -51,6 +51,23 @@ used. `notes` is free text.
 The response's `provision` object carries what to configure on the VM:
 `private_ip`, `gateway`, `netmask`, `cidr` and `ipconfig0` (a ready-made
 Proxmox cloud-init value).
+
+## Port forwards and port translation
+
+```sh
+curl -X PATCH http://127.0.0.1:8084/api/hosting/allocations/$ID \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"forward":"ports","ports":[
+        {"protocol":"tcp","port_start":443,"vm_port":11443},
+        {"protocol":"tcp","port_start":80,"vm_port":8080},
+        {"protocol":"udp","port_start":3478}]}'
+```
+
+`vm_port` is optional; without it the VM sees the same port number the client
+used. For a range (`port_start` to `port_end`), every public port in the range
+maps to the one `vm_port`. Source address, client IPs and the access lists on
+each entry work the same with or without translation. Ports not listed are
+dropped.
 
 ## Other endpoints
 

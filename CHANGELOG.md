@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+- **Port translation for hosted VMs.** A forwarded port on a hosting
+  allocation can set `vm_port` to DNAT to a different port on the VM (public
+  443 to VM 11443). The Hosting drawer has a "VM port" field per port entry.
+  Entries without it behave as before.
+
 ## [0.4.0] - 2026-10-15
 
 - **IP and ASN block lists.** New access list type `ip_block` (deny) that

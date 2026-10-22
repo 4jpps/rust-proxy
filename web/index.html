@@ -1230,7 +1230,7 @@ const aclPicker = (acls, selected, name = 'acl_ids') => acls.length
   : '<p class="help">No matching access lists exist yet. Create one under Network, Access lists.</p>';
 
 /* --------------------------------------------------------------- hosting */
-const fwdText = (a) => (a.forward === 'all' ? 'All ports' : (a.ports || []).map((p) => `${p.protocol}/${p.port_start === p.port_end ? p.port_start : p.port_start + '-' + p.port_end}`).join(', ') || 'No ports');
+const fwdText = (a) => (a.forward === 'all' ? 'All ports' : (a.ports || []).map((p) => `${p.protocol}/${p.port_start === p.port_end ? p.port_start : p.port_start + '-' + p.port_end}${p.vm_port ? ' \u2192 ' + p.vm_port : ''}`).join(', ') || 'No ports');
 const stateKind = { active: 'ok', reserved: 'info', disabled: 'off' };
 const stateLabel = { active: 'Active', reserved: 'Reserved', disabled: 'Disabled' };
 function syncBanner() {
@@ -1275,6 +1275,7 @@ function portRowHTML(p = { protocol: 'tcp', port_start: '', port_end: '' }) {
     <div class="field"><label class="sr-only">Protocol</label><select data-p="protocol"><option value="tcp"${p.protocol === 'tcp' ? ' selected' : ''}>tcp</option><option value="udp"${p.protocol === 'udp' ? ' selected' : ''}>udp</option></select></div>
     <div class="field"><label class="sr-only">From port</label><input type="number" data-p="port_start" min="1" max="65535" placeholder="from" value="${esc(p.port_start)}" required></div>
     <div class="field"><label class="sr-only">To port</label><input type="number" data-p="port_end" min="1" max="65535" placeholder="to (optional)" value="${p.port_end && p.port_end !== p.port_start ? esc(p.port_end) : ''}"></div>
+    <div class="field"><label class="sr-only">VM port</label><input type="number" data-p="vm_port" min="1" max="65535" placeholder="VM port (optional)" title="Translate to this port on the VM (DNAT). Leave empty to keep the same port." value="${p.vm_port ? esc(p.vm_port) : ''}"></div>
     <button type="button" class="icon-btn" data-rm-row aria-label="Remove port">${icon('x')}</button></div>`;
 }
 function wireRows(root, listSel, addSel, makeRow) {
@@ -1286,7 +1287,8 @@ function readPorts(root) {
   return $$('[data-port-row]', root).map((r) => {
     const g = (k) => r.querySelector(`[data-p=${k}]`).value;
     const start = Number(g('port_start')), end = g('port_end') ? Number(g('port_end')) : start;
-    return { protocol: g('protocol'), port_start: start, port_end: end };
+    const vm = g('vm_port');
+    return { protocol: g('protocol'), port_start: start, port_end: end, ...(vm ? { vm_port: Number(vm) } : {}) };
   });
 }
 async function openAllocDrawer(id) {

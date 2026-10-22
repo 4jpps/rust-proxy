@@ -2577,8 +2577,8 @@ mod tests {
             vm_id: Some(4001),
             forward: ForwardMode::Ports,
             ports: vec![
-                PortSpec { protocol: Protocol::Tcp, port_start: 22, port_end: 22, acl_ids: vec![] },
-                PortSpec { protocol: Protocol::Udp, port_start: 20100, port_end: 20200, acl_ids: vec![] },
+                PortSpec { protocol: Protocol::Tcp, port_start: 22, port_end: 22, vm_port: Some(2222), acl_ids: vec![] },
+                PortSpec { protocol: Protocol::Udp, port_start: 20100, port_end: 20200, vm_port: None, acl_ids: vec![] },
             ],
             enabled: true,
             created_at: Utc::now(),

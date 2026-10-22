@@ -151,9 +151,20 @@ pub fn generate_ruleset_full(
                                     net_set(&blocked)
                                 );
                             }
+                        }
+                        let mut targets: BTreeMap<Option<u16>, Vec<&PortSpec>> = BTreeMap::new();
+                        for p in specs.iter().filter(|p| p.protocol == proto) {
+                            targets.entry(p.vm_port).or_default().push(p);
+                        }
+                        for (vm_port, group) in &targets {
+                            let Some(set) = port_set(group, proto) else { continue };
+                            let to = match vm_port {
+                                Some(vp) => format!("{vm}:{vp}"),
+                                None => vm.to_string(),
+                            };
                             let _ = writeln!(
                                 out,
-                                "        ip daddr {public} {source}{name} dport {set} dnat to {vm}"
+                                "        ip daddr {public} {source}{name} dport {set} dnat to {to}"
                             );
                         }
                     }
@@ -277,7 +288,7 @@ mod tests {
     }
 
     fn spec(protocol: Protocol, s: u16, e: u16) -> PortSpec {
-        PortSpec { protocol, port_start: s, port_end: e, acl_ids: vec![] }
+        PortSpec { protocol, port_start: s, port_end: e, vm_port: None, acl_ids: vec![] }
     }
 
     #[test]
@@ -320,6 +331,24 @@ mod tests {
         assert_eq!(out.matches("tcp dport 443 accept").count(), 1, "duplicates collapse: {out}");
         assert!(!out.contains("9.9.9.9"), "only addresses that are actually hosted: {out}");
         assert!(!out.contains("ip daddr 204.52.221.226 tcp dport"), "unserved hosted IPs stay fully dropped");
+    }
+
+    #[test]
+    fn vm_port_remaps_with_dnat_to_addr_port() {
+        let mut https = spec(Protocol::Tcp, 443, 443);
+        https.vm_port = Some(11443);
+        let mut web = spec(Protocol::Tcp, 80, 80);
+        web.vm_port = Some(8080);
+        let out = generate_ruleset(&[alloc(
+            "204.52.221.226",
+            Some("100.64.241.226"),
+            ForwardMode::Ports,
+            vec![https, web, spec(Protocol::Tcp, 22, 22), spec(Protocol::Udp, 3478, 3478)],
+        )]);
+        assert!(out.contains("ip daddr 204.52.221.226 tcp dport { 22 } dnat to 100.64.241.226\n"), "{out}");
+        assert!(out.contains("ip daddr 204.52.221.226 tcp dport { 443 } dnat to 100.64.241.226:11443\n"), "{out}");
+        assert!(out.contains("ip daddr 204.52.221.226 tcp dport { 80 } dnat to 100.64.241.226:8080\n"), "{out}");
+        assert!(out.contains("ip daddr 204.52.221.226 udp dport { 3478 } dnat to 100.64.241.226\n"), "{out}");
     }
 
     #[test]
