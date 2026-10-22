@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.1] - 2026-10-22
 
 - **Port translation for hosted VMs.** A forwarded port on a hosting
   allocation can set `vm_port` to DNAT to a different port on the VM (public
