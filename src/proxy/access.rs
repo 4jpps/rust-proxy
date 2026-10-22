@@ -124,7 +124,14 @@ const EXPLOIT_URL_PATTERNS: &[&str] = &[
 ];
 
 const EXPLOIT_USER_AGENTS: &[&str] = &[
-    "sqlmap", "nikto", "havij", "acunetix", "nessus", "wpscan", "masscan", "nmap scripting",
+    "sqlmap",
+    "nikto",
+    "havij",
+    "acunetix",
+    "nessus",
+    "wpscan",
+    "masscan",
+    "nmap scripting",
 ];
 
 /// The opt-in `block_exploits` check: returns the reason a request looks
@@ -137,7 +144,9 @@ pub fn exploit_check(
     path_and_query: &str,
     user_agent: Option<&str>,
 ) -> Option<&'static str> {
-    if method.as_str().eq_ignore_ascii_case("TRACE") || method.as_str().eq_ignore_ascii_case("TRACK") {
+    if method.as_str().eq_ignore_ascii_case("TRACE")
+        || method.as_str().eq_ignore_ascii_case("TRACK")
+    {
         return Some("TRACE/TRACK method");
     }
     let decoded = percent_decode(&percent_decode(path_and_query)).to_ascii_lowercase();
@@ -172,46 +181,100 @@ mod tests {
     #[test]
     fn fallback_page_and_resources_pass_through() {
         for p in ["/live/", "/live/x.json", "/css/a.css", "/js", "/js/app.js"] {
-            assert_eq!(deny_fallback_decision(&fb(false), p, &Method::GET), DenyDecision::PassThrough, "{p}");
+            assert_eq!(
+                deny_fallback_decision(&fb(false), p, &Method::GET),
+                DenyDecision::PassThrough,
+                "{p}"
+            );
         }
     }
 
     #[test]
     fn unlocked_redirects_only_the_root() {
-        assert_eq!(deny_fallback_decision(&fb(false), "/", &Method::GET), DenyDecision::Redirect("/live/".into()));
-        assert_eq!(deny_fallback_decision(&fb(false), "/admin/", &Method::GET), DenyDecision::Forbidden);
+        assert_eq!(
+            deny_fallback_decision(&fb(false), "/", &Method::GET),
+            DenyDecision::Redirect("/live/".into())
+        );
+        assert_eq!(
+            deny_fallback_decision(&fb(false), "/admin/", &Method::GET),
+            DenyDecision::Forbidden
+        );
     }
 
     #[test]
     fn locked_redirects_everything_else_for_get_only() {
-        assert_eq!(deny_fallback_decision(&fb(true), "/admin/", &Method::GET), DenyDecision::Redirect("/live/".into()));
-        assert_eq!(deny_fallback_decision(&fb(true), "/admin/", &Method::HEAD), DenyDecision::Redirect("/live/".into()));
-        assert_eq!(deny_fallback_decision(&fb(true), "/admin/", &Method::POST), DenyDecision::Forbidden);
-        assert_eq!(deny_fallback_decision(&fb(true), "/live/x", &Method::POST), DenyDecision::PassThrough);
+        assert_eq!(
+            deny_fallback_decision(&fb(true), "/admin/", &Method::GET),
+            DenyDecision::Redirect("/live/".into())
+        );
+        assert_eq!(
+            deny_fallback_decision(&fb(true), "/admin/", &Method::HEAD),
+            DenyDecision::Redirect("/live/".into())
+        );
+        assert_eq!(
+            deny_fallback_decision(&fb(true), "/admin/", &Method::POST),
+            DenyDecision::Forbidden
+        );
+        assert_eq!(
+            deny_fallback_decision(&fb(true), "/live/x", &Method::POST),
+            DenyDecision::PassThrough
+        );
     }
 
     #[test]
     fn bare_fallback_path_is_bounced_to_the_slash_form() {
-        assert_eq!(deny_fallback_decision(&fb(false), "/live", &Method::GET), DenyDecision::Redirect("/live/".into()));
+        assert_eq!(
+            deny_fallback_decision(&fb(false), "/live", &Method::GET),
+            DenyDecision::Redirect("/live/".into())
+        );
     }
 
     #[test]
     fn prefix_lookalikes_and_traversal_do_not_pass() {
-        assert_eq!(deny_fallback_decision(&fb(true), "/livex", &Method::GET), DenyDecision::Redirect("/live/".into()));
-        assert_eq!(deny_fallback_decision(&fb(true), "/jsx/a", &Method::GET), DenyDecision::Redirect("/live/".into()));
+        assert_eq!(
+            deny_fallback_decision(&fb(true), "/livex", &Method::GET),
+            DenyDecision::Redirect("/live/".into())
+        );
+        assert_eq!(
+            deny_fallback_decision(&fb(true), "/jsx/a", &Method::GET),
+            DenyDecision::Redirect("/live/".into())
+        );
         for p in ["/live/../admin/", "/css/%2e%2e/admin/", "/css/..%2fadmin"] {
-            assert_ne!(deny_fallback_decision(&fb(true), p, &Method::GET), DenyDecision::PassThrough, "{p}");
+            assert_ne!(
+                deny_fallback_decision(&fb(true), p, &Method::GET),
+                DenyDecision::PassThrough,
+                "{p}"
+            );
         }
     }
 
     #[test]
     fn empty_redirect_is_a_pure_allow_list() {
-        let f = DenyFallback { scope: Default::default(), redirect_path: String::new(), lock: true, allow_paths: vec!["/guest/".into()] };
+        let f = DenyFallback {
+            scope: Default::default(),
+            redirect_path: String::new(),
+            lock: true,
+            allow_paths: vec!["/guest/".into()],
+        };
         assert!(f.validate().is_ok());
-        assert_eq!(deny_fallback_decision(&f, "/guest/s/x", &Method::GET), DenyDecision::PassThrough);
-        assert_eq!(deny_fallback_decision(&f, "/", &Method::GET), DenyDecision::Forbidden);
-        assert_eq!(deny_fallback_decision(&f, "/api/", &Method::GET), DenyDecision::Forbidden);
-        let empty = DenyFallback { scope: Default::default(), redirect_path: String::new(), lock: false, allow_paths: vec![] };
+        assert_eq!(
+            deny_fallback_decision(&f, "/guest/s/x", &Method::GET),
+            DenyDecision::PassThrough
+        );
+        assert_eq!(
+            deny_fallback_decision(&f, "/", &Method::GET),
+            DenyDecision::Forbidden
+        );
+        assert_eq!(
+            deny_fallback_decision(&f, "/api/", &Method::GET),
+            DenyDecision::Forbidden
+        );
+        let empty = DenyFallback {
+            scope: Default::default(),
+            redirect_path: String::new(),
+            lock: false,
+            allow_paths: vec![],
+        };
         assert!(empty.validate().is_err());
     }
 

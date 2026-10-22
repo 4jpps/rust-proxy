@@ -5,13 +5,13 @@
 //! download. Built directly on `reqwest` -- no `instant-acme`/`lego`.
 
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, CONTENT_TYPE, LOCATION};
 use reqwest::StatusCode;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, LOCATION};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use super::jws::{b64url, encode_jws, AccountKey, JwsError};
+use super::jws::{AccountKey, JwsError, b64url, encode_jws};
 use super::types::{
     Authorization, Directory, FinalizePayload, Identifier, NewAccountPayload, NewOrderPayload,
     Order, Problem,

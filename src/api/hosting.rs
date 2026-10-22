@@ -7,9 +7,9 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -17,10 +17,10 @@ use uuid::Uuid;
 
 use super::routes::ApiError;
 use crate::config::Protocol;
+use crate::hosting::HostingStatus;
 use crate::hosting::model::{
     self, Allocation, AllocationContext, ForwardMode, HostingError, HostingPool, PortSpec,
 };
-use crate::hosting::HostingStatus;
 use crate::state::AppState;
 
 impl From<HostingError> for ApiError {
@@ -186,8 +186,11 @@ pub async fn update_pool(
     all_pools.push(updated.clone());
     let bound = bound_ips(&state);
     for a in allocations.iter().filter(|a| a.pool == updated.name) {
-        let others_alloc: Vec<Allocation> =
-            allocations.iter().filter(|o| o.id != a.id).cloned().collect();
+        let others_alloc: Vec<Allocation> = allocations
+            .iter()
+            .filter(|o| o.id != a.id)
+            .cloned()
+            .collect();
         model::validate_allocation(
             a,
             &AllocationContext {
@@ -272,7 +275,11 @@ fn hostname_hint(name: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let h = h.trim_matches('-');
-    if h.is_empty() { "vm".into() } else { h.chars().take(63).collect() }
+    if h.is_empty() {
+        "vm".into()
+    } else {
+        h.chars().take(63).collect()
+    }
 }
 
 fn provision_for(a: &Allocation, pool: Option<&HostingPool>) -> Option<Provision> {
@@ -443,11 +450,11 @@ pub async fn create_allocation(
     };
     let vm_ip = match req.vm_ip {
         Some(ip) => Some(ip),
-        None if req.assign_vm_ip && pool.vm_cidr.is_some() => {
-            Some(model::next_free_vm_ip(pool, &pools, &allocations, Some(public_ip)).ok_or_else(|| {
-                ApiError::Conflict(format!("pool '{}' has no free VM addresses", pool.name))
-            })?)
-        }
+        None if req.assign_vm_ip && pool.vm_cidr.is_some() => Some(
+            model::next_free_vm_ip(pool, &pools, &allocations, Some(public_ip)).ok_or_else(
+                || ApiError::Conflict(format!("pool '{}' has no free VM addresses", pool.name)),
+            )?,
+        ),
         None => None,
     };
     let allocation = Allocation {
@@ -640,7 +647,10 @@ pub async fn check(
 /// 5-minute fallback. The result shows up in `GET /api/hosting/status`.
 pub async fn apply(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     state.request_hosting_sync();
-    (StatusCode::ACCEPTED, Json(serde_json::json!({"queued": true})))
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"queued": true})),
+    )
 }
 
 #[cfg(test)]
@@ -649,8 +659,8 @@ mod tests {
     use crate::api::auth;
     use crate::api::routes::build_router;
     use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig};
-    use axum::http::{header, Request};
     use axum::Router;
+    use axum::http::{Request, header};
     use std::path::PathBuf;
     use tower::ServiceExt;
 
@@ -691,7 +701,9 @@ mod tests {
             siem: None,
             hosting: None,
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -743,8 +755,13 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     const STANDARD: &str = r#"{"name":"standard","cidr":"204.52.221.224/28","vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1","reserved":["204.52.221.225"]}"#;
@@ -767,11 +784,20 @@ mod tests {
             ("POST", "/api/hosting/allocations"),
             ("GET", "/api/hosting/status"),
             ("POST", "/api/hosting/apply"),
-            ("POST", "/api/hosting/allocations/00000000-0000-0000-0000-000000000000/check"),
+            (
+                "POST",
+                "/api/hosting/allocations/00000000-0000-0000-0000-000000000000/check",
+            ),
         ] {
             let resp = router
                 .clone()
-                .oneshot(Request::builder().method(m).uri(uri).body(axum::body::Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .method(m)
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{m} {uri}");
@@ -788,13 +814,41 @@ mod tests {
 
         let (s, _) = call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
         assert_eq!(s, StatusCode::CONFLICT, "duplicate name");
-        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/pools", r#"{"name":"x","cidr":"204.52.221.232/29"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/pools",
+            r#"{"name":"x","cidr":"204.52.221.232/29"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT, "overlapping cidr");
-        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/pools", r#"{"name":"x","cidr":"10.1.0.0/28"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/pools",
+            r#"{"name":"x","cidr":"10.1.0.0/28"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "private space");
-        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/pools", r#"{"cidr":"44.30.51.224/28"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/pools",
+            r#"{"cidr":"44.30.51.224/28"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "name required");
-        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/pools", r#"{"name":"x","cidr":"44.30.51.224/28","bogus":1}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/pools",
+            r#"{"name":"x","cidr":"44.30.51.224/28","bogus":1}"#,
+        )
+        .await;
         assert!(s.is_client_error(), "unknown fields are rejected");
 
         let (s, list) = call(&router, &cookie, "GET", "/api/hosting/pools", "").await;
@@ -804,7 +858,14 @@ mod tests {
 
         let (s, _) = call(&router, &cookie, "DELETE", "/api/hosting/pools/nope", "").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
-        let (s, _) = call(&router, &cookie, "DELETE", "/api/hosting/pools/standard", "").await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "DELETE",
+            "/api/hosting/pools/standard",
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
         assert!(state.hosting_pools().is_empty());
     }
@@ -823,16 +884,29 @@ mod tests {
         let req = r#"{"pool":"standard","name":"web01","customer":"Acme","vm_ip":"172.16.63.10","vm_id":4001}"#;
         let (s, a) = call(&router, &cookie, "POST", "/api/hosting/allocations", req).await;
         assert_eq!(s, StatusCode::CREATED, "{a}");
-        assert_eq!(a["public_ip"], "204.52.221.226", "225 is reserved, 224 is the network");
+        assert_eq!(
+            a["public_ip"], "204.52.221.226",
+            "225 is reserved, 224 is the network"
+        );
         assert_eq!(a["state"], "active");
         assert_eq!(a["gateway"], "172.16.63.1");
         assert_eq!(a["forward"], "all");
 
-        let (s, b) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"web02","assign_vm_ip":false}"#).await;
+        let (s, b) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"web02","assign_vm_ip":false}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         assert_eq!(b["public_ip"], "204.52.221.227");
         assert_eq!(b["state"], "reserved");
-        assert!(b["provision"].is_null(), "no VM address, nothing to provision");
+        assert!(
+            b["provision"].is_null(),
+            "no VM address, nothing to provision"
+        );
         assert_eq!(state.hosting_allocations().len(), 2);
         assert_eq!(state.hosting_pools()[0].name, "standard");
     }
@@ -846,30 +920,102 @@ mod tests {
             let cookie = cookie.clone();
             async move { call(&router, &cookie, "POST", "/api/hosting/allocations", body).await }
         };
-        assert_eq!(post(r#"{"pool":"nope","name":"a"}"#).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(post(r#"{"pool":"standard","name":"a","public_ip":"204.52.221.250"}"#).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(post(r#"{"pool":"standard","name":"a","public_ip":"204.52.221.239"}"#).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(post(r#"{"pool":"standard","name":"a","vm_ip":"8.8.8.8"}"#).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(post(r#"{"pool":"standard","name":"a","vm_ip":"172.16.64.5"}"#).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(post(r#"{"pool":"standard","name":"a","forward":"ports"}"#).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(post(r#"{"pool":"standard","name":"a","ports":[{"protocol":"tcp","port_start":22}]}"#).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(post(r#"{"pool":"standard","name":""}"#).await.0, StatusCode::BAD_REQUEST);
-        assert!(post(r#"{"pool":"standard","name":"a","unknown":true}"#).await.0.is_client_error());
+        assert_eq!(
+            post(r#"{"pool":"nope","name":"a"}"#).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"a","public_ip":"204.52.221.250"}"#)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"a","public_ip":"204.52.221.239"}"#)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"a","vm_ip":"8.8.8.8"}"#)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"a","vm_ip":"172.16.64.5"}"#)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"a","forward":"ports"}"#)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"a","ports":[{"protocol":"tcp","port_start":22}]}"#)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":""}"#).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            post(r#"{"pool":"standard","name":"a","unknown":true}"#)
+                .await
+                .0
+                .is_client_error()
+        );
 
         assert_eq!(post(r#"{"pool":"standard","name":"a","public_ip":"204.52.221.230","vm_ip":"172.16.63.10"}"#).await.0, StatusCode::CREATED);
-        assert_eq!(post(r#"{"pool":"standard","name":"b","public_ip":"204.52.221.230"}"#).await.0, StatusCode::CONFLICT);
-        assert_eq!(post(r#"{"pool":"standard","name":"c","vm_ip":"172.16.63.10"}"#).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"b","public_ip":"204.52.221.230"}"#)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(r#"{"pool":"standard","name":"c","vm_ip":"172.16.63.10"}"#)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
     }
 
     #[tokio::test]
     async fn pool_exhaustion_is_a_conflict() {
         let (_, router, cookie) = setup(vec![]).await;
-        call(&router, &cookie, "POST", "/api/hosting/pools", r#"{"name":"tiny","cidr":"204.52.221.236/30"}"#).await;
+        call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/pools",
+            r#"{"name":"tiny","cidr":"204.52.221.236/30"}"#,
+        )
+        .await;
         for i in 0..2 {
-            let (s, b) = call(&router, &cookie, "POST", "/api/hosting/allocations", &format!(r#"{{"pool":"tiny","name":"v{i}"}}"#)).await;
+            let (s, b) = call(
+                &router,
+                &cookie,
+                "POST",
+                "/api/hosting/allocations",
+                &format!(r#"{{"pool":"tiny","name":"v{i}"}}"#),
+            )
+            .await;
             assert_eq!(s, StatusCode::CREATED, "{b}");
         }
-        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"tiny","name":"v2"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"tiny","name":"v2"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
     }
 
@@ -891,7 +1037,14 @@ mod tests {
         });
         state.set_port_rules(rules);
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"a","public_ip":"204.52.221.226"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"a","public_ip":"204.52.221.226"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
     }
 
@@ -899,11 +1052,25 @@ mod tests {
     async fn patch_sets_the_vm_activates_and_clears_it() {
         let (state, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        let (_, a) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"web01"}"#).await;
+        let (_, a) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"web01"}"#,
+        )
+        .await;
         let id = a["id"].as_str().unwrap().to_string();
         let uri = format!("/api/hosting/allocations/{id}");
 
-        let (s, p) = call(&router, &cookie, "PATCH", &uri, r#"{"vm_ip":"172.16.63.20","vm_id":4002}"#).await;
+        let (s, p) = call(
+            &router,
+            &cookie,
+            "PATCH",
+            &uri,
+            r#"{"vm_ip":"172.16.63.20","vm_id":4002}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::OK, "{p}");
         assert_eq!(p["state"], "active");
         assert_eq!(p["name"], "web01", "untouched fields are kept");
@@ -915,19 +1082,44 @@ mod tests {
 
         let (s, p) = call(&router, &cookie, "PATCH", &uri, r#"{"forward":"all"}"#).await;
         assert_eq!(s, StatusCode::OK, "{p}");
-        assert_eq!(p["ports"].as_array().unwrap().len(), 0, "switching to all drops the port list");
+        assert_eq!(
+            p["ports"].as_array().unwrap().len(),
+            0,
+            "switching to all drops the port list"
+        );
 
         let (s, p) = call(&router, &cookie, "PATCH", &uri, r#"{"enabled":false}"#).await;
         assert_eq!((s, p["state"].as_str()), (StatusCode::OK, Some("disabled")));
-        let (s, p) = call(&router, &cookie, "PATCH", &uri, r#"{"enabled":true,"vm_ip":null}"#).await;
+        let (s, p) = call(
+            &router,
+            &cookie,
+            "PATCH",
+            &uri,
+            r#"{"enabled":true,"vm_ip":null}"#,
+        )
+        .await;
         assert_eq!((s, p["state"].as_str()), (StatusCode::OK, Some("reserved")));
         assert!(state.hosting_allocations()[0].vm_ip.is_none());
 
-        let (s, _) = call(&router, &cookie, "PATCH", &uri, r#"{"public_ip":"204.52.221.230"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "PATCH",
+            &uri,
+            r#"{"public_ip":"204.52.221.230"}"#,
+        )
+        .await;
         assert!(s.is_client_error(), "public_ip is immutable");
         let (s, _) = call(&router, &cookie, "PATCH", &uri, r#"{"vm_ip":"8.8.8.8"}"#).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        let (s, _) = call(&router, &cookie, "PATCH", "/api/hosting/allocations/00000000-0000-0000-0000-000000000000", r#"{"enabled":true}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "PATCH",
+            "/api/hosting/allocations/00000000-0000-0000-0000-000000000000",
+            r#"{"enabled":true}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
@@ -935,20 +1127,72 @@ mod tests {
     async fn delete_releases_the_address_and_unblocks_the_pool() {
         let (state, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        let (_, a) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"web01"}"#).await;
+        let (_, a) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"web01"}"#,
+        )
+        .await;
         let id = a["id"].as_str().unwrap().to_string();
-        let (s, _) = call(&router, &cookie, "DELETE", "/api/hosting/pools/standard", "").await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "DELETE",
+            "/api/hosting/pools/standard",
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT, "pool with allocations");
-        let (s, _) = call(&router, &cookie, "DELETE", &format!("/api/hosting/allocations/{id}"), "").await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "DELETE",
+            &format!("/api/hosting/allocations/{id}"),
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
-        let (s, _) = call(&router, &cookie, "DELETE", &format!("/api/hosting/allocations/{id}"), "").await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "DELETE",
+            &format!("/api/hosting/allocations/{id}"),
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert!(state.hosting_allocations().is_empty());
-        let (_, b) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"web02"}"#).await;
-        assert_eq!(b["public_ip"], "204.52.221.226", "released address is reused");
-        let (s, list) = call(&router, &cookie, "GET", "/api/hosting/allocations?pool=standard", "").await;
+        let (_, b) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"web02"}"#,
+        )
+        .await;
+        assert_eq!(
+            b["public_ip"], "204.52.221.226",
+            "released address is reused"
+        );
+        let (s, list) = call(
+            &router,
+            &cookie,
+            "GET",
+            "/api/hosting/allocations?pool=standard",
+            "",
+        )
+        .await;
         assert_eq!((s, list.as_array().unwrap().len()), (StatusCode::OK, 1));
-        let (_, none) = call(&router, &cookie, "GET", "/api/hosting/allocations?pool=ham", "").await;
+        let (_, none) = call(
+            &router,
+            &cookie,
+            "GET",
+            "/api/hosting/allocations?pool=ham",
+            "",
+        )
+        .await;
         assert_eq!(none.as_array().unwrap().len(), 0);
     }
 
@@ -956,23 +1200,58 @@ mod tests {
     async fn pool_edit_cannot_invalidate_existing_allocations() {
         let (_, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"a","public_ip":"204.52.221.236","vm_ip":"172.16.63.10"}"#).await;
+        call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"a","public_ip":"204.52.221.236","vm_ip":"172.16.63.10"}"#,
+        )
+        .await;
         // Shrinking so .236 falls outside the pool.
-        let (s, b) = call(&router, &cookie, "PUT", "/api/hosting/pools/standard", r#"{"cidr":"204.52.221.224/29","vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1"}"#).await;
+        let (s, b) = call(
+            &router,
+            &cookie,
+            "PUT",
+            "/api/hosting/pools/standard",
+            r#"{"cidr":"204.52.221.224/29","vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT, "{b}");
         // Reserving an address that is in use.
         let (s, _) = call(&router, &cookie, "PUT", "/api/hosting/pools/standard", r#"{"cidr":"204.52.221.224/28","reserved":["204.52.221.236"],"vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1"}"#).await;
         assert_eq!(s, StatusCode::CONFLICT);
         // Moving the VM network away from the VM.
-        let (s, _) = call(&router, &cookie, "PUT", "/api/hosting/pools/standard", r#"{"cidr":"204.52.221.224/28","vm_cidr":"172.16.64.0/24","gateway":"172.16.64.1"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "PUT",
+            "/api/hosting/pools/standard",
+            r#"{"cidr":"204.52.221.224/28","vm_cidr":"172.16.64.0/24","gateway":"172.16.64.1"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
         // A harmless edit works; renames do not.
         let (s, b) = call(&router, &cookie, "PUT", "/api/hosting/pools/standard", r#"{"cidr":"204.52.221.224/28","description":"std","vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1"}"#).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert_eq!(b["description"], "std");
-        let (s, _) = call(&router, &cookie, "PUT", "/api/hosting/pools/standard", r#"{"name":"other","cidr":"204.52.221.224/28"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "PUT",
+            "/api/hosting/pools/standard",
+            r#"{"name":"other","cidr":"204.52.221.224/28"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        let (s, _) = call(&router, &cookie, "PUT", "/api/hosting/pools/missing", r#"{"cidr":"204.52.221.224/28"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "PUT",
+            "/api/hosting/pools/missing",
+            r#"{"cidr":"204.52.221.224/28"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
@@ -980,16 +1259,31 @@ mod tests {
     async fn status_and_apply_endpoints_work_and_persistence_survives_reload() {
         let (state, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"a","vm_ip":"172.16.63.10"}"#).await;
+        call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"a","vm_ip":"172.16.63.10"}"#,
+        )
+        .await;
         let (s, st) = call(&router, &cookie, "GET", "/api/hosting/status", "").await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!((st["pool_count"].as_u64(), st["allocation_count"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(
+            (st["pool_count"].as_u64(), st["allocation_count"].as_u64()),
+            (Some(1), Some(1))
+        );
         let (s, b) = call(&router, &cookie, "POST", "/api/hosting/apply", "").await;
-        assert_eq!((s, b["queued"].as_bool()), (StatusCode::ACCEPTED, Some(true)));
+        assert_eq!(
+            (s, b["queued"].as_bool()),
+            (StatusCode::ACCEPTED, Some(true))
+        );
 
         // What the API wrote is what a restart would load.
         let pools = crate::db::load_hosting_pools(state.db()).await.unwrap();
-        let allocs = crate::db::load_hosting_allocations(state.db()).await.unwrap();
+        let allocs = crate::db::load_hosting_allocations(state.db())
+            .await
+            .unwrap();
         assert_eq!(pools.len(), 1);
         assert_eq!(allocs.len(), 1);
         assert_eq!(allocs[0].vm_ip, Some("172.16.63.10".parse().unwrap()));
@@ -999,11 +1293,21 @@ mod tests {
     async fn create_auto_assigns_vm_ip_and_returns_provision() {
         let (_, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        let (s, a) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"class":"standard","name":"My Web_01"}"#).await;
+        let (s, a) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"class":"standard","name":"My Web_01"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CREATED, "{a}");
         assert_eq!(a["pool"], "standard", "`class` is an alias for `pool`");
         assert_eq!(a["state"], "active");
-        assert_eq!(a["vm_ip"], "172.16.63.226", "private last octet matches the public address");
+        assert_eq!(
+            a["vm_ip"], "172.16.63.226",
+            "private last octet matches the public address"
+        );
         let p = &a["provision"];
         assert_eq!(p["public_ip"], "204.52.221.226");
         assert_eq!(p["private_ip"], "172.16.63.226");
@@ -1013,21 +1317,62 @@ mod tests {
         assert_eq!(p["hostname"], "my-web-01");
         assert_eq!(p["ipconfig0"], "ip=172.16.63.226/24,gw=172.16.63.1");
 
-        let (_, b) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"b"}"#).await;
-        assert_eq!(b["vm_ip"], "172.16.63.227", "each VM gets its own private address");
+        let (_, b) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"b"}"#,
+        )
+        .await;
+        assert_eq!(
+            b["vm_ip"], "172.16.63.227",
+            "each VM gets its own private address"
+        );
 
-        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","class":"standard","name":"c"}"#).await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","class":"standard","name":"c"}"#,
+        )
+        .await;
         assert!(s.is_client_error(), "pool and class together is ambiguous");
 
-        let (_, g) = call(&router, &cookie, "GET", &format!("/api/hosting/allocations/{}", a["id"].as_str().unwrap()), "").await;
-        assert_eq!(g["provision"]["private_ip"], "172.16.63.226", "GET carries provision too");
+        let (_, g) = call(
+            &router,
+            &cookie,
+            "GET",
+            &format!("/api/hosting/allocations/{}", a["id"].as_str().unwrap()),
+            "",
+        )
+        .await;
+        assert_eq!(
+            g["provision"]["private_ip"], "172.16.63.226",
+            "GET carries provision too"
+        );
     }
 
     #[tokio::test]
     async fn pool_without_vm_cidr_reserves_only() {
         let (_, router, cookie) = setup(vec![]).await;
-        call(&router, &cookie, "POST", "/api/hosting/pools", r#"{"name":"ham","cidr":"44.30.51.224/28"}"#).await;
-        let (s, a) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"ham","name":"w1aw"}"#).await;
+        call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/pools",
+            r#"{"name":"ham","cidr":"44.30.51.224/28"}"#,
+        )
+        .await;
+        let (s, a) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"ham","name":"w1aw"}"#,
+        )
+        .await;
         assert_eq!(s, StatusCode::CREATED, "{a}");
         assert_eq!(a["state"], "reserved");
         assert!(a["vm_ip"].is_null());
@@ -1037,17 +1382,49 @@ mod tests {
     async fn status_lists_per_pool_usage() {
         let (_, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        call(&router, &cookie, "POST", "/api/hosting/pools", r#"{"name":"ham","cidr":"44.30.51.224/28"}"#).await;
-        call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"a"}"#).await;
-        call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"b","assign_vm_ip":false}"#).await;
+        call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/pools",
+            r#"{"name":"ham","cidr":"44.30.51.224/28"}"#,
+        )
+        .await;
+        call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"a"}"#,
+        )
+        .await;
+        call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"b","assign_vm_ip":false}"#,
+        )
+        .await;
         let (_, st) = call(&router, &cookie, "GET", "/api/hosting/status", "").await;
         let pools = st["pools"].as_array().unwrap();
         assert_eq!(pools.len(), 2);
         let std = pools.iter().find(|p| p["name"] == "standard").unwrap();
         assert_eq!(std["cidr"], "204.52.221.224/28");
-        assert_eq!((std["usable"].as_u64(), std["allocated"].as_u64(), std["free"].as_u64(), std["active"].as_u64()), (Some(13), Some(2), Some(11), Some(1)));
+        assert_eq!(
+            (
+                std["usable"].as_u64(),
+                std["allocated"].as_u64(),
+                std["free"].as_u64(),
+                std["active"].as_u64()
+            ),
+            (Some(13), Some(2), Some(11), Some(1))
+        );
         let ham = pools.iter().find(|p| p["name"] == "ham").unwrap();
-        assert_eq!((ham["allocated"].as_u64(), ham["free"].as_u64()), (Some(0), Some(14)));
+        assert_eq!(
+            (ham["allocated"].as_u64(), ham["free"].as_u64()),
+            (Some(0), Some(14))
+        );
         assert_eq!(st["allocation_count"], 2);
         assert!(st["ok"].is_boolean() && st["inert"].is_boolean());
     }
@@ -1056,26 +1433,67 @@ mod tests {
     async fn check_endpoint_reports_per_item_results() {
         let (_, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
-        let (_, a) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"a"}"#).await;
-        let (_, r) = call(&router, &cookie, "POST", "/api/hosting/allocations", r#"{"pool":"standard","name":"r","assign_vm_ip":false}"#).await;
+        let (_, a) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"a"}"#,
+        )
+        .await;
+        let (_, r) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"pool":"standard","name":"r","assign_vm_ip":false}"#,
+        )
+        .await;
 
         // Nothing has been applied in the test environment, so a live check
         // of an active allocation must come back not-ok, item by item.
-        let uri = format!("/api/hosting/allocations/{}/check", a["id"].as_str().unwrap());
+        let uri = format!(
+            "/api/hosting/allocations/{}/check",
+            a["id"].as_str().unwrap()
+        );
         let (s, c) = call(&router, &cookie, "POST", &uri, "").await;
         assert_eq!(s, StatusCode::OK, "{c}");
         assert_eq!(c["ok"], false);
         assert_eq!(c["state"], "active");
-        let names: Vec<&str> = c["checks"].as_array().unwrap().iter().map(|i| i["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["active", "address_on_lo", "dnat_rule", "snat_rule", "vm_reachable"]);
+        let names: Vec<&str> = c["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "active",
+                "address_on_lo",
+                "dnat_rule",
+                "snat_rule",
+                "vm_reachable"
+            ]
+        );
 
-        let uri = format!("/api/hosting/allocations/{}/check", r["id"].as_str().unwrap());
+        let uri = format!(
+            "/api/hosting/allocations/{}/check",
+            r["id"].as_str().unwrap()
+        );
         let (s, c) = call(&router, &cookie, "POST", &uri, "").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(c["ok"], false);
         assert_eq!(c["checks"].as_array().unwrap().len(), 1);
 
-        let (s, _) = call(&router, &cookie, "POST", &format!("/api/hosting/allocations/{}/check", uuid::Uuid::new_v4()), "").await;
+        let (s, _) = call(
+            &router,
+            &cookie,
+            "POST",
+            &format!("/api/hosting/allocations/{}/check", uuid::Uuid::new_v4()),
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 }

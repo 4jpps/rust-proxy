@@ -5,7 +5,7 @@
 
 use std::net::IpAddr;
 
-use crate::config::{host_bind_ips, ProxyHost};
+use crate::config::{ProxyHost, host_bind_ips};
 
 /// Case-insensitive per RFC 4343 -- DNS names/SNI/Host headers aren't
 /// case-sensitive, and a client (or a misbehaving upstream) may send
@@ -45,23 +45,34 @@ pub fn match_host<'a>(
 /// unknown hostname (Default Site).
 pub fn host_is_known(hosts: &[ProxyHost], name: &str) -> bool {
     let name = strip_port_suffix(name);
-    let wildcard = name.split_once('.').map(|(_, parent)| format!("*.{parent}"));
+    let wildcard = name
+        .split_once('.')
+        .map(|(_, parent)| format!("*.{parent}"));
     hosts.iter().any(|h| {
         h.enabled
             && (h.domain.eq_ignore_ascii_case(name)
-                || wildcard.as_deref().is_some_and(|w| h.domain.eq_ignore_ascii_case(w)))
+                || wildcard
+                    .as_deref()
+                    .is_some_and(|w| h.domain.eq_ignore_ascii_case(w)))
     })
 }
 
 /// Enabled hosts a plain-HTTP `Host:` name resolves to on any bind
 /// address (exact name, plus a one-label `*.parent` wildcard).
-pub fn known_hosts<'a>(hosts: &'a [ProxyHost], name: &str) -> impl Iterator<Item = &'a ProxyHost> + use<'a> {
+pub fn known_hosts<'a>(
+    hosts: &'a [ProxyHost],
+    name: &str,
+) -> impl Iterator<Item = &'a ProxyHost> + use<'a> {
     let name = strip_port_suffix(name).to_string();
-    let wildcard = name.split_once('.').map(|(_, parent)| format!("*.{parent}"));
+    let wildcard = name
+        .split_once('.')
+        .map(|(_, parent)| format!("*.{parent}"));
     hosts.iter().filter(move |h| {
         h.enabled
             && (h.domain.eq_ignore_ascii_case(&name)
-                || wildcard.as_deref().is_some_and(|w| h.domain.eq_ignore_ascii_case(w)))
+                || wildcard
+                    .as_deref()
+                    .is_some_and(|w| h.domain.eq_ignore_ascii_case(w)))
     })
 }
 
@@ -298,7 +309,10 @@ mod tests {
         assert!(host_is_known(&hosts, "app.example.com:8080"));
         assert!(host_is_known(&hosts, "x.wild.example.com"));
         assert!(!host_is_known(&hosts, "other.example.com"));
-        assert!(!host_is_known(&hosts, "off.example.com"), "disabled sites do not count");
+        assert!(
+            !host_is_known(&hosts, "off.example.com"),
+            "disabled sites do not count"
+        );
         assert!(!host_is_known(&hosts, "10.0.0.2"));
     }
 }

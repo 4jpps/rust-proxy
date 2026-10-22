@@ -43,8 +43,12 @@ impl NetSet {
         let mut set = NetSet::default();
         for net in IpNet::aggregate(&nets) {
             match net {
-                IpNet::V4(n) => set.v4.push((u32::from(n.network()), u32::from(n.broadcast()))),
-                IpNet::V6(n) => set.v6.push((u128::from(n.network()), u128::from(n.broadcast()))),
+                IpNet::V4(n) => set
+                    .v4
+                    .push((u32::from(n.network()), u32::from(n.broadcast()))),
+                IpNet::V6(n) => set
+                    .v6
+                    .push((u128::from(n.network()), u128::from(n.broadcast()))),
             }
         }
         set.v4.sort_unstable();
@@ -118,7 +122,9 @@ impl BlockIndex {
     /// Whether any block list among `acl_ids` (a host's selected ACLs)
     /// contains `ip`.
     pub fn is_blocked_for(&self, acl_ids: &[Uuid], ip: IpAddr) -> bool {
-        acl_ids.iter().any(|id| self.lists.get(id).is_some_and(|s| s.contains(ip)))
+        acl_ids
+            .iter()
+            .any(|id| self.lists.get(id).is_some_and(|s| s.contains(ip)))
     }
 
     pub fn from_lists(
@@ -171,7 +177,10 @@ pub async fn rebuild(state: &AppState) {
     }
 }
 
-pub async fn fetch_announced_prefixes(client: &reqwest::Client, asn: u32) -> Result<Vec<String>, String> {
+pub async fn fetch_announced_prefixes(
+    client: &reqwest::Client,
+    asn: u32,
+) -> Result<Vec<String>, String> {
     let url = format!("https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}");
     let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -220,7 +229,11 @@ pub async fn refresh_stale(state: &AppState) {
         .map(|s| (s.asn, s))
         .collect();
     let now = chrono::Utc::now();
-    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&chrono::Utc));
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent("rust-proxy asn-blocklist")
@@ -247,11 +260,14 @@ pub async fn refresh_stale(state: &AppState) {
         match fetch_announced_prefixes(&client, asn).await {
             Ok(prefixes) => {
                 tracing::info!(asn, prefixes = prefixes.len(), "asn prefixes refreshed");
-                match crate::db::store_asn_prefixes(state.db(), asn, &prefixes).await { Err(err) => {
-                    tracing::error!(asn, error = %err, "asn refresh: failed to store prefixes");
-                } _ => {
-                    changed = true;
-                }}
+                match crate::db::store_asn_prefixes(state.db(), asn, &prefixes).await {
+                    Err(err) => {
+                        tracing::error!(asn, error = %err, "asn refresh: failed to store prefixes");
+                    }
+                    _ => {
+                        changed = true;
+                    }
+                }
             }
             Err(err) => {
                 tracing::warn!(asn, error = %err, "asn prefix fetch failed; keeping previous prefixes");
@@ -310,7 +326,10 @@ mod tests {
 
     #[test]
     fn overlapping_nets_are_merged() {
-        let set = NetSet::from_nets(vec!["10.0.0.0/8".parse().unwrap(), "10.1.0.0/16".parse().unwrap()]);
+        let set = NetSet::from_nets(vec![
+            "10.0.0.0/8".parse().unwrap(),
+            "10.1.0.0/16".parse().unwrap(),
+        ]);
         assert_eq!(set.len(), 1);
         assert!(set.contains(ip("10.1.2.3")));
     }
@@ -320,18 +339,28 @@ mod tests {
         let host_list = Uuid::new_v4();
         let global_list = Uuid::new_v4();
         let mut asn = HashMap::new();
-        asn.insert(13238, vec!["5.45.192.0/18".to_string(), "bogus".to_string()]);
+        asn.insert(
+            13238,
+            vec!["5.45.192.0/18".to_string(), "bogus".to_string()],
+        );
         let index = BlockIndex::from_lists(
             vec![
                 (host_list, false, vec!["AS13238".into()]),
-                (global_list, true, vec!["198.51.100.4".into(), "AS99999".into()]),
+                (
+                    global_list,
+                    true,
+                    vec!["198.51.100.4".into(), "AS99999".into()],
+                ),
             ],
             &asn,
         );
         assert!(index.is_blocked_for(&[host_list], ip("5.45.200.1")));
         assert!(!index.is_blocked_for(&[], ip("5.45.200.1")));
         assert!(!index.is_blocked_for(&[global_list], ip("5.45.200.1")));
-        assert!(!index.is_globally_blocked(ip("5.45.200.1")), "a per-host list is not global");
+        assert!(
+            !index.is_globally_blocked(ip("5.45.200.1")),
+            "a per-host list is not global"
+        );
         assert!(index.is_globally_blocked(ip("198.51.100.4")));
         assert!(!index.is_globally_blocked(ip("198.51.100.5")));
         assert_eq!(index.global_prefix_count(), 1);

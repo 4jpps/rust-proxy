@@ -12,12 +12,12 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -94,7 +94,9 @@ fn validate_token(raw: &str) -> Result<String, String> {
 fn validate_common_name(raw: &str) -> Result<String, String> {
     let cn = raw.trim();
     if cn.is_empty() || cn.chars().count() > MAX_CN_LEN || cn.chars().any(char::is_control) {
-        return Err(format!("common_name must be 1-{MAX_CN_LEN} characters with no control characters"));
+        return Err(format!(
+            "common_name must be 1-{MAX_CN_LEN} characters with no control characters"
+        ));
     }
     Ok(cn.to_string())
 }
@@ -135,7 +137,9 @@ async fn call(
 ) -> Result<Value, TbError> {
     let settings = load_settings(state).await?;
     if settings.token.is_empty() {
-        return Err(TbError::bad_request("no TrustBridge org token is configured"));
+        return Err(TbError::bad_request(
+            "no TrustBridge org token is configured",
+        ));
     }
     let mut req = http()
         .request(method, format!("{}{}", settings.url, path))
@@ -144,15 +148,16 @@ async fn call(
     if let Some(body) = body {
         req = req.json(&body);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| TbError::gateway(format!("could not reach TrustBridge: {}", e.without_url())))?;
+    let resp = req.send().await.map_err(|e| {
+        TbError::gateway(format!("could not reach TrustBridge: {}", e.without_url()))
+    })?;
     let status = resp.status();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| TbError::gateway(format!("could not read TrustBridge's response: {}", e.without_url())))?;
+    let bytes = resp.bytes().await.map_err(|e| {
+        TbError::gateway(format!(
+            "could not read TrustBridge's response: {}",
+            e.without_url()
+        ))
+    })?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err(TbError::gateway("TrustBridge's response was too large"));
     }
@@ -167,9 +172,15 @@ async fn call(
         .map(|m| m.chars().take(300).collect::<String>())
         .unwrap_or_else(|| format!("TrustBridge returned HTTP {}", status.as_u16()));
     if status == StatusCode::UNAUTHORIZED {
-        return Err(TbError::gateway(format!("TrustBridge rejected the org token: {message}")));
+        return Err(TbError::gateway(format!(
+            "TrustBridge rejected the org token: {message}"
+        )));
     }
-    let out = if status.is_client_error() { status } else { StatusCode::BAD_GATEWAY };
+    let out = if status.is_client_error() {
+        status
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
     Err(TbError(out, message))
 }
 
@@ -211,8 +222,13 @@ pub struct PutSettings {
 
 fn validate_org_id(s: &str) -> Result<String, String> {
     let ok = (3..=64).contains(&s.len())
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if ok { Ok(s.to_string()) } else { Err("org id must be 3-64 letters, digits, '-' or '_'".into()) }
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err("org id must be 3-64 letters, digits, '-' or '_'".into())
+    }
 }
 
 pub async fn put_settings(
@@ -220,7 +236,9 @@ pub async fn put_settings(
     Json(body): Json<PutSettings>,
 ) -> Result<Json<Value>, TbError> {
     if body.url.is_none() && body.token.is_none() && body.required_org_id.is_none() {
-        return Err(TbError::bad_request("nothing to change: provide url, token and/or required_org_id"));
+        return Err(TbError::bad_request(
+            "nothing to change: provide url, token and/or required_org_id",
+        ));
     }
     let new_lock = match body.required_org_id.as_deref().map(str::trim) {
         None => None,
@@ -247,7 +265,9 @@ pub async fn put_settings(
 }
 
 pub async fn list_certs(State(state): State<AppState>) -> Result<Json<Value>, TbError> {
-    Ok(Json(call(&state, reqwest::Method::GET, "/api/v1/org/certs", None).await?))
+    Ok(Json(
+        call(&state, reqwest::Method::GET, "/api/v1/org/certs", None).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -264,11 +284,19 @@ pub async fn create_cert(
     let mut req = json!({ "common_name": common_name });
     if let Some(days) = body.days {
         if days == 0 || days > MAX_DAYS {
-            return Err(TbError::bad_request(format!("days must be between 1 and {MAX_DAYS}")));
+            return Err(TbError::bad_request(format!(
+                "days must be between 1 and {MAX_DAYS}"
+            )));
         }
         req["days"] = json!(days);
     }
-    let created = call(&state, reqwest::Method::POST, "/api/v1/org/certs", Some(req)).await?;
+    let created = call(
+        &state,
+        reqwest::Method::POST,
+        "/api/v1/org/certs",
+        Some(req),
+    )
+    .await?;
     // The response carries the private key and the .p12 password.
     Ok((
         StatusCode::CREATED,
@@ -302,8 +330,14 @@ mod tests {
 
     #[test]
     fn base_url_accepts_https_and_normalises() {
-        assert_eq!(validate_base_url(" https://pki.jpps.us/ ").unwrap(), "https://pki.jpps.us");
-        assert_eq!(validate_base_url("https://pki.example.com:8443/tb").unwrap(), "https://pki.example.com:8443/tb");
+        assert_eq!(
+            validate_base_url(" https://pki.jpps.us/ ").unwrap(),
+            "https://pki.jpps.us"
+        );
+        assert_eq!(
+            validate_base_url("https://pki.example.com:8443/tb").unwrap(),
+            "https://pki.example.com:8443/tb"
+        );
     }
 
     #[test]
@@ -317,8 +351,13 @@ mod tests {
     #[test]
     fn base_url_rejects_junk() {
         for bad in [
-            "", "pki.jpps.us", "ftp://pki.jpps.us", "https://user:pw@pki.jpps.us",
-            "https://pki.jpps.us/?x=1", "https://pki.jpps.us/#frag", "file:///etc/passwd",
+            "",
+            "pki.jpps.us",
+            "ftp://pki.jpps.us",
+            "https://user:pw@pki.jpps.us",
+            "https://pki.jpps.us/?x=1",
+            "https://pki.jpps.us/#frag",
+            "file:///etc/passwd",
         ] {
             assert!(validate_base_url(bad).is_err(), "{bad} should be rejected");
         }
@@ -328,7 +367,17 @@ mod tests {
     fn serial_must_be_digits_only() {
         assert!(validate_serial("1234567890").is_ok());
         assert!(validate_serial("AbCdEf0123").is_ok());
-        for bad in ["", "../x", "12/34", "12 34", "12;34", "1%2f", "0x12", "12\n", &"1".repeat(65)] {
+        for bad in [
+            "",
+            "../x",
+            "12/34",
+            "12 34",
+            "12;34",
+            "1%2f",
+            "0x12",
+            "12\n",
+            &"1".repeat(65),
+        ] {
             assert!(validate_serial(bad).is_err(), "{bad:?} should be rejected");
         }
     }
@@ -343,7 +392,10 @@ mod tests {
 
     #[test]
     fn common_name_is_trimmed_and_bounded() {
-        assert_eq!(validate_common_name(" Jeff Parrish ").unwrap(), "Jeff Parrish");
+        assert_eq!(
+            validate_common_name(" Jeff Parrish ").unwrap(),
+            "Jeff Parrish"
+        );
         assert!(validate_common_name("").is_err());
         assert!(validate_common_name("a\u{0}b").is_err());
         assert!(validate_common_name(&"a".repeat(129)).is_err());

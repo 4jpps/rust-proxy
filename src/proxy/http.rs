@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
+use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, UPGRADE};
 use hyper::{Request, Response};
@@ -133,7 +133,9 @@ fn merge_split_cookie_headers(req: &mut Request<Incoming>) {
         }
     }
 
-    let Ok(value) = hyper::header::HeaderValue::from_str(&merged.join("; ")) else { return };
+    let Ok(value) = hyper::header::HeaderValue::from_str(&merged.join("; ")) else {
+        return;
+    };
     req.headers_mut().remove(hyper::header::COOKIE);
     req.headers_mut().insert(hyper::header::COOKIE, value);
 }
@@ -172,8 +174,12 @@ fn rewrite_samesite_none_to_lax(headers: &mut hyper::HeaderMap) {
         .get_all(hyper::header::SET_COOKIE)
         .iter()
         .map(|value| {
-            let Ok(s) = value.to_str() else { return value.clone() };
-            let Some(idx) = s.to_ascii_lowercase().find("samesite=none") else { return value.clone() };
+            let Ok(s) = value.to_str() else {
+                return value.clone();
+            };
+            let Some(idx) = s.to_ascii_lowercase().find("samesite=none") else {
+                return value.clone();
+            };
             let mut new_value = String::with_capacity(s.len());
             new_value.push_str(&s[..idx]);
             new_value.push_str("SameSite=Lax");
@@ -286,9 +292,10 @@ pub async fn forward_http(
         hyper::header::HeaderValue::from_static("https"),
     );
     if let Some(host) = original_host
-        && let Ok(value) = hyper::header::HeaderValue::from_str(&host) {
-            req.headers_mut().insert("x-forwarded-host", value);
-        }
+        && let Ok(value) = hyper::header::HeaderValue::from_str(&host)
+    {
+        req.headers_mut().insert("x-forwarded-host", value);
+    }
 
     // A genuine HTTP/2 request's `req.uri()` is absolute-form (hyper/h2
     // builds it from the `:scheme`/`:authority`/`:path` pseudo-headers,
@@ -308,13 +315,14 @@ pub async fn forward_http(
     // an absolute-form request line silently, which is exactly why
     // this went unnoticed until a POST to a stricter upstream hit it.
     if req.uri().authority().is_some()
-        && let Some(path_and_query) = req.uri().path_and_query().cloned() {
-            let mut parts = hyper::http::uri::Parts::default();
-            parts.path_and_query = Some(path_and_query);
-            if let Ok(origin_form) = hyper::Uri::from_parts(parts) {
-                *req.uri_mut() = origin_form;
-            }
+        && let Some(path_and_query) = req.uri().path_and_query().cloned()
+    {
+        let mut parts = hyper::http::uri::Parts::default();
+        parts.path_and_query = Some(path_and_query);
+        if let Ok(origin_form) = hyper::Uri::from_parts(parts) {
+            *req.uri_mut() = origin_form;
         }
+    }
 
     let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
     let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));
@@ -627,49 +635,104 @@ mod tests {
         let mut headers = hyper::HeaderMap::new();
         headers.append(
             hyper::header::SET_COOKIE,
-            hyper::header::HeaderValue::from_static("_gitlab_session=abc123; path=/; secure; HttpOnly; SameSite=None"),
+            hyper::header::HeaderValue::from_static(
+                "_gitlab_session=abc123; path=/; secure; HttpOnly; SameSite=None",
+            ),
         );
 
         rewrite_samesite_none_to_lax(&mut headers);
 
-        let value = headers.get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap();
-        assert_eq!(value, "_gitlab_session=abc123; path=/; secure; HttpOnly; SameSite=Lax");
+        let value = headers
+            .get(hyper::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            value,
+            "_gitlab_session=abc123; path=/; secure; HttpOnly; SameSite=Lax"
+        );
     }
 
     #[test]
     fn rewrite_samesite_none_is_case_insensitive() {
         let mut headers = hyper::HeaderMap::new();
-        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("foo=bar; samesite=none"));
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("foo=bar; samesite=none"),
+        );
 
         rewrite_samesite_none_to_lax(&mut headers);
 
-        assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap(), "foo=bar; SameSite=Lax");
+        assert_eq!(
+            headers
+                .get(hyper::header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "foo=bar; SameSite=Lax"
+        );
     }
 
     #[test]
     fn rewrite_samesite_none_leaves_lax_and_strict_cookies_untouched() {
         let mut headers = hyper::HeaderMap::new();
-        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("a=1; SameSite=Lax"));
-        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("b=2; SameSite=Strict"));
-        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("c=3"));
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("a=1; SameSite=Lax"),
+        );
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("b=2; SameSite=Strict"),
+        );
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("c=3"),
+        );
 
         rewrite_samesite_none_to_lax(&mut headers);
 
-        let values: Vec<&str> = headers.get_all(hyper::header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
-        assert_eq!(values, vec!["a=1; SameSite=Lax", "b=2; SameSite=Strict", "c=3"]);
+        let values: Vec<&str> = headers
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["a=1; SameSite=Lax", "b=2; SameSite=Strict", "c=3"]
+        );
     }
 
     #[test]
     fn rewrite_samesite_none_handles_multiple_set_cookie_headers_independently() {
         let mut headers = hyper::HeaderMap::new();
-        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("session=x; SameSite=None; Secure"));
-        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("pref=en; path=/"));
-        headers.append(hyper::header::SET_COOKIE, hyper::header::HeaderValue::from_static("other=y; SameSite=None; Secure"));
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("session=x; SameSite=None; Secure"),
+        );
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("pref=en; path=/"),
+        );
+        headers.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("other=y; SameSite=None; Secure"),
+        );
 
         rewrite_samesite_none_to_lax(&mut headers);
 
-        let values: Vec<&str> = headers.get_all(hyper::header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
-        assert_eq!(values, vec!["session=x; SameSite=Lax; Secure", "pref=en; path=/", "other=y; SameSite=Lax; Secure"]);
+        let values: Vec<&str> = headers
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "session=x; SameSite=Lax; Secure",
+                "pref=en; path=/",
+                "other=y; SameSite=Lax; Secure"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -681,17 +744,23 @@ mod tests {
                 let (stream, _) = upstream_listener.accept().await.unwrap();
                 let io = TokioIo::new(stream);
                 let service = service_fn(|_req: Request<Incoming>| async move {
-                    let body: BoxBody<Bytes, hyper::Error> =
-                        Empty::<Bytes>::new().map_err(|e: std::convert::Infallible| match e {}).boxed();
+                    let body: BoxBody<Bytes, hyper::Error> = Empty::<Bytes>::new()
+                        .map_err(|e: std::convert::Infallible| match e {})
+                        .boxed();
                     Ok::<_, std::convert::Infallible>(
                         Response::builder()
                             .status(200)
-                            .header(hyper::header::SET_COOKIE, "session=x; Secure; SameSite=None")
+                            .header(
+                                hyper::header::SET_COOKIE,
+                                "session=x; Secure; SameSite=None",
+                            )
                             .body(body)
                             .unwrap(),
                     )
                 });
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
             });
 
             let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -709,22 +778,43 @@ mod tests {
                         client_ip: "203.0.113.42".parse().unwrap(),
                         rewrite_samesite_none_cookies: rewrite_enabled,
                     };
-                    forward_http(req, upstream_addr, opts).await.map_err(|e| e.to_string())
+                    forward_http(req, upstream_addr, opts)
+                        .await
+                        .map_err(|e| e.to_string())
                 });
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
             });
 
             let stream = TcpStream::connect(proxy_addr).await.unwrap();
             let io = TokioIo::new(stream);
             let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
             tokio::spawn(conn);
-            let req = Request::builder().uri("/").header(hyper::header::HOST, "example.com").body(Empty::<Bytes>::new()).unwrap();
+            let req = Request::builder()
+                .uri("/")
+                .header(hyper::header::HOST, "example.com")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
             let resp = sender.send_request(req).await.unwrap();
-            resp.headers().get(hyper::header::SET_COOKIE).unwrap().to_str().unwrap().to_string()
+            resp.headers()
+                .get(hyper::header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
         }
 
-        assert_eq!(run(true).await, "session=x; Secure; SameSite=Lax", "enabled must downgrade the upstream's SameSite=None");
-        assert_eq!(run(false).await, "session=x; Secure; SameSite=None", "disabled (the default) must leave the upstream's cookie untouched");
+        assert_eq!(
+            run(true).await,
+            "session=x; Secure; SameSite=Lax",
+            "enabled must downgrade the upstream's SameSite=None"
+        );
+        assert_eq!(
+            run(false).await,
+            "session=x; Secure; SameSite=None",
+            "disabled (the default) must leave the upstream's cookie untouched"
+        );
     }
 
     #[test]
@@ -963,7 +1053,7 @@ mod tests {
                     upstream_host_port: &upstream_host_port,
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
-                rewrite_samesite_none_cookies: false,
+                    rewrite_samesite_none_cookies: false,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1035,7 +1125,7 @@ mod tests {
                     upstream_host_port: "backend.internal:9999",
                     preserve_host: false,
                     client_ip: "127.0.0.1".parse().unwrap(),
-                rewrite_samesite_none_cookies: false,
+                    rewrite_samesite_none_cookies: false,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1076,8 +1166,8 @@ mod tests {
     /// from the request's own declared authority -- not the client's
     /// literal header, since here there isn't one.
     #[tokio::test]
-    async fn forward_http_synthesizes_a_host_header_from_an_h2_requests_authority_when_preserve_host_is_enabled(
-    ) {
+    async fn forward_http_synthesizes_a_host_header_from_an_h2_requests_authority_when_preserve_host_is_enabled()
+     {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1124,7 +1214,7 @@ mod tests {
                     upstream_host_port: "unused:0",
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
-                rewrite_samesite_none_cookies: false,
+                    rewrite_samesite_none_cookies: false,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1284,8 +1374,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_http_downgrades_an_h2_requests_absolute_form_uri_to_origin_form_for_the_http1_upstream(
-    ) {
+    async fn forward_http_downgrades_an_h2_requests_absolute_form_uri_to_origin_form_for_the_http1_upstream()
+     {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1315,7 +1405,7 @@ mod tests {
                     upstream_host_port: "unused:0",
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
-                rewrite_samesite_none_cookies: false,
+                    rewrite_samesite_none_cookies: false,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1345,7 +1435,11 @@ mod tests {
             .unwrap();
         let resp = sender.send_request(req).await.unwrap();
 
-        assert_eq!(resp.status(), 200, "upstream only returns 200 if it saw an origin-form request line -- see the mock's own check");
+        assert_eq!(
+            resp.status(),
+            200,
+            "upstream only returns 200 if it saw an origin-form request line -- see the mock's own check"
+        );
     }
 
     #[tokio::test]
@@ -1362,7 +1456,8 @@ mod tests {
                 .filter(|line| line.to_ascii_lowercase().starts_with("cookie:"))
                 .collect();
             let response = if cookie_lines.len() == 1
-                && cookie_lines[0] == "cookie: preferred_language=en; _gitlab_session=abc123; other=xyz"
+                && cookie_lines[0]
+                    == "cookie: preferred_language=en; _gitlab_session=abc123; other=xyz"
             {
                 "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
             } else {
@@ -1418,7 +1513,11 @@ mod tests {
             .unwrap();
         let resp = sender.send_request(req).await.unwrap();
 
-        assert_eq!(resp.status(), 200, "upstream only returns 200 if it saw a single merged Cookie header -- see the mock's own check");
+        assert_eq!(
+            resp.status(),
+            200,
+            "upstream only returns 200 if it saw a single merged Cookie header -- see the mock's own check"
+        );
     }
 
     fn self_signed_server_config(domain: &str) -> rustls::ServerConfig {
@@ -1483,7 +1582,7 @@ mod tests {
                     upstream_host_port: "upstream.internal:0",
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
-                rewrite_samesite_none_cookies: false,
+                    rewrite_samesite_none_cookies: false,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await

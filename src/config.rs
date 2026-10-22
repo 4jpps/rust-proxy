@@ -214,7 +214,7 @@ impl SiemConfig {
             other => {
                 return Err(format!(
                     "siem.facility \"{other}\" is not a known syslog facility"
-                ))
+                ));
             }
         };
         Ok(n)
@@ -235,11 +235,12 @@ impl SiemConfig {
             );
         }
         if let Some(h) = &self.hostname
-            && (h.is_empty() || h.len() > 255 || !h.chars().all(|c| c.is_ascii_graphic())) {
-                return Err(
-                    "siem.hostname must be 1-255 printable ASCII characters with no spaces".into(),
-                );
-            }
+            && (h.is_empty() || h.len() > 255 || !h.chars().all(|c| c.is_ascii_graphic()))
+        {
+            return Err(
+                "siem.hostname must be 1-255 printable ASCII characters with no spaces".into(),
+            );
+        }
         for c in &self.categories {
             if !SIEM_CATEGORIES.contains(&c.as_str()) {
                 return Err(format!(
@@ -830,8 +831,9 @@ impl DefaultSite {
 
     pub fn validate(&self) -> Result<(), String> {
         match self.mode {
-            DefaultSiteMode::Redirect => validate_redirect_target(self.redirect_url.trim())
-                .map_err(|e| e.to_string()),
+            DefaultSiteMode::Redirect => {
+                validate_redirect_target(self.redirect_url.trim()).map_err(|e| e.to_string())
+            }
             DefaultSiteMode::CustomHtml if self.custom_html.trim().is_empty() => {
                 Err("custom HTML mode needs some HTML".into())
             }
@@ -864,7 +866,9 @@ impl FixedResponse {
     pub const MAX_BODY: usize = 64 * 1024;
 
     pub fn validate(&self) -> Result<(), String> {
-        if !(200..=599).contains(&self.status) || matches!(self.status, 204 | 205 | 304) && !self.body.is_empty() {
+        if !(200..=599).contains(&self.status)
+            || matches!(self.status, 204 | 205 | 304) && !self.body.is_empty()
+        {
             return Err("fixed_response status must be 200-599 (204/205/304 take no body)".into());
         }
         if self.body.len() > Self::MAX_BODY {
@@ -925,13 +929,23 @@ impl DenyFallback {
     /// `proxy::login::sanitize_return_to`).
     pub fn validate(&self) -> Result<(), String> {
         fn check(p: &str, what: &str) -> Result<(), String> {
-            if !p.starts_with('/') || p.starts_with("//") || p.contains('\\') || p.contains('?') || p.contains('#') || p.chars().any(|c| c.is_control() || c.is_whitespace()) {
-                return Err(format!("{what} must be a plain path starting with a single '/' (got {p:?})"));
+            if !p.starts_with('/')
+                || p.starts_with("//")
+                || p.contains('\\')
+                || p.contains('?')
+                || p.contains('#')
+                || p.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(format!(
+                    "{what} must be a plain path starting with a single '/' (got {p:?})"
+                ));
             }
             Ok(())
         }
         if self.redirect_path.is_empty() && self.allow_paths.is_empty() {
-            return Err("deny_fallback needs a redirect_path or at least one allow_paths entry".into());
+            return Err(
+                "deny_fallback needs a redirect_path or at least one allow_paths entry".into(),
+            );
         }
         if !self.redirect_path.is_empty() {
             check(&self.redirect_path, "deny_fallback redirect_path")?;
@@ -1171,23 +1185,26 @@ impl Config {
             ));
         }
         if let Some(secret) = &self.admin.session_secret
-            && secret.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "admin.session_secret must not be empty if set".into(),
-                ));
-            }
+            && secret.trim().is_empty()
+        {
+            return Err(ConfigError::Validation(
+                "admin.session_secret must not be empty if set".into(),
+            ));
+        }
         if let Some(username) = &self.admin.admin_username
-            && username.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "admin.admin_username must not be empty if set".into(),
-                ));
-            }
+            && username.trim().is_empty()
+        {
+            return Err(ConfigError::Validation(
+                "admin.admin_username must not be empty if set".into(),
+            ));
+        }
         if let Some(hash) = &self.admin.admin_password_hash
-            && hash.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "admin.admin_password_hash must not be empty if set".into(),
-                ));
-            }
+            && hash.trim().is_empty()
+        {
+            return Err(ConfigError::Validation(
+                "admin.admin_password_hash must not be empty if set".into(),
+            ));
+        }
 
         // `seen_socket_binds` tracks exclusive claims on a raw (ip, port,
         // protocol) socket -- a host implicitly claims one for TCP, and a
@@ -1255,7 +1272,10 @@ impl Config {
                 for port in rule.port_start..=rule.port_end {
                     let key = (bind_ip, port, rule.protocol);
                     if seen_socket_binds.contains(&key) {
-                        return Err(ConfigError::Validation(format!("port_rules entry conflicts with an existing bind at {bind_ip}:{port}/{:?}", rule.protocol)));
+                        return Err(ConfigError::Validation(format!(
+                            "port_rules entry conflicts with an existing bind at {bind_ip}:{port}/{:?}",
+                            rule.protocol
+                        )));
                     }
                     seen_socket_binds.push(key);
                 }
@@ -1562,13 +1582,13 @@ gateway = "172.16.63.1"
         // log_dir belongs under [admin] -- insert it into base_toml()'s
         // own [admin] table rather than appending after the whole
         // document, which would land the key outside any table.
-        let toml_str = base_toml().replacen(
-            "[admin]",
-            "[admin]\nlog_dir = \"/var/log/rust-proxy\"",
-            1,
-        );
+        let toml_str =
+            base_toml().replacen("[admin]", "[admin]\nlog_dir = \"/var/log/rust-proxy\"", 1);
         let cfg: Config = toml::from_str(&toml_str).expect("should parse");
-        assert_eq!(cfg.admin.log_dir, Some(std::path::PathBuf::from("/var/log/rust-proxy")));
+        assert_eq!(
+            cfg.admin.log_dir,
+            Some(std::path::PathBuf::from("/var/log/rust-proxy"))
+        );
     }
 
     #[test]
@@ -1944,7 +1964,7 @@ gateway = "172.16.63.1"
                 fixed_response: None,
                 hsts: false,
                 hsts_subdomains: false,
-            pass_client_cert_header: false,
+                pass_client_cert_header: false,
                 enabled: true,
             });
         }
@@ -1984,7 +2004,7 @@ gateway = "172.16.63.1"
                 fixed_response: None,
                 hsts: false,
                 hsts_subdomains: false,
-            pass_client_cert_header: false,
+                pass_client_cert_header: false,
                 enabled: true,
             });
         }
@@ -2100,11 +2120,21 @@ gateway = "172.16.63.1"
             upstream_https: false,
             upstream_tls_verify: true,
         };
-        let locs = vec![loc("/api", "a:1"), loc("/api/v2", "b:2"), loc("/static/", "c:3")];
+        let locs = vec![
+            loc("/api", "a:1"),
+            loc("/api/v2", "b:2"),
+            loc("/static/", "c:3"),
+        ];
         assert_eq!(match_location(&locs, "/api").unwrap().upstream, "a:1");
         assert_eq!(match_location(&locs, "/api/users").unwrap().upstream, "a:1");
-        assert_eq!(match_location(&locs, "/api/v2/users").unwrap().upstream, "b:2");
-        assert_eq!(match_location(&locs, "/static/x.css").unwrap().upstream, "c:3");
+        assert_eq!(
+            match_location(&locs, "/api/v2/users").unwrap().upstream,
+            "b:2"
+        );
+        assert_eq!(
+            match_location(&locs, "/static/x.css").unwrap().upstream,
+            "c:3"
+        );
         assert!(match_location(&locs, "/apiary").is_none());
         assert!(match_location(&locs, "/static").is_none());
         assert!(match_location(&locs, "/").is_none());
@@ -2112,13 +2142,15 @@ gateway = "172.16.63.1"
 
     #[test]
     fn host_location_validation() {
-        let ok = |path: &str, up: &str| HostLocation {
-            path: path.into(),
-            upstream: up.into(),
-            upstream_https: false,
-            upstream_tls_verify: true,
-        }
-        .validate();
+        let ok = |path: &str, up: &str| {
+            HostLocation {
+                path: path.into(),
+                upstream: up.into(),
+                upstream_https: false,
+                upstream_tls_verify: true,
+            }
+            .validate()
+        };
         assert!(ok("/api", "10.0.0.1:80").is_ok());
         assert!(ok("api", "10.0.0.1:80").is_err());
         assert!(ok("//evil", "10.0.0.1:80").is_err());
@@ -2130,7 +2162,14 @@ gateway = "172.16.63.1"
 
     #[test]
     fn fixed_response_validation() {
-        let fr = |status, body: &str| FixedResponse { status, body: body.into(), html: false }.validate();
+        let fr = |status, body: &str| {
+            FixedResponse {
+                status,
+                body: body.into(),
+                html: false,
+            }
+            .validate()
+        };
         assert!(fr(404, "").is_ok());
         assert!(fr(200, "hello").is_ok());
         assert!(fr(99, "").is_err());
@@ -2174,14 +2213,38 @@ gateway = "172.16.63.1"
             custom_html: html.into(),
         };
         assert!(site(DefaultSiteMode::NotFound, "", "").validate().is_ok());
-        assert!(site(DefaultSiteMode::Congratulations, "", "").validate().is_ok());
+        assert!(
+            site(DefaultSiteMode::Congratulations, "", "")
+                .validate()
+                .is_ok()
+        );
         assert!(site(DefaultSiteMode::NoResponse, "", "").validate().is_ok());
-        assert!(site(DefaultSiteMode::Redirect, "https://www.example.com", "").validate().is_ok());
+        assert!(
+            site(DefaultSiteMode::Redirect, "https://www.example.com", "")
+                .validate()
+                .is_ok()
+        );
         assert!(site(DefaultSiteMode::Redirect, "", "").validate().is_err());
-        assert!(site(DefaultSiteMode::Redirect, "javascript:alert(1)", "").validate().is_err());
-        assert!(site(DefaultSiteMode::CustomHtml, "", "   ").validate().is_err());
-        assert!(site(DefaultSiteMode::CustomHtml, "", "<p>x</p>").validate().is_ok());
+        assert!(
+            site(DefaultSiteMode::Redirect, "javascript:alert(1)", "")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            site(DefaultSiteMode::CustomHtml, "", "   ")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            site(DefaultSiteMode::CustomHtml, "", "<p>x</p>")
+                .validate()
+                .is_ok()
+        );
         let big = "x".repeat(DefaultSite::MAX_HTML + 1);
-        assert!(site(DefaultSiteMode::CustomHtml, "", &big).validate().is_err());
+        assert!(
+            site(DefaultSiteMode::CustomHtml, "", &big)
+                .validate()
+                .is_err()
+        );
     }
 }

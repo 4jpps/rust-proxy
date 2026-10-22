@@ -106,7 +106,10 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
         global: index.global_nets().to_vec(),
         rule: std::collections::HashMap::new(),
     };
-    for rule in port_rules.iter().filter(|r| r.enabled && !r.acl_ids.is_empty()) {
+    for rule in port_rules
+        .iter()
+        .filter(|r| r.enabled && !r.acl_ids.is_empty())
+    {
         let nets = index.nets_for(&rule.acl_ids);
         if !nets.is_empty() {
             blocks.rule.insert(rule.id, nets);

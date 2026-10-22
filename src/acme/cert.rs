@@ -155,10 +155,11 @@ mod tests {
         // ASN.1 for these two -- if they're not requested at all,
         // neither string should appear anywhere in the DER, regardless
         // of encoding position.
-        assert!(!csr
-            .der
-            .windows(b"Acme Corp".len())
-            .any(|w| w == b"Acme Corp"));
+        assert!(
+            !csr.der
+                .windows(b"Acme Corp".len())
+                .any(|w| w == b"Acme Corp")
+        );
     }
 
     #[test]

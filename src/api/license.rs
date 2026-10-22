@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -72,10 +72,12 @@ impl LicenseResponse {
 }
 
 pub async fn get_license(State(state): State<AppState>) -> Result<Json<LicenseResponse>, ApiError> {
-    Ok(Json(match db::load_commercial_license(state.db()).await? {
-        Some(lic) => LicenseResponse::from_record(lic),
-        None => LicenseResponse::none(),
-    }))
+    Ok(Json(
+        match db::load_commercial_license(state.db()).await? {
+            Some(lic) => LicenseResponse::from_record(lic),
+            None => LicenseResponse::none(),
+        },
+    ))
 }
 
 #[derive(Deserialize)]
@@ -128,7 +130,9 @@ async fn validate_with_store(base_url: &str, key: &str) -> Result<CommercialLice
             (_, s) if !s.is_empty() => s.to_string(),
             _ => "not valid".to_string(),
         };
-        return Err(ApiError::BadRequest(format!("that license key is not valid ({why})")));
+        return Err(ApiError::BadRequest(format!(
+            "that license key is not valid ({why})"
+        )));
     }
     Ok(CommercialLicense {
         license_key: key.to_string(),
@@ -154,7 +158,9 @@ pub async fn put_license(
     Ok(Json(LicenseResponse::from_record(lic)))
 }
 
-pub async fn delete_license(State(state): State<AppState>) -> Result<Json<LicenseResponse>, ApiError> {
+pub async fn delete_license(
+    State(state): State<AppState>,
+) -> Result<Json<LicenseResponse>, ApiError> {
     db::clear_commercial_license(state.db()).await?;
     Ok(Json(LicenseResponse::none()))
 }
@@ -172,7 +178,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/validate"))
-            .and(body_json(serde_json::json!({"license_key": KEY, "product": "rust-proxy"})))
+            .and(body_json(
+                serde_json::json!({"license_key": KEY, "product": "rust-proxy"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "valid": true, "status": "active", "name": "Jeff Parrish PC Services LLC",
                 "product": "rust-proxy", "expires_at": "2126-10-14T00:00:00Z", "lifetime": true
@@ -227,7 +235,10 @@ mod tests {
             lifetime: true,
             validated_at: "2026-10-14T00:00:00Z".into(),
         });
-        assert_eq!(r.key_hint.as_deref(), Some("lic-...06041b5f"[..4].to_owned().as_str()).map(|_| "lic-...041b5f"));
+        assert_eq!(
+            r.key_hint.as_deref(),
+            Some("lic-...06041b5f"[..4].to_owned().as_str()).map(|_| "lic-...041b5f")
+        );
         assert!(!serde_json::to_string(&r).unwrap().contains(KEY));
     }
 }

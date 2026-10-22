@@ -111,11 +111,15 @@ mod tests {
             .expect("a specific address must bind beside a wildcard listener on the same port");
         let got_specific = tokio::spawn(async move { specific.accept().await.is_ok() });
         let got_wildcard = tokio::spawn(async move { wildcard.accept().await.is_ok() });
-        tokio::net::TcpStream::connect(("127.0.0.2", port)).await.unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), got_specific)
+        tokio::net::TcpStream::connect(("127.0.0.2", port))
             .await
-            .expect("exact-address listener must receive the connection")
-            .unwrap());
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), got_specific)
+                .await
+                .expect("exact-address listener must receive the connection")
+                .unwrap()
+        );
         got_wildcard.abort();
     }
 
@@ -125,11 +129,15 @@ mod tests {
         let port = wildcard.local_addr().unwrap().port();
         let _specific = bind_tcp_listener(format!("127.0.0.2:{port}").parse().unwrap()).unwrap();
         let got_wildcard = tokio::spawn(async move { wildcard.accept().await.is_ok() });
-        tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), got_wildcard)
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
-            .expect("wildcard listener must still get other addresses")
-            .unwrap());
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), got_wildcard)
+                .await
+                .expect("wildcard listener must still get other addresses")
+                .unwrap()
+        );
     }
 
     #[tokio::test]

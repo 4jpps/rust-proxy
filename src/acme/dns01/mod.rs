@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::jws::{b64url, AccountKey};
+use super::jws::{AccountKey, b64url};
 
 pub use cloudflare::CloudflareDns01;
 pub use digitalocean::DigitalOceanDns01;

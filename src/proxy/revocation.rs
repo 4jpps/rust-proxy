@@ -37,7 +37,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const CACHE_MAX: usize = 4096;
 
 // AlgorithmIdentifier { sha1, NULL }
-const SHA1_ALG_ID: &[u8] = &[0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00];
+const SHA1_ALG_ID: &[u8] = &[
+    0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00,
+];
 // OID ecdsa-with-SHA256
 const ECDSA_SHA256_OID: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
 
@@ -149,12 +151,18 @@ impl RevocationChecker {
             return false;
         }
         if let Some((verdict, at)) = self.cache.lock().unwrap().get(&key).copied() {
-            let ttl = if verdict == Verdict::Good { GOOD_TTL } else { UNAVAILABLE_TTL };
+            let ttl = if verdict == Verdict::Good {
+                GOOD_TTL
+            } else {
+                UNAVAILABLE_TTL
+            };
             if at.elapsed() < ttl {
                 return false;
             }
         }
-        let verdict = self.query(url, issuer, cert.issuer().as_raw(), &serial).await;
+        let verdict = self
+            .query(url, issuer, cert.issuer().as_raw(), &serial)
+            .await;
         match verdict {
             Verdict::Revoked => {
                 self.mark_revoked(&key).await;
@@ -181,15 +189,23 @@ impl RevocationChecker {
         self.revoked.lock().unwrap().insert(key.to_string());
         tracing::warn!(serial = %key, "client certificate is revoked; it will no longer be accepted");
         if let Some(db) = &self.db {
-            let _ = sqlx::query("INSERT OR IGNORE INTO revoked_client_certs (serial, first_seen) VALUES (?, ?)")
-                .bind(key)
-                .bind(chrono::Utc::now().to_rfc3339())
-                .execute(db)
-                .await;
+            let _ = sqlx::query(
+                "INSERT OR IGNORE INTO revoked_client_certs (serial, first_seen) VALUES (?, ?)",
+            )
+            .bind(key)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(db)
+            .await;
         }
     }
 
-    async fn query(&self, url: &str, issuer: &Issuer, issuer_name_der: &[u8], serial: &[u8]) -> Verdict {
+    async fn query(
+        &self,
+        url: &str,
+        issuer: &Issuer,
+        issuer_name_der: &[u8],
+        serial: &[u8],
+    ) -> Verdict {
         let body = build_request(issuer, issuer_name_der, serial);
         let resp = self
             .http
@@ -268,7 +284,12 @@ fn read_tlv(buf: &[u8]) -> Option<Tlv<'_>> {
     if end > buf.len() {
         return None;
     }
-    Some(Tlv { tag, content: &buf[header..end], rest: &buf[end..], raw: &buf[..end] })
+    Some(Tlv {
+        tag,
+        content: &buf[header..end],
+        rest: &buf[end..],
+        raw: &buf[..end],
+    })
 }
 
 fn trim_zeros(b: &[u8]) -> &[u8] {
@@ -312,7 +333,11 @@ fn parse_inner(resp: &[u8], issuer_key: &[u8], serial: &[u8]) -> Option<Verdict>
     if tbs.tag != 0x30 || sig_alg.tag != 0x30 || sig.tag != 0x03 {
         return None;
     }
-    if !sig_alg.content.windows(ECDSA_SHA256_OID.len()).any(|w| w == ECDSA_SHA256_OID) {
+    if !sig_alg
+        .content
+        .windows(ECDSA_SHA256_OID.len())
+        .any(|w| w == ECDSA_SHA256_OID)
+    {
         return None;
     }
     signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, issuer_key)
@@ -355,7 +380,7 @@ mod tests {
     use super::*;
     use rcgen::{CertificateParams, KeyPair, SerialNumber};
     use ring::rand::SystemRandom;
-    use ring::signature::{EcdsaKeyPair, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING};
+    use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -372,12 +397,16 @@ mod tests {
         let ca_kp = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.distinguished_name.push(rcgen::DnType::CommonName, format!("Test Intermediate {n}"));
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("Test Intermediate {n}"));
         let ca = ca_params.self_signed(&ca_kp).unwrap();
 
         let leaf_kp = KeyPair::generate().unwrap();
         let mut leaf_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        leaf_params.distinguished_name.push(rcgen::DnType::CommonName, "Jeff");
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Jeff");
         leaf_params.serial_number = Some(SerialNumber::from(vec![0x12, 0x34, 0x56]));
         let leaf = leaf_params.signed_by(&leaf_kp, &ca, &ca_kp).unwrap();
 
@@ -420,7 +449,10 @@ mod tests {
         basic.extend(tlv(0x30, &tlv(0x06, ECDSA_SHA256_OID)));
         basic.extend(tlv(0x03, &sig_bits));
         let basic = tlv(0x30, &basic);
-        let mut rb = tlv(0x06, &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01]);
+        let mut rb = tlv(
+            0x06,
+            &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01],
+        );
         rb.extend(tlv(0x04, &basic));
         let mut out = tlv(0x0A, &[0]);
         out.extend(tlv(0xA0, &tlv(0x30, &rb)));
@@ -444,12 +476,19 @@ mod tests {
     fn a_real_trustbridge_response_verifies_and_reads_as_revoked() {
         let issuer = Issuer::trustbridge().expect("embedded intermediate parses");
         let serial = [
-            0x0C, 0xA2, 0x8A, 0xE4, 0xA2, 0xB4, 0x4F, 0xBC, 0xCD, 0x92, 0x86, 0xCB, 0xBF, 0x51, 0x50, 0xD4,
+            0x0C, 0xA2, 0x8A, 0xE4, 0xA2, 0xB4, 0x4F, 0xBC, 0xCD, 0x92, 0x86, 0xCB, 0xBF, 0x51,
+            0x50, 0xD4,
         ];
         let resp = include_bytes!("testdata/trustbridge_ocsp_revoked.der");
-        assert_eq!(parse_response(resp, &issuer.key_bytes, &serial), Verdict::Revoked);
+        assert_eq!(
+            parse_response(resp, &issuer.key_bytes, &serial),
+            Verdict::Revoked
+        );
         let other = [1u8, 2, 3];
-        assert_eq!(parse_response(resp, &issuer.key_bytes, &other), Verdict::Unavailable);
+        assert_eq!(
+            parse_response(resp, &issuer.key_bytes, &other),
+            Verdict::Unavailable
+        );
     }
 
     #[test]
@@ -460,21 +499,30 @@ mod tests {
         let top = read_tlv(&req).unwrap();
         assert_eq!(top.tag, 0x30);
         assert!(top.rest.is_empty());
-        assert!(req.windows(3).any(|w| w == [0x02, 0x03, 0x12]), "serial is encoded as an INTEGER");
+        assert!(
+            req.windows(3).any(|w| w == [0x02, 0x03, 0x12]),
+            "serial is encoded as an INTEGER"
+        );
     }
 
     #[test]
     fn a_good_signed_response_is_good() {
         let pki = make_pki();
         let key = pki.signer.public_key().as_ref().to_vec();
-        assert_eq!(parse_response(&signed_response(&pki, &pki.serial, 0x80), &key, &pki.serial), Verdict::Good);
+        assert_eq!(
+            parse_response(&signed_response(&pki, &pki.serial, 0x80), &key, &pki.serial),
+            Verdict::Good
+        );
     }
 
     #[test]
     fn a_revoked_signed_response_is_revoked() {
         let pki = make_pki();
         let key = pki.signer.public_key().as_ref().to_vec();
-        assert_eq!(parse_response(&signed_response(&pki, &pki.serial, 0xA1), &key, &pki.serial), Verdict::Revoked);
+        assert_eq!(
+            parse_response(&signed_response(&pki, &pki.serial, 0xA1), &key, &pki.serial),
+            Verdict::Revoked
+        );
     }
 
     #[test]
@@ -482,12 +530,25 @@ mod tests {
         let pki = make_pki();
         let other = make_pki();
         let key = pki.signer.public_key().as_ref().to_vec();
-        assert_eq!(parse_response(&signed_response(&pki, &pki.serial, 0x82), &key, &pki.serial), Verdict::Unavailable);
-        assert_eq!(parse_response(&signed_response(&pki, &[9, 9], 0xA1), &key, &pki.serial), Verdict::Unavailable);
-        assert_eq!(parse_response(b"not der", &key, &pki.serial), Verdict::Unavailable);
+        assert_eq!(
+            parse_response(&signed_response(&pki, &pki.serial, 0x82), &key, &pki.serial),
+            Verdict::Unavailable
+        );
+        assert_eq!(
+            parse_response(&signed_response(&pki, &[9, 9], 0xA1), &key, &pki.serial),
+            Verdict::Unavailable
+        );
+        assert_eq!(
+            parse_response(b"not der", &key, &pki.serial),
+            Verdict::Unavailable
+        );
         assert_eq!(parse_response(&[], &key, &pki.serial), Verdict::Unavailable);
         let forged = signed_response(&other, &pki.serial, 0xA1);
-        assert_eq!(parse_response(&forged, &key, &pki.serial), Verdict::Unavailable, "signed by the wrong key");
+        assert_eq!(
+            parse_response(&forged, &key, &pki.serial),
+            Verdict::Unavailable,
+            "signed by the wrong key"
+        );
     }
 
     #[tokio::test]
@@ -497,7 +558,10 @@ mod tests {
         let c = checker(&pki, Some(server.uri()));
         assert!(c.is_revoked(&pki.leaf_der).await);
         drop(server);
-        assert!(c.is_revoked(&pki.leaf_der).await, "known revocation survives the responder disappearing");
+        assert!(
+            c.is_revoked(&pki.leaf_der).await,
+            "known revocation survives the responder disappearing"
+        );
     }
 
     #[tokio::test]
@@ -516,7 +580,11 @@ mod tests {
         let c = checker(&pki, Some(server.uri()));
         assert!(!c.is_revoked(&pki.leaf_der).await);
         assert!(!c.is_revoked(&pki.leaf_der).await);
-        assert_eq!(server.received_requests().await.unwrap().len(), 1, "second check served from cache");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "second check served from cache"
+        );
     }
 
     #[tokio::test]
@@ -533,7 +601,10 @@ mod tests {
         let c = checker(&pki, Some(server.uri()));
         assert!(!c.is_revoked(&pki.leaf_der).await);
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
         let c = checker(&pki, Some(server.uri()));
         assert!(!c.is_revoked(&pki.leaf_der).await);
     }
@@ -558,11 +629,18 @@ mod tests {
     #[tokio::test]
     async fn revocations_persist_across_restarts() {
         let pki = make_pki();
-        let db = crate::db::connect(&std::path::PathBuf::from(":memory:")).await.unwrap();
+        let db = crate::db::connect(&std::path::PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         let server = serve(signed_response(&pki, &pki.serial, 0xA1)).await;
-        let c = RevocationChecker::with_parts(Some(server.uri()), Issuer::from_der(&pki.issuer_der), Some(db.clone()));
+        let c = RevocationChecker::with_parts(
+            Some(server.uri()),
+            Issuer::from_der(&pki.issuer_der),
+            Some(db.clone()),
+        );
         assert!(c.is_revoked(&pki.leaf_der).await);
-        let fresh = RevocationChecker::with_parts(None, Issuer::from_der(&pki.issuer_der), Some(db));
+        let fresh =
+            RevocationChecker::with_parts(None, Issuer::from_der(&pki.issuer_der), Some(db));
         assert!(!fresh.is_revoked(&pki.leaf_der).await, "not loaded yet");
         fresh.load_revoked().await;
         assert!(fresh.is_revoked(&pki.leaf_der).await);

@@ -14,8 +14,8 @@
 //! typically a much lower-trust "viewer" account than the daemon's own
 //! admin account.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -159,11 +159,7 @@ fn sanitize_return_to(return_to: &str) -> &str {
         && !return_to.starts_with("//")
         && !return_to.starts_with("/\\")
         && !return_to.contains("://");
-    if is_safe {
-        return_to
-    } else {
-        "/"
-    }
+    if is_safe { return_to } else { "/" }
 }
 
 /// Renders the self-contained login page served in place of the

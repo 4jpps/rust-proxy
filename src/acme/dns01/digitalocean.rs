@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use super::{
-    join_api_errors, relative_record_name, ApiErrorMessage, Dns01Error, DnsProvider, DnsZone,
+    ApiErrorMessage, Dns01Error, DnsProvider, DnsZone, join_api_errors, relative_record_name,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.digitalocean.com/v2";

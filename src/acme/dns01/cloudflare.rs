@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use super::{join_api_errors, ApiErrorMessage, Dns01Error, DnsProvider, DnsZone};
+use super::{ApiErrorMessage, Dns01Error, DnsProvider, DnsZone, join_api_errors};
 
 const DEFAULT_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 

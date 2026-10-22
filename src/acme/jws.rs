@@ -5,12 +5,12 @@
 //! it is less risk than pulling in a general-purpose implementation and
 //! only using a sliver of it.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -182,7 +182,7 @@ pub fn encode_jws(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+    use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 
     #[test]
     fn b64url_matches_rfc4648_test_vectors_unpadded() {
@@ -223,9 +223,11 @@ mod tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
         let public_key_bytes = key.public_key_der();
         let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &public_key_bytes);
-        assert!(public_key
-            .verify(signing_input.as_bytes(), &sig_bytes)
-            .is_ok());
+        assert!(
+            public_key
+                .verify(signing_input.as_bytes(), &sig_bytes)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -249,9 +251,11 @@ mod tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
         let public_key_bytes = key.public_key_der();
         let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &public_key_bytes);
-        assert!(public_key
-            .verify(signing_input.as_bytes(), &sig_bytes)
-            .is_err());
+        assert!(
+            public_key
+                .verify(signing_input.as_bytes(), &sig_bytes)
+                .is_err()
+        );
     }
 
     #[test]

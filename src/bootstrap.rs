@@ -156,8 +156,12 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
 
 /// Pools from the optional `[hosting]` config section, minus any that fail
 /// validation (logged and skipped, so one typo cannot block startup).
-pub(crate) fn seed_hosting_pools(cfg: &crate::config::Config) -> Vec<crate::hosting::model::HostingPool> {
-    let Some(seed) = &cfg.hosting else { return vec![] };
+pub(crate) fn seed_hosting_pools(
+    cfg: &crate::config::Config,
+) -> Vec<crate::hosting::model::HostingPool> {
+    let Some(seed) = &cfg.hosting else {
+        return vec![];
+    };
     let mut accepted: Vec<crate::hosting::model::HostingPool> = Vec::new();
     for pool in &seed.pools {
         if accepted.iter().any(|p| p.name == pool.name) {
@@ -166,7 +170,9 @@ pub(crate) fn seed_hosting_pools(cfg: &crate::config::Config) -> Vec<crate::host
         }
         match crate::hosting::model::validate_pool(pool, &accepted, &cfg.network.dedicated_ips) {
             Ok(()) => accepted.push(pool.clone()),
-            Err(err) => tracing::warn!(pool = %pool.name, error = ?err, "ignoring invalid [hosting] pool"),
+            Err(err) => {
+                tracing::warn!(pool = %pool.name, error = ?err, "ignoring invalid [hosting] pool")
+            }
         }
     }
     accepted
@@ -199,7 +205,10 @@ mod tests {
                 pool("standard", "198.51.100.0/28"),
             ],
         });
-        let names: Vec<String> = seed_hosting_pools(&cfg).into_iter().map(|p| p.name).collect();
+        let names: Vec<String> = seed_hosting_pools(&cfg)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
         assert_eq!(names, ["standard", "ham"]);
     }
 
@@ -327,10 +336,12 @@ mod tests {
     #[tokio::test]
     async fn persisted_admin_identity_is_none_before_setup_and_populated_after() {
         let pool = memory_pool().await;
-        assert!(load_persisted_admin_identity(&pool)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            load_persisted_admin_identity(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         crate::db::create_admin_identity_if_absent(&pool, "admin", "hash", "secret")
             .await

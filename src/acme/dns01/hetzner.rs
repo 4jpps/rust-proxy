@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use super::{join_api_errors, relative_record_name, Dns01Error, DnsProvider, DnsZone};
+use super::{Dns01Error, DnsProvider, DnsZone, join_api_errors, relative_record_name};
 
 const DEFAULT_BASE_URL: &str = "https://dns.hetzner.com/api/v1";
 const AUTH_HEADER: &str = "Auth-API-Token";

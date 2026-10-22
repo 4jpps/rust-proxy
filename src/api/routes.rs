@@ -7,7 +7,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use axum::extract::{Extension, Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -144,7 +144,10 @@ pub fn build_router(state: AppState) -> Router {
                 .patch(super::hosting::patch_allocation)
                 .delete(super::hosting::delete_allocation),
         )
-        .route("/api/hosting/allocations/:id/check", post(super::hosting::check))
+        .route(
+            "/api/hosting/allocations/:id/check",
+            post(super::hosting::check),
+        )
         .route("/api/hosting/status", get(super::hosting::status))
         .route("/api/hosting/apply", post(super::hosting::apply))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -210,7 +213,15 @@ async fn access_log(req: Request, next: Next) -> Response {
         role,
         "admin api request"
     );
-    siem_admin_event(&method, &path, status, auth, user, role, client_ip.as_deref());
+    siem_admin_event(
+        &method,
+        &path,
+        status,
+        auth,
+        user,
+        role,
+        client_ip.as_deref(),
+    );
     resp
 }
 
@@ -237,9 +248,9 @@ fn client_ip_from(
             .and_then(|v| v.rsplit(',').next())
             .map(str::trim)
             .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
-        {
-            return Some(last.to_string());
-        }
+    {
+        return Some(last.to_string());
+    }
     Some(peer.to_string())
 }
 
@@ -256,7 +267,7 @@ fn siem_admin_event(
     role: &str,
     client_ip: Option<&str>,
 ) {
-    use crate::siem::{emit, wants, Category, Severity};
+    use crate::siem::{Category, Severity, emit, wants};
     if !wants(Category::Admin) {
         return;
     }
@@ -369,7 +380,11 @@ async fn require_admin(
                     .get("x-client-cert-subject")
                     .and_then(|v| v.to_str().ok())
                     .filter(|subject| {
-                        state.admin().client_cert_subjects.iter().any(|s| s == subject)
+                        state
+                            .admin()
+                            .client_cert_subjects
+                            .iter()
+                            .any(|s| s == subject)
                     });
                 if let Some(subject) = subject {
                     break 'auth Some(Principal {
@@ -576,7 +591,11 @@ async fn setup_status(
     let configured = state.admin_identity().is_some();
     Json(SetupStatusResponse {
         configured,
-        client_ip: if configured { None } else { client_ip_from(&parts.extensions, &parts.headers) },
+        client_ip: if configured {
+            None
+        } else {
+            client_ip_from(&parts.extensions, &parts.headers)
+        },
     })
 }
 
@@ -639,12 +658,17 @@ fn parse_admin_allowed_ips(
             .map_err(|_| ApiError::BadRequest(format!("'{entry}' is not an IP address or CIDR")))?;
         out.push(net);
     }
-    if let Some(ip) = client_ip.and_then(|c| c.parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_canonical())
-        && !out.is_empty() && !ip.is_loopback() && !out.iter().any(|n| n.contains(&ip)) {
-            return Err(ApiError::BadRequest(format!(
-                "your own address ({ip}) is not in this list, which would lock you out of the admin UI"
-            )));
-        }
+    if let Some(ip) = client_ip
+        .and_then(|c| c.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
+        && !out.is_empty()
+        && !ip.is_loopback()
+        && !out.iter().any(|n| n.contains(&ip))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "your own address ({ip}) is not in this list, which would lock you out of the admin UI"
+        )));
+    }
     Ok(out)
 }
 
@@ -726,10 +750,11 @@ async fn setup(
         state.set_admin_allowed_ips(allowed_ips);
     }
     if let Some(expose) = body.expose_admin_port
-        && state.admin().expose_admin_port.is_none() {
-            crate::db::set_expose_admin_port(state.db(), expose).await?;
-            state.set_expose_admin_port(expose);
-        }
+        && state.admin().expose_admin_port.is_none()
+    {
+        crate::db::set_expose_admin_port(state.db(), expose).await?;
+        state.set_expose_admin_port(expose);
+    }
     state.notify_config_change();
     Ok(StatusCode::CREATED)
 }
@@ -800,7 +825,11 @@ struct FirewallSettingsResponse {
 fn firewall_response(state: &AppState) -> FirewallSettingsResponse {
     FirewallSettingsResponse {
         expose_admin_port: state.expose_admin_port(),
-        admin_allowed_ips: state.admin_allowed_ips().iter().map(|n| n.to_string()).collect(),
+        admin_allowed_ips: state
+            .admin_allowed_ips()
+            .iter()
+            .map(|n| n.to_string())
+            .collect(),
         allowed_ips_from_config: !state.admin().allowed_ips.is_empty(),
         from_config: state.admin().expose_admin_port.is_some(),
     }
@@ -1057,7 +1086,9 @@ fn validate_host_request(state: &AppState, req: &HostRequest) -> Result<(), ApiE
         fixed.validate().map_err(ApiError::BadRequest)?;
     }
     if req.hsts_subdomains && !req.hsts {
-        return Err(ApiError::BadRequest("hsts_subdomains needs hsts turned on".into()));
+        return Err(ApiError::BadRequest(
+            "hsts_subdomains needs hsts turned on".into(),
+        ));
     }
     match (&req.redirect, &req.static_root) {
         _ if req.fixed_response.is_some() => {}
@@ -1291,7 +1322,10 @@ async fn create_acl_list(
                     if subject.is_empty() {
                         return Err(ApiError::BadRequest("subject must not be empty".into()));
                     }
-                    Ok((subject.to_string(), normalize_description(e.description.clone())))
+                    Ok((
+                        subject.to_string(),
+                        normalize_description(e.description.clone()),
+                    ))
                 })
                 .collect::<Result<_, ApiError>>()?;
             crate::db::create_acl_list(state.db(), id, name, body.kind, created_at).await?;
@@ -1363,7 +1397,9 @@ async fn set_acl_global(
         .await?
         .ok_or(ApiError::NotFound)?;
     if list.kind != crate::config::AclKind::IpBlock {
-        return Err(ApiError::BadRequest("only an IP block list can be global".into()));
+        return Err(ApiError::BadRequest(
+            "only an IP block list can be global".into(),
+        ));
     }
     crate::db::set_acl_global(state.db(), id, body.global).await?;
     crate::blocklist::rebuild(&state).await;
@@ -1438,9 +1474,7 @@ async fn add_acl_ip_entry(
         list.kind,
         crate::config::AclKind::IpAllow | crate::config::AclKind::IpBlock
     ) {
-        return Err(ApiError::BadRequest(
-            "this ACL is not an IP list".into(),
-        ));
+        return Err(ApiError::BadRequest("this ACL is not an IP list".into()));
     }
     let cidr = normalize_entry_for(list.kind, &body.cidr)?;
     let description = normalize_description(body.description);
@@ -1469,9 +1503,7 @@ async fn update_acl_ip_entry(
         list.kind,
         crate::config::AclKind::IpAllow | crate::config::AclKind::IpBlock
     ) {
-        return Err(ApiError::BadRequest(
-            "this ACL is not an IP list".into(),
-        ));
+        return Err(ApiError::BadRequest("this ACL is not an IP list".into()));
     }
     let cidr = normalize_entry_for(list.kind, &body.cidr)?;
     let description = normalize_description(body.description);
@@ -1629,7 +1661,8 @@ async fn add_acl_client_cert_entry(
     }
     let description = normalize_description(body.description);
     let entry_id =
-        crate::db::add_acl_client_cert_entry(state.db(), id, subject, description.as_deref()).await?;
+        crate::db::add_acl_client_cert_entry(state.db(), id, subject, description.as_deref())
+            .await?;
     state.notify_config_change();
     Ok(Json(crate::db::AclClientCertEntry {
         id: entry_id,
@@ -1656,8 +1689,13 @@ async fn update_acl_client_cert_entry(
         return Err(ApiError::BadRequest("subject must not be empty".into()));
     }
     let description = normalize_description(body.description);
-    let found =
-        crate::db::update_acl_client_cert_entry(state.db(), entry_id, subject, description.as_deref()).await?;
+    let found = crate::db::update_acl_client_cert_entry(
+        state.db(),
+        entry_id,
+        subject,
+        description.as_deref(),
+    )
+    .await?;
     if !found {
         return Err(ApiError::NotFound);
     }
@@ -2179,8 +2217,8 @@ async fn change_my_password(
             "new password must be at least {MIN_PASSWORD_LEN} characters"
         )));
     }
-    let hash = auth::hash_password(&body.new_password)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let hash =
+        auth::hash_password(&body.new_password).map_err(|e| ApiError::Internal(e.to_string()))?;
     crate::db::set_user_password(state.db(), user.id, &hash).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2223,7 +2261,12 @@ async fn list_users(State(state): State<AppState>) -> Result<Json<Vec<UserSummar
             last_login_at: None,
         });
     }
-    out.extend(crate::db::list_users(state.db()).await?.into_iter().map(user_summary));
+    out.extend(
+        crate::db::list_users(state.db())
+            .await?
+            .into_iter()
+            .map(user_summary),
+    );
     Ok(Json(out))
 }
 
@@ -2268,12 +2311,14 @@ async fn create_user(
             "that username belongs to the primary admin account".into(),
         ));
     }
-    let hash = auth::hash_password(&body.password)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let hash =
+        auth::hash_password(&body.password).map_err(|e| ApiError::Internal(e.to_string()))?;
     let id = Uuid::new_v4();
     let created_at = chrono::Utc::now();
     if !crate::db::create_user(state.db(), id, username, &hash, body.role, created_at).await? {
-        return Err(ApiError::Conflict("a user with that name already exists".into()));
+        return Err(ApiError::Conflict(
+            "a user with that name already exists".into(),
+        ));
     }
     Ok((
         StatusCode::CREATED,
@@ -2335,9 +2380,7 @@ async fn update_user(
                 "password must be at least {MIN_PASSWORD_LEN} characters"
             )));
         }
-        Some(p) => Some(
-            auth::hash_password(p).map_err(|e| ApiError::Internal(e.to_string()))?,
-        ),
+        Some(p) => Some(auth::hash_password(p).map_err(|e| ApiError::Internal(e.to_string()))?),
         None => None,
     };
     let role = body.role.unwrap_or(existing.role);
@@ -2521,11 +2564,11 @@ async fn create_standalone_cert(
         && crate::db::get_dns_credential(state.db(), id)
             .await?
             .is_none()
-        {
-            return Err(ApiError::BadRequest(
-                "dns_credential_id does not reference an existing DNS credential".into(),
-            ));
-        }
+    {
+        return Err(ApiError::BadRequest(
+            "dns_credential_id does not reference an existing DNS credential".into(),
+        ));
+    }
 
     // Explicit per-cert override wins; otherwise fall back to the
     // global config.toml default -- same "explicit wins, else a
@@ -2918,7 +2961,10 @@ mod tests {
         assert_eq!(json["host_count"], 0);
     }
 
-    async fn test_state_with_client_cert(subjects: Vec<String>, forward_token: Option<String>) -> AppState {
+    async fn test_state_with_client_cert(
+        subjects: Vec<String>,
+        forward_token: Option<String>,
+    ) -> AppState {
         let cfg = Config {
             network: NetworkConfig {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
@@ -2955,7 +3001,9 @@ mod tests {
             siem: None,
             hosting: None,
         };
-        let pool = crate::db::connect(&PathBuf::from(":memory:")).await.unwrap();
+        let pool = crate::db::connect(&PathBuf::from(":memory:"))
+            .await
+            .unwrap();
         AppState::new(cfg, pool, vec![], vec![], None, None, None)
     }
 
@@ -2964,7 +3012,11 @@ mod tests {
     /// `/api/dashboard` with no session cookie or bearer token at all.
     #[tokio::test]
     async fn client_cert_subject_with_valid_token_authenticates_without_a_session() {
-        let state = test_state_with_client_cert(vec!["Jeff Parrish".into()], Some("shared-secret-token".into())).await;
+        let state = test_state_with_client_cert(
+            vec!["Jeff Parrish".into()],
+            Some("shared-secret-token".into()),
+        )
+        .await;
         let router = build_router(state);
 
         let resp = router
@@ -2985,7 +3037,11 @@ mod tests {
     /// a correctly-matching token.
     #[tokio::test]
     async fn client_cert_subject_not_on_the_allow_list_is_rejected() {
-        let state = test_state_with_client_cert(vec!["Jeff Parrish".into()], Some("shared-secret-token".into())).await;
+        let state = test_state_with_client_cert(
+            vec!["Jeff Parrish".into()],
+            Some("shared-secret-token".into()),
+        )
+        .await;
         let router = build_router(state);
 
         let resp = router
@@ -3007,7 +3063,11 @@ mod tests {
     /// name, no way to know the token) still gets rejected.
     #[tokio::test]
     async fn client_cert_subject_with_wrong_token_is_rejected() {
-        let state = test_state_with_client_cert(vec!["Jeff Parrish".into()], Some("shared-secret-token".into())).await;
+        let state = test_state_with_client_cert(
+            vec!["Jeff Parrish".into()],
+            Some("shared-secret-token".into()),
+        )
+        .await;
         let router = build_router(state);
 
         let resp = router
@@ -3489,7 +3549,11 @@ mod tests {
             .await
             .unwrap();
         let json = body_json(list_resp).await;
-        assert_eq!(json.as_array().unwrap().len(), 1, "the second create with a duplicate name must have been rejected, not silently duplicated");
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            1,
+            "the second create with a duplicate name must have been rejected, not silently duplicated"
+        );
     }
 
     #[tokio::test]
@@ -4127,10 +4191,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["name"], "ci pipeline");
-        assert!(json["token"]
-            .as_str()
-            .unwrap()
-            .starts_with(auth::API_TOKEN_PREFIX));
+        assert!(
+            json["token"]
+                .as_str()
+                .unwrap()
+                .starts_with(auth::API_TOKEN_PREFIX)
+        );
     }
 
     #[tokio::test]
@@ -4358,11 +4424,21 @@ mod tests {
         assert!(state.block_index().is_blocked_for(&[list_id], ip));
         assert!(!state.block_index().is_globally_blocked(ip));
 
-        let resp = call("PUT", format!("/api/acls/{id}/global"), r#"{"global":true}"#).await;
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{id}/global"),
+            r#"{"global":true}"#,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert!(state.block_index().is_globally_blocked(ip));
 
-        let bad = call("POST", format!("/api/acls/{id}/ip-entries"), r#"{"cidr":"ASx"}"#).await;
+        let bad = call(
+            "POST",
+            format!("/api/acls/{id}/ip-entries"),
+            r#"{"cidr":"ASx"}"#,
+        )
+        .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 
         let allow = body_json(
@@ -4567,7 +4643,11 @@ mod tests {
             .await
             .unwrap();
         let json = body_json(list_resp).await;
-        assert_eq!(json.as_array().unwrap().len(), 1, "the second create with a duplicate name must have been rejected, not silently duplicated");
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            1,
+            "the second create with a duplicate name must have been rejected, not silently duplicated"
+        );
     }
 
     #[tokio::test]
@@ -4764,9 +4844,11 @@ mod tests {
             2,
             "the original bulk-created entry plus the individually-added one"
         );
-        assert!(entries
-            .iter()
-            .any(|e| e["cidr"] == "203.0.113.5/32" && e["description"] == "remote office"));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["cidr"] == "203.0.113.5/32" && e["description"] == "remote office")
+        );
     }
 
     #[tokio::test]
@@ -5679,8 +5761,14 @@ mod tests {
     #[tokio::test]
     async fn a_created_user_can_sign_in_and_gets_the_role_they_were_given() {
         let (router, _owner, _id) = router_with_user("Olivia", "operator").await;
-        assert!(login_as(&router, "olivia", "wrong-password").await.is_none());
-        let cookie = login_as(&router, "olivia", "a-long-password").await.unwrap();
+        assert!(
+            login_as(&router, "olivia", "wrong-password")
+                .await
+                .is_none()
+        );
+        let cookie = login_as(&router, "olivia", "a-long-password")
+            .await
+            .unwrap();
         let me = body_json(send(&router, "GET", "/api/me", Some(&cookie), None, None).await).await;
         assert_eq!(me["username"], "Olivia");
         assert_eq!(me["role"], "operator");
@@ -5689,7 +5777,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_and_disabled_users_cannot_sign_in() {
         let (router, owner, id) = router_with_user("sam", "viewer").await;
-        assert!(login_as(&router, "nobody", "a-long-password").await.is_none());
+        assert!(
+            login_as(&router, "nobody", "a-long-password")
+                .await
+                .is_none()
+        );
         let resp = send(
             &router,
             "PUT",
@@ -5707,11 +5799,25 @@ mod tests {
     async fn a_viewer_can_read_but_not_change_anything() {
         let (router, _owner, _id) = router_with_user("vera", "viewer").await;
         let cookie = login_as(&router, "vera", "a-long-password").await.unwrap();
-        for uri in ["/api/dashboard", "/api/hosts", "/api/certs", "/api/dns-credentials", "/api/siem"] {
+        for uri in [
+            "/api/dashboard",
+            "/api/hosts",
+            "/api/certs",
+            "/api/dns-credentials",
+            "/api/siem",
+        ] {
             let resp = send(&router, "GET", uri, Some(&cookie), None, None).await;
             assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
         }
-        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some("{}")).await;
+        let resp = send(
+            &router,
+            "POST",
+            "/api/hosts",
+            Some(&cookie),
+            None,
+            Some("{}"),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             body_json(resp).await["error"],
@@ -5728,7 +5834,15 @@ mod tests {
         let (router, _owner, _id) = router_with_user("oscar", "operator").await;
         let cookie = login_as(&router, "oscar", "a-long-password").await.unwrap();
         // Not a 403 -- the (empty) body is rejected by the handler instead.
-        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some("{}")).await;
+        let resp = send(
+            &router,
+            "POST",
+            "/api/hosts",
+            Some(&cookie),
+            None,
+            Some("{}"),
+        )
+        .await;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
         for (m, uri) in [
@@ -5752,20 +5866,56 @@ mod tests {
         let cookie = login_as(&router, "rita", "a-long-password").await.unwrap();
         let write = |c: String| {
             let r = router.clone();
-            async move { send(&r, "POST", "/api/hosts", Some(&c), None, Some("{}")).await.status() }
+            async move {
+                send(&r, "POST", "/api/hosts", Some(&c), None, Some("{}"))
+                    .await
+                    .status()
+            }
         };
         assert_ne!(write(cookie.clone()).await, StatusCode::FORBIDDEN);
 
-        send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None, Some(r#"{"role":"viewer"}"#)).await;
+        send(
+            &router,
+            "PUT",
+            &format!("/api/users/{id}"),
+            Some(&owner),
+            None,
+            Some(r#"{"role":"viewer"}"#),
+        )
+        .await;
         assert_eq!(write(cookie.clone()).await, StatusCode::FORBIDDEN);
 
-        send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None, Some(r#"{"disabled":true}"#)).await;
+        send(
+            &router,
+            "PUT",
+            &format!("/api/users/{id}"),
+            Some(&owner),
+            None,
+            Some(r#"{"disabled":true}"#),
+        )
+        .await;
         assert_eq!(write(cookie.clone()).await, StatusCode::UNAUTHORIZED);
 
-        send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None, Some(r#"{"disabled":false,"role":"admin"}"#)).await;
+        send(
+            &router,
+            "PUT",
+            &format!("/api/users/{id}"),
+            Some(&owner),
+            None,
+            Some(r#"{"disabled":false,"role":"admin"}"#),
+        )
+        .await;
         assert_ne!(write(cookie.clone()).await, StatusCode::FORBIDDEN);
 
-        let resp = send(&router, "DELETE", &format!("/api/users/{id}"), Some(&owner), None, None).await;
+        let resp = send(
+            &router,
+            "DELETE",
+            &format!("/api/users/{id}"),
+            Some(&owner),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(write(cookie).await, StatusCode::UNAUTHORIZED);
     }
@@ -5776,14 +5926,37 @@ mod tests {
         let create = |body: &'static str| {
             let r = router.clone();
             let c = owner.clone();
-            async move { send(&r, "POST", "/api/users", Some(&c), None, Some(body)).await.status() }
+            async move {
+                send(&r, "POST", "/api/users", Some(&c), None, Some(body))
+                    .await
+                    .status()
+            }
         };
-        assert_eq!(create(r#"{"username":"ADMIN","password":"a-long-password","role":"viewer"}"#).await, StatusCode::CONFLICT);
-        assert_eq!(create(r#"{"username":"DUP","password":"a-long-password","role":"viewer"}"#).await, StatusCode::CONFLICT);
-        assert_eq!(create(r#"{"username":"short","password":"1234567","role":"viewer"}"#).await, StatusCode::BAD_REQUEST);
-        assert_eq!(create(r#"{"username":"bad name","password":"a-long-password","role":"viewer"}"#).await, StatusCode::BAD_REQUEST);
-        assert_eq!(create(r#"{"username":"","password":"a-long-password","role":"viewer"}"#).await, StatusCode::BAD_REQUEST);
-        assert!(create(r#"{"username":"x","password":"a-long-password","role":"root"}"#).await.is_client_error());
+        assert_eq!(
+            create(r#"{"username":"ADMIN","password":"a-long-password","role":"viewer"}"#).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            create(r#"{"username":"DUP","password":"a-long-password","role":"viewer"}"#).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            create(r#"{"username":"short","password":"1234567","role":"viewer"}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            create(r#"{"username":"bad name","password":"a-long-password","role":"viewer"}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            create(r#"{"username":"","password":"a-long-password","role":"viewer"}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            create(r#"{"username":"x","password":"a-long-password","role":"root"}"#)
+                .await
+                .is_client_error()
+        );
     }
 
     #[tokio::test]
@@ -5799,14 +5972,35 @@ mod tests {
     async fn a_user_can_change_their_own_password_and_the_old_one_stops_working() {
         let (router, _owner, _id) = router_with_user("pam", "viewer").await;
         let cookie = login_as(&router, "pam", "a-long-password").await.unwrap();
-        let bad = send(&router, "POST", "/api/me/password", Some(&cookie), None,
-            Some(r#"{"current_password":"nope","new_password":"another-long-one"}"#)).await;
+        let bad = send(
+            &router,
+            "POST",
+            "/api/me/password",
+            Some(&cookie),
+            None,
+            Some(r#"{"current_password":"nope","new_password":"another-long-one"}"#),
+        )
+        .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-        let short = send(&router, "POST", "/api/me/password", Some(&cookie), None,
-            Some(r#"{"current_password":"a-long-password","new_password":"short"}"#)).await;
+        let short = send(
+            &router,
+            "POST",
+            "/api/me/password",
+            Some(&cookie),
+            None,
+            Some(r#"{"current_password":"a-long-password","new_password":"short"}"#),
+        )
+        .await;
         assert_eq!(short.status(), StatusCode::BAD_REQUEST);
-        let ok = send(&router, "POST", "/api/me/password", Some(&cookie), None,
-            Some(r#"{"current_password":"a-long-password","new_password":"another-long-one"}"#)).await;
+        let ok = send(
+            &router,
+            "POST",
+            "/api/me/password",
+            Some(&cookie),
+            None,
+            Some(r#"{"current_password":"a-long-password","new_password":"another-long-one"}"#),
+        )
+        .await;
         assert_eq!(ok.status(), StatusCode::NO_CONTENT);
         assert!(login_as(&router, "pam", "a-long-password").await.is_none());
         assert!(login_as(&router, "pam", "another-long-one").await.is_some());
@@ -5816,19 +6010,37 @@ mod tests {
     async fn the_owner_cannot_use_the_user_password_endpoint() {
         let router = build_router(test_state().await);
         let owner = logged_in_cookie(&router).await;
-        let resp = send(&router, "POST", "/api/me/password", Some(&owner), None,
-            Some(r#"{"current_password":"correct-password","new_password":"another-long-one"}"#)).await;
+        let resp = send(
+            &router,
+            "POST",
+            "/api/me/password",
+            Some(&owner),
+            None,
+            Some(r#"{"current_password":"correct-password","new_password":"another-long-one"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn an_admin_resets_another_users_password() {
         let (router, owner, id) = router_with_user("ruth", "viewer").await;
-        let resp = send(&router, "PUT", &format!("/api/users/{id}"), Some(&owner), None,
-            Some(r#"{"password":"brand-new-password"}"#)).await;
+        let resp = send(
+            &router,
+            "PUT",
+            &format!("/api/users/{id}"),
+            Some(&owner),
+            None,
+            Some(r#"{"password":"brand-new-password"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(login_as(&router, "ruth", "a-long-password").await.is_none());
-        assert!(login_as(&router, "ruth", "brand-new-password").await.is_some());
+        assert!(
+            login_as(&router, "ruth", "brand-new-password")
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5837,44 +6049,118 @@ mod tests {
         let reset = |cookie: String, id: String, pw: &'static str| {
             let r = router.clone();
             async move {
-                send(&r, "PUT", &format!("/api/users/{id}"), Some(&cookie), None,
-                    Some(&format!(r#"{{"password":"{pw}"}}"#))).await
+                send(
+                    &r,
+                    "PUT",
+                    &format!("/api/users/{id}"),
+                    Some(&cookie),
+                    None,
+                    Some(&format!(r#"{{"password":"{pw}"}}"#)),
+                )
+                .await
             }
         };
         // The owner is an admin too: refused.
         let resp = reset(owner.clone(), id.clone(), "owner-forced-password").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(login_as(&router, "alice", "a-long-password").await.is_some());
+        assert!(
+            login_as(&router, "alice", "a-long-password")
+                .await
+                .is_some()
+        );
         // So is a second admin, and a bearer token.
         let (router2, owner2, id2) = router_with_user("bob", "admin").await;
         let bob = login_as(&router2, "bob", "a-long-password").await.unwrap();
         let (_, _, _) = (&owner2, &id2, &bob);
-        let resp = send(&router2, "POST", "/api/users", Some(&owner2), None,
-            Some(r#"{"username":"carol","password":"a-long-password","role":"admin"}"#)).await;
+        let resp = send(
+            &router2,
+            "POST",
+            "/api/users",
+            Some(&owner2),
+            None,
+            Some(r#"{"username":"carol","password":"a-long-password","role":"admin"}"#),
+        )
+        .await;
         let carol = body_json(resp).await["id"].as_str().unwrap().to_string();
-        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), Some(&bob), None,
-            Some(r#"{"password":"bob-forced-password"}"#)).await;
+        let resp = send(
+            &router2,
+            "PUT",
+            &format!("/api/users/{carol}"),
+            Some(&bob),
+            None,
+            Some(r#"{"password":"bob-forced-password"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(login_as(&router2, "carol", "a-long-password").await.is_some());
-        let tok = body_json(send(&router2, "POST", "/api/tokens", Some(&owner2), None,
-            Some(r#"{"name":"adm","role":"admin"}"#)).await).await["token"].as_str().unwrap().to_string();
-        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), None, Some(&tok),
-            Some(r#"{"password":"token-forced-password"}"#)).await;
+        assert!(
+            login_as(&router2, "carol", "a-long-password")
+                .await
+                .is_some()
+        );
+        let tok = body_json(
+            send(
+                &router2,
+                "POST",
+                "/api/tokens",
+                Some(&owner2),
+                None,
+                Some(r#"{"name":"adm","role":"admin"}"#),
+            )
+            .await,
+        )
+        .await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = send(
+            &router2,
+            "PUT",
+            &format!("/api/users/{carol}"),
+            None,
+            Some(&tok),
+            Some(r#"{"password":"token-forced-password"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         // A second admin cannot demote an admin to get around that; the
         // owner can.
-        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), Some(&bob), None,
-            Some(r#"{"role":"viewer"}"#)).await;
+        let resp = send(
+            &router2,
+            "PUT",
+            &format!("/api/users/{carol}"),
+            Some(&bob),
+            None,
+            Some(r#"{"role":"viewer"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         // Non-password edits to an admin still work, and an admin can
         // reset their own password.
-        let resp = send(&router2, "PUT", &format!("/api/users/{carol}"), Some(&bob), None,
-            Some(r#"{"disabled":false}"#)).await;
+        let resp = send(
+            &router2,
+            "PUT",
+            &format!("/api/users/{carol}"),
+            Some(&bob),
+            None,
+            Some(r#"{"disabled":false}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let resp = send(&router2, "PUT", &format!("/api/users/{id2}"), Some(&bob), None,
-            Some(r#"{"password":"bobs-own-new-password"}"#)).await;
+        let resp = send(
+            &router2,
+            "PUT",
+            &format!("/api/users/{id2}"),
+            Some(&bob),
+            None,
+            Some(r#"{"password":"bobs-own-new-password"}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(login_as(&router2, "bob", "bobs-own-new-password").await.is_some());
+        assert!(
+            login_as(&router2, "bob", "bobs-own-new-password")
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5897,30 +6183,95 @@ mod tests {
         assert_eq!(me["role"], "viewer");
         assert_eq!(me["username"], "token:t-viewer");
         assert_eq!(me["via"], "token");
-        assert_eq!(send(&router, "GET", "/api/hosts", None, Some(&viewer), None).await.status(), StatusCode::OK);
-        assert_eq!(send(&router, "POST", "/api/hosts", None, Some(&viewer), Some("{}")).await.status(), StatusCode::FORBIDDEN);
-        assert_ne!(send(&router, "POST", "/api/hosts", None, Some(&operator), Some("{}")).await.status(), StatusCode::FORBIDDEN);
-        assert_eq!(send(&router, "GET", "/api/tokens", None, Some(&operator), None).await.status(), StatusCode::FORBIDDEN);
-        let listed = body_json(send(&router, "GET", "/api/tokens", Some(&owner), None, None).await).await;
-        assert!(listed.as_array().unwrap().iter().any(|t| t["role"] == "viewer"));
+        assert_eq!(
+            send(&router, "GET", "/api/hosts", None, Some(&viewer), None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                "/api/hosts",
+                None,
+                Some(&viewer),
+                Some("{}")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_ne!(
+            send(
+                &router,
+                "POST",
+                "/api/hosts",
+                None,
+                Some(&operator),
+                Some("{}")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&router, "GET", "/api/tokens", None, Some(&operator), None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let listed =
+            body_json(send(&router, "GET", "/api/tokens", Some(&owner), None, None).await).await;
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["role"] == "viewer")
+        );
     }
 
     #[tokio::test]
     async fn a_token_created_without_a_role_is_an_admin_token() {
         let router = build_router(test_state().await);
         let owner = logged_in_cookie(&router).await;
-        let resp = send(&router, "POST", "/api/tokens", Some(&owner), None, Some(r#"{"name":"legacy"}"#)).await;
+        let resp = send(
+            &router,
+            "POST",
+            "/api/tokens",
+            Some(&owner),
+            None,
+            Some(r#"{"name":"legacy"}"#),
+        )
+        .await;
         let json = body_json(resp).await;
         assert_eq!(json["role"], "admin");
         let token = json["token"].as_str().unwrap().to_string();
-        assert_eq!(send(&router, "GET", "/api/users", None, Some(&token), None).await.status(), StatusCode::OK);
+        assert_eq!(
+            send(&router, "GET", "/api/users", None, Some(&token), None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
     async fn default_site_api_round_trips_and_validates() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
-        let got = body_json(send(&router, "GET", "/api/default-site", Some(&cookie), None, None).await).await;
+        let got = body_json(
+            send(
+                &router,
+                "GET",
+                "/api/default-site",
+                Some(&cookie),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
         assert_eq!(got["mode"], "not_found");
 
         let put = |body: &'static str| {
@@ -5935,14 +6286,43 @@ mod tests {
             r#"{"mode":"nonsense"}"#,
         ] {
             let resp = put(bad).await;
-            assert!(resp.status().is_client_error(), "{bad} -> {}", resp.status());
+            assert!(
+                resp.status().is_client_error(),
+                "{bad} -> {}",
+                resp.status()
+            );
         }
-        let unchanged = body_json(send(&router, "GET", "/api/default-site", Some(&cookie), None, None).await).await;
-        assert_eq!(unchanged["mode"], "not_found", "rejected writes must not change the setting");
+        let unchanged = body_json(
+            send(
+                &router,
+                "GET",
+                "/api/default-site",
+                Some(&cookie),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            unchanged["mode"], "not_found",
+            "rejected writes must not change the setting"
+        );
 
         let ok = put(r#"{"mode":"redirect","redirect_url":" https://www.example.com "}"#).await;
         assert_eq!(ok.status(), StatusCode::OK);
-        let got = body_json(send(&router, "GET", "/api/default-site", Some(&cookie), None, None).await).await;
+        let got = body_json(
+            send(
+                &router,
+                "GET",
+                "/api/default-site",
+                Some(&cookie),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
         assert_eq!(got["mode"], "redirect");
         assert_eq!(got["redirect_url"], "https://www.example.com");
     }
@@ -5951,11 +6331,20 @@ mod tests {
     async fn license_api_get_empty_rejects_bad_keys_and_deletes() {
         let router = build_router(test_state().await);
         let cookie = logged_in_cookie(&router).await;
-        let got = body_json(send(&router, "GET", "/api/license", Some(&cookie), None, None).await).await;
+        let got =
+            body_json(send(&router, "GET", "/api/license", Some(&cookie), None, None).await).await;
         assert_eq!(got["licensed"], false);
         assert!(got.get("key_hint").is_none());
         for bad in [r#"{"license_key":""}"#, r#"{"license_key":"not-a-key"}"#] {
-            let resp = send(&router, "PUT", "/api/license", Some(&cookie), None, Some(bad)).await;
+            let resp = send(
+                &router,
+                "PUT",
+                "/api/license",
+                Some(&cookie),
+                None,
+                Some(bad),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
         }
         let resp = send(&router, "DELETE", "/api/license", Some(&cookie), None, None).await;
@@ -5971,11 +6360,28 @@ mod tests {
                 r#"{{"domain":"h.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":false,{extra}}}"#
             )
         };
-        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some(&host(r#""hsts_subdomains":true"#))).await;
+        let resp = send(
+            &router,
+            "POST",
+            "/api/hosts",
+            Some(&cookie),
+            None,
+            Some(&host(r#""hsts_subdomains":true"#)),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let resp = send(&router, "POST", "/api/hosts", Some(&cookie), None, Some(&host(r#""hsts":true,"hsts_subdomains":true"#))).await;
+        let resp = send(
+            &router,
+            "POST",
+            "/api/hosts",
+            Some(&cookie),
+            None,
+            Some(&host(r#""hsts":true,"hsts_subdomains":true"#)),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let hosts = body_json(send(&router, "GET", "/api/hosts", Some(&cookie), None, None).await).await;
+        let hosts =
+            body_json(send(&router, "GET", "/api/hosts", Some(&cookie), None, None).await).await;
         assert_eq!(hosts[0]["hsts"], true);
         assert_eq!(hosts[0]["hsts_subdomains"], true);
     }
@@ -5984,7 +6390,9 @@ mod tests {
     async fn license_and_default_site_writes_are_admin_only() {
         for role in ["operator", "viewer"] {
             let (router, _owner, _id) = router_with_user("limited", role).await;
-            let cookie = login_as(&router, "limited", "a-long-password").await.unwrap();
+            let cookie = login_as(&router, "limited", "a-long-password")
+                .await
+                .unwrap();
             for (m, uri) in [
                 ("PUT", "/api/license"),
                 ("DELETE", "/api/license"),
@@ -6014,11 +6422,24 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let ips: Vec<String> = state.admin_allowed_ips().iter().map(|n| n.to_string()).collect();
+        let ips: Vec<String> = state
+            .admin_allowed_ips()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
         assert_eq!(ips, ["192.168.1.0/24", "10.0.0.5/32"]);
         assert!(!state.expose_admin_port());
-        assert_eq!(crate::db::load_admin_allowed_ips(state.db()).await.unwrap().len(), 2);
-        assert_eq!(crate::db::load_expose_admin_port(state.db()).await.unwrap(), Some(false));
+        assert_eq!(
+            crate::db::load_admin_allowed_ips(state.db())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            crate::db::load_expose_admin_port(state.db()).await.unwrap(),
+            Some(false)
+        );
     }
 
     #[tokio::test]
@@ -6043,11 +6464,21 @@ mod tests {
         let list = vec!["192.168.1.0/24".to_string()];
         assert!(parse_admin_allowed_ips(&list, Some("192.168.1.9")).is_ok());
         assert!(parse_admin_allowed_ips(&list, Some("203.0.113.7")).is_err());
-        assert!(parse_admin_allowed_ips(&list, Some("127.0.0.1")).is_ok(), "loopback is always reachable");
+        assert!(
+            parse_admin_allowed_ips(&list, Some("127.0.0.1")).is_ok(),
+            "loopback is always reachable"
+        );
         assert!(parse_admin_allowed_ips(&list, None).is_ok());
-        assert!(parse_admin_allowed_ips(&list, Some("::ffff:192.168.1.9")).is_ok(), "IPv4-mapped addresses are matched as IPv4");
+        assert!(
+            parse_admin_allowed_ips(&list, Some("::ffff:192.168.1.9")).is_ok(),
+            "IPv4-mapped addresses are matched as IPv4"
+        );
         assert!(parse_admin_allowed_ips(&list, Some("::ffff:203.0.113.7")).is_err());
-        assert!(parse_admin_allowed_ips(&[], Some("203.0.113.7")).unwrap().is_empty());
+        assert!(
+            parse_admin_allowed_ips(&[], Some("203.0.113.7"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -6055,13 +6486,32 @@ mod tests {
         let state = test_state().await;
         let router = build_router(state.clone());
         let cookie = logged_in_cookie(&router).await;
-        let resp = send(&router, "PUT", "/api/firewall-settings", Some(&cookie), None, Some(r#"{"admin_allowed_ips":["172.16.0.0/16"]}"#)).await;
+        let resp = send(
+            &router,
+            "PUT",
+            "/api/firewall-settings",
+            Some(&cookie),
+            None,
+            Some(r#"{"admin_allowed_ips":["172.16.0.0/16"]}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["admin_allowed_ips"][0], "172.16.0.0/16");
         assert_eq!(json["allowed_ips_from_config"], false);
-        assert_eq!(json["expose_admin_port"], true, "an omitted field is left alone");
-        let resp = send(&router, "PUT", "/api/firewall-settings", Some(&cookie), None, Some(r#"{"admin_allowed_ips":[]}"#)).await;
+        assert_eq!(
+            json["expose_admin_port"], true,
+            "an omitted field is left alone"
+        );
+        let resp = send(
+            &router,
+            "PUT",
+            "/api/firewall-settings",
+            Some(&cookie),
+            None,
+            Some(r#"{"admin_allowed_ips":[]}"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(state.admin_allowed_ips().is_empty());
     }
@@ -6072,7 +6522,7 @@ mod tests {
     async fn trustbridge_settings_and_cert_passthrough_against_a_fake_server() {
         use super::super::trustbridge as tb;
         use axum::routing::{get, post};
-        use serde_json::{json, Value};
+        use serde_json::{Value, json};
 
         fn authed(h: &axum::http::HeaderMap) -> bool {
             h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer tbo_secret")
@@ -6097,7 +6547,9 @@ mod tests {
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap(); });
+        tokio::spawn(async move {
+            axum::serve(listener, fake).await.unwrap();
+        });
 
         let state = test_state().await;
         let st = || State(state.clone());
@@ -6109,20 +6561,48 @@ mod tests {
         assert!(v["org"].is_null());
 
         // Bad URL / empty update are rejected.
-        assert!(tb::put_settings(st(), Json(serde_json::from_value(json!({"url": "http://example.com"})).unwrap())).await.is_err());
-        assert!(tb::put_settings(st(), Json(serde_json::from_value(json!({})).unwrap())).await.is_err());
+        assert!(
+            tb::put_settings(
+                st(),
+                Json(serde_json::from_value(json!({"url": "http://example.com"})).unwrap())
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tb::put_settings(st(), Json(serde_json::from_value(json!({})).unwrap()))
+                .await
+                .is_err()
+        );
         // Cert calls without a token are refused before any network use.
         assert!(tb::list_certs(st()).await.is_err());
 
         // A wrong token reports an error string but the endpoint itself is 200.
         let body = json!({"url": format!("http://127.0.0.1:{port}/"), "token": "tbo_wrong"});
-        let Json(v) = tb::put_settings(st(), Json(serde_json::from_value(body).unwrap())).await.ok().unwrap();
+        let Json(v) = tb::put_settings(st(), Json(serde_json::from_value(body).unwrap()))
+            .await
+            .ok()
+            .unwrap();
         assert_eq!(v["token_set"], true);
-        assert!(v["error"].as_str().unwrap().contains("rejected the org token"));
-        assert!(!v.to_string().contains("tbo_wrong"), "token must never be echoed");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("rejected the org token")
+        );
+        assert!(
+            !v.to_string().contains("tbo_wrong"),
+            "token must never be echoed"
+        );
 
         // Right token: org info comes back, still no token in the body.
-        let Json(v) = tb::put_settings(st(), Json(serde_json::from_value(json!({"token": "tbo_secret"})).unwrap())).await.ok().unwrap();
+        let Json(v) = tb::put_settings(
+            st(),
+            Json(serde_json::from_value(json!({"token": "tbo_secret"})).unwrap()),
+        )
+        .await
+        .ok()
+        .unwrap();
         assert_eq!(v["org"]["org_id"], "O-1");
         assert_eq!(v["url"], format!("http://127.0.0.1:{port}"));
         assert!(!v.to_string().contains("tbo_secret"));
@@ -6131,29 +6611,60 @@ mod tests {
         assert_eq!(v["certs"], json!([]));
 
         // Create passes fields through, returns 201 + no-store.
-        let resp = tb::create_cert(st(), Json(serde_json::from_value(json!({"common_name": " Jeff ", "days": 30})).unwrap())).await.ok().unwrap();
+        let resp = tb::create_cert(
+            st(),
+            Json(serde_json::from_value(json!({"common_name": " Jeff ", "days": 30})).unwrap()),
+        )
+        .await
+        .ok()
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(resp.headers()["cache-control"], "no-store");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!((v["common_name"].as_str(), v["days"].as_u64()), (Some("Jeff"), Some(30)));
+        assert_eq!(
+            (v["common_name"].as_str(), v["days"].as_u64()),
+            (Some("Jeff"), Some(30))
+        );
 
         // Upstream 4xx keeps its status and message.
-        let err = tb::create_cert(st(), Json(serde_json::from_value(json!({"common_name": "limit"})).unwrap())).await.err().unwrap();
+        let err = tb::create_cert(
+            st(),
+            Json(serde_json::from_value(json!({"common_name": "limit"})).unwrap()),
+        )
+        .await
+        .err()
+        .unwrap();
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"], "certificate limit reached");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["error"],
+            "certificate limit reached"
+        );
 
         // Bad input never reaches upstream.
-        assert!(tb::create_cert(st(), Json(serde_json::from_value(json!({"common_name": "x", "days": 0})).unwrap())).await.is_err());
+        assert!(
+            tb::create_cert(
+                st(),
+                Json(serde_json::from_value(json!({"common_name": "x", "days": 0})).unwrap())
+            )
+            .await
+            .is_err()
+        );
         assert!(tb::revoke_cert(st(), Path("../etc".into())).await.is_err());
 
         let Json(v) = tb::revoke_cert(st(), Path("42".into())).await.ok().unwrap();
         assert_eq!(v, json!({"serial": "42", "revoked": true}));
 
         // Empty token clears it.
-        let Json(v) = tb::put_settings(st(), Json(serde_json::from_value(json!({"token": ""})).unwrap())).await.ok().unwrap();
+        let Json(v) = tb::put_settings(
+            st(),
+            Json(serde_json::from_value(json!({"token": ""})).unwrap()),
+        )
+        .await
+        .ok()
+        .unwrap();
         assert_eq!(v["token_set"], false);
     }
 }

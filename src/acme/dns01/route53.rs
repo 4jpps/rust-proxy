@@ -30,8 +30,8 @@
 //! (`[A-Za-z0-9_-]`, see `dns01::dns01_txt_value`).
 
 use async_trait::async_trait;
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 use super::sigv4::SigV4Signer;
 use super::{Dns01Error, DnsProvider, DnsZone};
@@ -263,7 +263,7 @@ fn parse_list_hosted_zones_response(
             Err(err) => {
                 return Err(Dns01Error::Api(format!(
                     "failed to parse Route53 response: {err}"
-                )))
+                )));
             }
         }
         buf.clear();
@@ -318,7 +318,9 @@ mod tests {
     }
 
     fn hosted_zone_xml(id: &str, name: &str) -> String {
-        format!("<HostedZone><Id>{id}</Id><Name>{name}</Name><CallerReference>x</CallerReference></HostedZone>")
+        format!(
+            "<HostedZone><Id>{id}</Id><Name>{name}</Name><CallerReference>x</CallerReference></HostedZone>"
+        )
     }
 
     #[tokio::test]

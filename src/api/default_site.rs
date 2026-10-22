@@ -1,8 +1,8 @@
 //! `/api/default-site`: what a request gets when its hostname matches no
 //! site (NPM's Settings, Default Site).
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 
 use super::routes::ApiError;
 use crate::config::DefaultSite;

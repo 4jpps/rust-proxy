@@ -12,8 +12,8 @@
 
 use argon2::password_hash::PasswordHash;
 use argon2::{Argon2, PasswordVerifier};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -98,9 +98,7 @@ impl Role {
         match self {
             Role::Admin => true,
             Role::Viewer => is_read,
-            Role::Operator => {
-                is_read || !ADMIN_WRITE_PATHS.iter().any(|p| path_is_under(path, p))
-            }
+            Role::Operator => is_read || !ADMIN_WRITE_PATHS.iter().any(|p| path_is_under(path, p)),
         }
     }
 }
@@ -163,9 +161,9 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
 }
 
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    use argon2::password_hash::rand_core::OsRng;
-    use argon2::password_hash::SaltString;
     use argon2::PasswordHasher;
+    use argon2::password_hash::SaltString;
+    use argon2::password_hash::rand_core::OsRng;
 
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default().hash_password(password.as_bytes(), &salt)?;

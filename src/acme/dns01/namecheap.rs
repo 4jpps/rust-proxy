@@ -41,10 +41,10 @@
 //! plainly rather than silently mishandled.
 
 use async_trait::async_trait;
-use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
 
-use super::{join_api_errors, relative_record_name, Dns01Error, DnsProvider, DnsZone};
+use super::{Dns01Error, DnsProvider, DnsZone, join_api_errors, relative_record_name};
 
 const DEFAULT_BASE_URL: &str = "https://api.namecheap.com/xml.response";
 /// Namecheap requires this field on every `setHosts` write for every
@@ -259,7 +259,7 @@ fn parse_get_hosts_response(body: &str) -> Result<Vec<HostRecord>, Dns01Error> {
             Err(err) => {
                 return Err(Dns01Error::Api(format!(
                     "failed to parse Namecheap response: {err}"
-                )))
+                )));
             }
         }
         buf.clear();
@@ -299,7 +299,7 @@ fn parse_set_hosts_response(body: &str) -> Result<(), Dns01Error> {
             Err(err) => {
                 return Err(Dns01Error::Api(format!(
                     "failed to parse Namecheap response: {err}"
-                )))
+                )));
             }
         }
         buf.clear();

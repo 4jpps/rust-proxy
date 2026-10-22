@@ -104,7 +104,9 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
         .map(|a| a.public_ip)
         .collect();
 
-    let current = generator::parse_lo_addresses(&run_capture("ip", &["-4", "-o", "addr", "show", "dev", "lo"]).await?);
+    let current = generator::parse_lo_addresses(
+        &run_capture("ip", &["-4", "-o", "addr", "show", "dev", "lo"]).await?,
+    );
     let (add, remove) = generator::plan_addresses(&desired, &current, &pool_nets);
 
     for ip in &add {
@@ -117,13 +119,16 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
     let hosts = state.hosts();
     let mut proxy_served: Vec<(Ipv4Addr, u16)> = Vec::new();
     for host in hosts.iter().filter(|h| h.enabled) {
-        let Some(ip) = host.bind_ip_v4.filter(|ip| !ip.is_unspecified()) else { continue };
+        let Some(ip) = host.bind_ip_v4.filter(|ip| !ip.is_unspecified()) else {
+            continue;
+        };
         proxy_served.push((ip, host.bind_port));
         if host.force_https || crate::acme::opens_port_80_for_acme(host) {
             proxy_served.push((ip, 80));
         }
     }
-    let mut acl_sources: std::collections::HashMap<Uuid, Vec<Ipv4Net>> = std::collections::HashMap::new();
+    let mut acl_sources: std::collections::HashMap<Uuid, Vec<Ipv4Net>> =
+        std::collections::HashMap::new();
     for acl_id in allocations
         .iter()
         .filter(|a| a.is_active())
@@ -152,7 +157,10 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
             })
             .collect()
     };
-    let mut blocks = generator::HostingBlocks { global: v4(index.global_nets()), ..Default::default() };
+    let mut blocks = generator::HostingBlocks {
+        global: v4(index.global_nets()),
+        ..Default::default()
+    };
     for acl_id in allocations
         .iter()
         .filter(|a| a.is_active())
@@ -164,7 +172,13 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
             blocks.acl.insert(acl_id, nets);
         }
     }
-    apply_ruleset(&generator::generate_ruleset_full(&allocations, &proxy_served, &acl_sources, &blocks)).await?;
+    apply_ruleset(&generator::generate_ruleset_full(
+        &allocations,
+        &proxy_served,
+        &acl_sources,
+        &blocks,
+    ))
+    .await?;
     EVER_APPLIED.store(true, Ordering::Relaxed);
     for ip in &remove {
         run_checked("ip", &["addr", "del", &format!("{ip}/32"), "dev", "lo"]).await?;
@@ -242,7 +256,11 @@ pub struct CheckReport {
 }
 
 fn item(name: &'static str, ok: bool, detail: impl Into<String>) -> CheckItem {
-    CheckItem { name, ok, detail: detail.into() }
+    CheckItem {
+        name,
+        ok,
+        detail: detail.into(),
+    }
 }
 
 /// Judges the live host state for one allocation. `lo` is the output of
@@ -268,38 +286,65 @@ pub fn evaluate_check(
         Ok(text) if generator::parse_lo_addresses(text).contains(&public) => {
             item("address_on_lo", true, format!("{public}/32 is on lo"))
         }
-        Ok(_) => item("address_on_lo", false, format!("{public}/32 is not on lo -- sync has not applied it")),
+        Ok(_) => item(
+            "address_on_lo",
+            false,
+            format!("{public}/32 is not on lo -- sync has not applied it"),
+        ),
         Err(e) => item("address_on_lo", false, format!("could not read lo: {e}")),
     });
 
     let line_has = |text: &str, parts: &[String]| {
-        text.lines().any(|l| parts.iter().all(|p| l.contains(p.as_str())))
+        text.lines()
+            .any(|l| parts.iter().all(|p| l.contains(p.as_str())))
     };
     match ruleset {
         Ok(text) => {
-            let dnat = line_has(text, &[format!("ip daddr {public}"), format!("dnat to {vm}")]);
+            let dnat = line_has(
+                text,
+                &[format!("ip daddr {public}"), format!("dnat to {vm}")],
+            );
             out.push(item(
                 "dnat_rule",
                 dnat,
-                if dnat { format!("{public} -> {vm}") } else { format!("no DNAT {public} -> {vm} in table {}", generator::TABLE) },
+                if dnat {
+                    format!("{public} -> {vm}")
+                } else {
+                    format!("no DNAT {public} -> {vm} in table {}", generator::TABLE)
+                },
             ));
-            let snat = line_has(text, &[format!("ip saddr {vm}"), format!("snat to {public}")]);
+            let snat = line_has(
+                text,
+                &[format!("ip saddr {vm}"), format!("snat to {public}")],
+            );
             out.push(item(
                 "snat_rule",
                 snat,
-                if snat { format!("{vm} egresses as {public}") } else { format!("no SNAT {vm} -> {public} in table {}", generator::TABLE) },
+                if snat {
+                    format!("{vm} egresses as {public}")
+                } else {
+                    format!("no SNAT {vm} -> {public} in table {}", generator::TABLE)
+                },
             ));
         }
         Err(e) => {
             for name in ["dnat_rule", "snat_rule"] {
-                out.push(item(name, false, format!("could not read table {}: {e}", generator::TABLE)));
+                out.push(item(
+                    name,
+                    false,
+                    format!("could not read table {}: {e}", generator::TABLE),
+                ));
             }
         }
     }
 
     out.push(match ping {
         Some(true) => item("vm_reachable", true, format!("{vm} answers ping")),
-        Some(false) => item("vm_reachable", false, format!("{vm} did not answer ping (VM down, or blocks ICMP)")),
+        Some(false) => item(
+            "vm_reachable",
+            false,
+            format!("{vm} did not answer ping (VM down, or blocks ICMP)"),
+        ),
         None => item("vm_reachable", false, "ping could not be run"),
     });
     out
@@ -329,7 +374,12 @@ pub async fn check_allocation(a: &Allocation) -> CheckReport {
         };
         let lo = lo.as_deref().map_err(|e| e.to_string());
         let rules = rules.as_deref().map_err(|e| e.to_string());
-        evaluate_check(a, lo.as_deref().map_err(String::as_str), rules.as_deref().map_err(String::as_str), ping)
+        evaluate_check(
+            a,
+            lo.as_deref().map_err(String::as_str),
+            rules.as_deref().map_err(String::as_str),
+            ping,
+        )
     } else {
         evaluate_check(a, Ok(""), Ok(""), None)
     };
@@ -365,7 +415,8 @@ mod tests {
         }
     }
 
-    const LO: &str = "1: lo    inet 127.0.0.1/8 scope host lo\n1: lo    inet 204.52.221.226/32 scope global lo";
+    const LO: &str =
+        "1: lo    inet 127.0.0.1/8 scope host lo\n1: lo    inet 204.52.221.226/32 scope global lo";
 
     #[test]
     fn healthy_allocation_passes_every_check() {
@@ -379,9 +430,17 @@ mod tests {
     #[test]
     fn missing_pieces_are_reported_individually() {
         let a = active();
-        let checks = evaluate_check(&a, Ok("1: lo inet 127.0.0.1/8"), Ok("table ip x {}"), Some(false));
+        let checks = evaluate_check(
+            &a,
+            Ok("1: lo inet 127.0.0.1/8"),
+            Ok("table ip x {}"),
+            Some(false),
+        );
         let failed: Vec<_> = checks.iter().filter(|c| !c.ok).map(|c| c.name).collect();
-        assert_eq!(failed, ["address_on_lo", "dnat_rule", "snat_rule", "vm_reachable"]);
+        assert_eq!(
+            failed,
+            ["address_on_lo", "dnat_rule", "snat_rule", "vm_reachable"]
+        );
         let checks = evaluate_check(&a, Err("boom"), Err("denied"), None);
         assert_eq!(checks.iter().filter(|c| !c.ok).count(), 5 - 1);
     }

@@ -25,15 +25,19 @@ use crate::config::{AcmeChallengeType, ProxyHost};
 use crate::config::DnsProviderKind;
 use crate::state::AppState;
 use client::{AcmeClient, AcmeError};
-use dns01::{acme_challenge_record_name, dns01_txt_value, Dns01Error, DnsProvider};
+use dns01::{Dns01Error, DnsProvider, acme_challenge_record_name, dns01_txt_value};
 use jws::{AccountKey, JwsError};
 use types::{Authorization, AuthorizationStatus, OrderStatus};
 
 #[derive(Debug, Error)]
 pub enum DnsCredentialError {
-    #[error("host {0} needs a dns-01 DNS credential but dns_credential_id is unset and no DNS credentials are configured -- add one first")]
+    #[error(
+        "host {0} needs a dns-01 DNS credential but dns_credential_id is unset and no DNS credentials are configured -- add one first"
+    )]
     NoneConfigured(String),
-    #[error("host {0} needs a dns-01 DNS credential but dns_credential_id is unset and multiple DNS credentials exist -- set dns_credential_id explicitly")]
+    #[error(
+        "host {0} needs a dns-01 DNS credential but dns_credential_id is unset and multiple DNS credentials exist -- set dns_credential_id explicitly"
+    )]
     Ambiguous(String),
     #[error("host {0}'s dns_credential_id does not match any existing DNS credential")]
     NotFound(String),
@@ -985,8 +989,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_dns_credential_uses_the_explicitly_specified_credential_even_when_others_exist(
-    ) {
+    async fn resolve_dns_credential_uses_the_explicitly_specified_credential_even_when_others_exist()
+     {
         let pool = crate::db::connect(&PathBuf::from(":memory:"))
             .await
             .unwrap();

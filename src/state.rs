@@ -13,8 +13,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
 
 use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig, PortRule, ProxyHost};
-use crate::hosting::model::{Allocation, HostingPool};
 use crate::hosting::HostingStatus;
+use crate::hosting::model::{Allocation, HostingPool};
 
 /// One domain's live TLS material, ready for SNI dispatch.
 #[derive(Clone, Debug)]
@@ -634,7 +634,7 @@ mod tests {
                     fixed_response: None,
                     hsts: false,
                     hsts_subdomains: false,
-            pass_client_cert_header: false,
+                    pass_client_cert_header: false,
                     enabled: true,
                 }]);
             }));

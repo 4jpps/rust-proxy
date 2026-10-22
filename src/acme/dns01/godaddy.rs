@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{relative_record_name, ApiErrorMessage, Dns01Error, DnsProvider, DnsZone};
+use super::{ApiErrorMessage, Dns01Error, DnsProvider, DnsZone, relative_record_name};
 
 const DEFAULT_BASE_URL: &str = "https://api.godaddy.com/v3/domains/zones";
 

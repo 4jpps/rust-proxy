@@ -25,8 +25,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
+use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -235,7 +235,9 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                         // at all: the host falls back to its login page and
                         // no identity headers are forwarded.
                         let client_cert_subject = match (&client_cert_subject, &client_cert_leaf) {
-                            (Some(_), Some(leaf)) if state.revocation().is_revoked(leaf).await => None,
+                            (Some(_), Some(leaf)) if state.revocation().is_revoked(leaf).await => {
+                                None
+                            }
                             _ => client_cert_subject,
                         };
                         match handle_https_request(
@@ -420,7 +422,11 @@ async fn handle_https_request(
         })
         .or_else(|| sni.clone())
         .unwrap_or_else(|| "-".into());
-    let query_present = if req.uri().query().is_some() { "1" } else { "0" };
+    let query_present = if req.uri().query().is_some() {
+        "1"
+    } else {
+        "0"
+    };
     let user_agent: String = req
         .headers()
         .get(hyper::header::USER_AGENT)
@@ -502,16 +508,25 @@ async fn route_https_request(
         })
         .or_else(|| sni.clone());
     let hsts = lookup_name.as_deref().and_then(|name| {
-        router::match_host(&state.hosts(), bind_ip, bind_port, name).and_then(|h| h.hsts_header_value())
+        router::match_host(&state.hosts(), bind_ip, bind_port, name)
+            .and_then(|h| h.hsts_header_value())
     });
-    let mut result =
-        route_https_request_inner(state, bind_ip, bind_port, peer_ip, sni, client_cert_subject, req)
-            .await;
+    let mut result = route_https_request_inner(
+        state,
+        bind_ip,
+        bind_port,
+        peer_ip,
+        sni,
+        client_cert_subject,
+        req,
+    )
+    .await;
     if let (Some(value), Ok(resp)) = (hsts, result.as_mut())
-        && let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
-            resp.headers_mut()
-                .insert(hyper::header::STRICT_TRANSPORT_SECURITY, value);
-        }
+        && let Ok(value) = hyper::header::HeaderValue::from_str(&value)
+    {
+        resp.headers_mut()
+            .insert(hyper::header::STRICT_TRANSPORT_SECURITY, value);
+    }
     result
 }
 
@@ -657,15 +672,11 @@ async fn route_https_request_inner(
     let client_cert_ok = resolved_acls.has_client_cert_acl
         && client_cert_subject.as_ref().is_some_and(|id| {
             // The org lock was already applied at the top of this function.
-            resolved_acls
-                .allowed_client_cert_subjects.contains(&id.cn)
+            resolved_acls.allowed_client_cert_subjects.contains(&id.cn)
         });
     let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
     if host.block_exploits {
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map_or("/", |pq| pq.as_str());
+        let path_and_query = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
         let user_agent = req
             .headers()
             .get(hyper::header::USER_AGENT)
@@ -772,9 +783,9 @@ async fn route_https_request_inner(
     if host.pass_client_cert_header
         && let (Some(identity), Some(token)) =
             (&client_cert_subject, state.client_cert_forward_token())
-        {
-            client_cert::set_identity_headers(req.headers_mut(), identity, token);
-        }
+    {
+        client_cert::set_identity_headers(req.headers_mut(), identity, token);
+    }
 
     if let Some(path_rewrite) = &host.path_rewrite {
         apply_path_rewrite(&mut req, path_rewrite);
@@ -782,8 +793,16 @@ async fn route_https_request_inner(
 
     let location = crate::config::match_location(&host.locations, req.uri().path());
     let (upstream_host_port, upstream_https, upstream_tls_verify) = match location {
-        Some(loc) => (loc.upstream.as_str(), loc.upstream_https, loc.upstream_tls_verify),
-        None => (host.upstream.as_str(), host.upstream_https, host.upstream_tls_verify),
+        Some(loc) => (
+            loc.upstream.as_str(),
+            loc.upstream_https,
+            loc.upstream_tls_verify,
+        ),
+        None => (
+            host.upstream.as_str(),
+            host.upstream_https,
+            host.upstream_tls_verify,
+        ),
     };
     let Ok(upstream) = resolve_upstream(upstream_host_port) else {
         return Ok(bad_gateway());
@@ -872,7 +891,7 @@ async fn handle_login_gate(
                     "/",
                     Some("invalid request"),
                     hyper::StatusCode::BAD_REQUEST,
-                )
+                );
             }
         };
         let Ok(submission) = serde_json::from_slice::<login::LoginSubmission>(&body_bytes) else {
@@ -917,7 +936,7 @@ async fn handle_login_gate(
 /// read here; the username is included (truncated) since it is the
 /// useful signal for spotting credential stuffing.
 fn siem_login_event(ok: bool, domain: &str, username: &str, peer_ip: IpAddr) {
-    use crate::siem::{emit, wants, Category, Severity};
+    use crate::siem::{Category, Severity, emit, wants};
     let (cat, sev, event, msg) = if ok {
         (
             Category::Admin,
@@ -1129,9 +1148,11 @@ fn passthrough_target_for_port(target: &str, port: u16) -> String {
         return target.to_string();
     }
     if let Some((host, p)) = target.rsplit_once(':')
-        && !host.contains(':') && p.parse::<u16>().is_ok() {
-            return target.to_string();
-        }
+        && !host.contains(':')
+        && p.parse::<u16>().is_ok()
+    {
+        return target.to_string();
+    }
     if target.parse::<std::net::Ipv6Addr>().is_ok() {
         return format!("[{target}]:{port}");
     }
@@ -1155,9 +1176,14 @@ struct DropConnection;
 
 type ServiceError = std::io::Error;
 
-fn deliver(resp: Response<BoxBody<Bytes, hyper::Error>>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ServiceError> {
+fn deliver(
+    resp: Response<BoxBody<Bytes, hyper::Error>>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ServiceError> {
     if resp.extensions().get::<DropConnection>().is_some() {
-        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "default site: no response (444)"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "default site: no response (444)",
+        ));
     }
     Ok(resp)
 }
@@ -1166,7 +1192,9 @@ const HTML_RESPONSE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; 
 
 const CONGRATULATIONS_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Congratulations</title><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:12vh auto;padding:0 1rem;color:#222}h1{font-size:1.6rem}</style></head><body><h1>Congratulations!</h1><p>RustProxy is running. No site is configured for this address yet.</p></body></html>\n";
 
-pub(crate) fn default_site_response(site: &crate::config::DefaultSite) -> Response<BoxBody<Bytes, hyper::Error>> {
+pub(crate) fn default_site_response(
+    site: &crate::config::DefaultSite,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     use crate::config::DefaultSiteMode as M;
     let html = |status: hyper::StatusCode, body: String| {
         Response::builder()
@@ -1231,7 +1259,11 @@ fn fixed_response_page(
         .status(status)
         .header(
             hyper::header::CONTENT_TYPE,
-            if fixed.html { "text/html; charset=utf-8" } else { "text/plain; charset=utf-8" },
+            if fixed.html {
+                "text/html; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            },
         )
         .header(hyper::header::CACHE_CONTROL, "no-store")
         .header("x-content-type-options", "nosniff")
@@ -1901,8 +1933,8 @@ mod tests {
     /// connection's possibly-stale `sni` -- the exact scenario
     /// connection coalescing creates.
     #[tokio::test]
-    async fn an_h2_requests_authority_wins_over_a_stale_connection_level_sni_with_no_host_header_at_all(
-    ) {
+    async fn an_h2_requests_authority_wins_over_a_stale_connection_level_sni_with_no_host_header_at_all()
+     {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let target_first = crate::config::RedirectTarget {
@@ -2046,8 +2078,8 @@ mod tests {
     /// credentials. The two now combine by OR: a matching IP admits the
     /// request outright, without ever touching the login gate.
     #[tokio::test]
-    async fn matching_ip_admits_the_request_without_requiring_login_even_when_a_login_acl_is_also_configured(
-    ) {
+    async fn matching_ip_admits_the_request_without_requiring_login_even_when_a_login_acl_is_also_configured()
+     {
         let state = test_state_with_access(
             "example.com",
             vec!["10.0.0.0/24".parse().unwrap()],
@@ -2347,8 +2379,8 @@ mod tests {
     /// wanting a cert requested, same as if there were no IpAllow ACL
     /// at all.
     #[tokio::test]
-    async fn a_client_cert_acl_host_still_wants_a_cert_requested_for_a_peer_outside_the_ip_allow_list(
-    ) {
+    async fn a_client_cert_acl_host_still_wants_a_cert_requested_for_a_peer_outside_the_ip_allow_list()
+     {
         let state = test_state_with_cert("example.com").await;
         let host = client_cert_host_with_ip_allow(state.db(), "example.com", "10.0.0.0/24").await;
         state.set_hosts(vec![host]);
@@ -2459,12 +2491,9 @@ mod tests {
             org: Some("Some Other Org".into()),
             org_id: Some("NOT-THE-ORG-ID".into()),
         };
-        let resp = send_test_request_with_cert(
-            state,
-            "203.0.113.7".parse().unwrap(),
-            Some(with_org),
-        )
-        .await;
+        let resp =
+            send_test_request_with_cert(state, "203.0.113.7".parse().unwrap(), Some(with_org))
+                .await;
         assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY);
     }
 
@@ -2487,7 +2516,11 @@ mod tests {
             org_id: org_id.map(str::to_string),
         };
         for (label, id, passes) in [
-            ("old cert, no org-id", client_cert::ClientCertIdentity::cn_only("Jeffs MacBook"), false),
+            (
+                "old cert, no org-id",
+                client_cert::ClientCertIdentity::cn_only("Jeffs MacBook"),
+                false,
+            ),
             ("other org", ident(Some("TB-OTHER")), false),
             ("right org", ident(Some("TB-GOOD")), true),
         ] {
@@ -2501,7 +2534,10 @@ mod tests {
                 assert_eq!(resp.status(), hyper::StatusCode::BAD_GATEWAY, "{label}");
             } else {
                 assert_eq!(resp.status(), hyper::StatusCode::OK, "{label}");
-                assert!(response_text(resp).await.contains("Sign in to example.com"), "{label}");
+                assert!(
+                    response_text(resp).await.contains("Sign in to example.com"),
+                    "{label}"
+                );
             }
         }
     }
@@ -2524,7 +2560,9 @@ mod tests {
         let resp = send_test_request_with_cert(
             state,
             "203.0.113.7".parse().unwrap(),
-            Some(client_cert::ClientCertIdentity::cn_only("Someone Else's Phone")),
+            Some(client_cert::ClientCertIdentity::cn_only(
+                "Someone Else's Phone",
+            )),
         )
         .await;
         assert_eq!(resp.status(), hyper::StatusCode::OK);
@@ -2764,9 +2802,20 @@ mod tests {
             html: false,
         });
         let state = test_state_with_host(host).await;
-        let resp = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/x", None, None).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/x",
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         assert_eq!(&body[..], b"no such site");
     }
 
@@ -2785,13 +2834,24 @@ mod tests {
             html: true,
         });
         let state = test_state_with_host(host).await;
-        let resp = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/x", None, None).await;
+        let resp = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/x",
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
         assert_eq!(
             resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
         );
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         assert_eq!(&body[..], b"<h1>Coming soon</h1>");
     }
 
@@ -2815,7 +2875,15 @@ mod tests {
         )
         .await;
         assert_eq!(blocked.status(), hyper::StatusCode::FORBIDDEN);
-        let ok = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/page", None, None).await;
+        let ok = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/page",
+            None,
+            None,
+        )
+        .await;
         assert_eq!(ok.status(), hyper::StatusCode::MOVED_PERMANENTLY);
     }
 
@@ -2825,13 +2893,15 @@ mod tests {
         let loc_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let io = TokioIo::new(stream);
                 tokio::spawn(async move {
                     let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
-                        Ok::<_, std::convert::Infallible>(Response::new(
-                            http_body_util::Full::new(Bytes::from_static(b"from-location")),
-                        ))
+                        Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(
+                            Bytes::from_static(b"from-location"),
+                        )))
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
@@ -2854,11 +2924,30 @@ mod tests {
             upstream_tls_verify: true,
         }];
         let state = test_state_with_host(host).await;
-        let hit = send_test_request(state.clone(), "203.0.113.7".parse().unwrap(), "GET", "/api/users", None, None).await;
+        let hit = send_test_request(
+            state.clone(),
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/api/users",
+            None,
+            None,
+        )
+        .await;
         assert_eq!(hit.status(), hyper::StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(hit.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(hit.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         assert_eq!(&body[..], b"from-location");
-        let miss = send_test_request(state, "203.0.113.7".parse().unwrap(), "GET", "/other", None, None).await;
+        let miss = send_test_request(
+            state,
+            "203.0.113.7".parse().unwrap(),
+            "GET",
+            "/other",
+            None,
+            None,
+        )
+        .await;
         assert_eq!(miss.status(), hyper::StatusCode::BAD_GATEWAY);
     }
 
@@ -3034,11 +3123,27 @@ mod tests {
 
     async fn default_site_body(resp: Response<BoxBody<Bytes, hyper::Error>>) -> String {
         use http_body_util::BodyExt;
-        String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+        String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
     }
 
-    fn site(mode: crate::config::DefaultSiteMode, url: &str, html: &str) -> crate::config::DefaultSite {
-        crate::config::DefaultSite { mode, redirect_url: url.into(), custom_html: html.into() }
+    fn site(
+        mode: crate::config::DefaultSiteMode,
+        url: &str,
+        html: &str,
+    ) -> crate::config::DefaultSite {
+        crate::config::DefaultSite {
+            mode,
+            redirect_url: url.into(),
+            custom_html: html.into(),
+        }
     }
 
     #[tokio::test]
@@ -3058,7 +3163,11 @@ mod tests {
             resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
         );
-        assert!(default_site_body(resp).await.contains("RustProxy is running"));
+        assert!(
+            default_site_body(resp)
+                .await
+                .contains("RustProxy is running")
+        );
 
         let resp = default_site_response(&site(M::CustomHtml, "", "<h1>Mine</h1>"));
         assert_eq!(resp.status(), hyper::StatusCode::OK);

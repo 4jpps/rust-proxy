@@ -132,7 +132,9 @@ pub fn validate_slug(name: &str) -> Check {
     if ok {
         Ok(())
     } else {
-        invalid("pool name must be 1-32 characters of a-z, 0-9 and '-' (not starting or ending with '-')")
+        invalid(
+            "pool name must be 1-32 characters of a-z, 0-9 and '-' (not starting or ending with '-')",
+        )
     }
 }
 
@@ -221,7 +223,11 @@ pub fn next_free_vm_ip(
 }
 
 /// `others` are the pools other than the one being validated.
-pub fn validate_pool(candidate: &HostingPool, others: &[HostingPool], dedicated: &[IpAddr]) -> Check {
+pub fn validate_pool(
+    candidate: &HostingPool,
+    others: &[HostingPool],
+    dedicated: &[IpAddr],
+) -> Check {
     validate_slug(&candidate.name)?;
     if candidate.description.len() > 256 {
         return invalid("description must be at most 256 characters");
@@ -249,7 +255,10 @@ pub fn validate_pool(candidate: &HostingPool, others: &[HostingPool], dedicated:
     }
     // The dedicated addresses are the proxy's own sites; a pool covering one
     // would let an allocation take it over.
-    if let Some(ip) = dedicated_v4(dedicated).into_iter().find(|ip| net.contains(ip)) {
+    if let Some(ip) = dedicated_v4(dedicated)
+        .into_iter()
+        .find(|ip| net.contains(ip))
+    {
         return invalid(format!(
             "pool cidr contains network.dedicated_ips address {ip}, which hosting must never touch"
         ));
@@ -267,7 +276,9 @@ pub fn validate_pool(candidate: &HostingPool, others: &[HostingPool], dedicated:
     }
     if let (Some(vm_net), Some(gw)) = (candidate.vm_cidr, candidate.gateway) {
         if !is_internal(vm_net.network()) || !is_internal(vm_net.broadcast()) {
-            return invalid("vm_cidr must be a private (RFC 1918) or CGNAT (100.64.0.0/10) network");
+            return invalid(
+                "vm_cidr must be a private (RFC 1918) or CGNAT (100.64.0.0/10) network",
+            );
         }
         if vm_net.prefix_len() > 29 {
             return invalid("vm_cidr must be a /29 or larger");
@@ -416,7 +427,9 @@ pub fn validate_allocation(a: &Allocation, ctx: &AllocationContext<'_>) -> Check
                 ));
             }
             if vm_ip == vm_net.network() || vm_ip == vm_net.broadcast() {
-                return invalid("vm_ip must be a host address, not the network or broadcast address");
+                return invalid(
+                    "vm_ip must be a host address, not the network or broadcast address",
+                );
             }
         }
         if ctx.pool.gateway == Some(vm_ip) {
@@ -426,7 +439,9 @@ pub fn validate_allocation(a: &Allocation, ctx: &AllocationContext<'_>) -> Check
             return invalid("vm_ip must not be a pool gateway");
         }
         if ctx.others.iter().any(|o| o.vm_ip == Some(vm_ip)) {
-            return conflict(format!("vm_ip {vm_ip} is already used by another allocation"));
+            return conflict(format!(
+                "vm_ip {vm_ip} is already used by another allocation"
+            ));
         }
     }
     Ok(())
@@ -470,13 +485,29 @@ mod tests {
         p.vm_cidr = Some("172.16.63.0/29".parse().unwrap());
         p.gateway = Some("172.16.63.1".parse().unwrap());
         let pools = vec![p.clone()];
-        assert_eq!(next_free_vm_ip(&p, &pools, &[], None), Some("172.16.63.2".parse().unwrap()));
+        assert_eq!(
+            next_free_vm_ip(&p, &pools, &[], None),
+            Some("172.16.63.2".parse().unwrap())
+        );
         let used = vec![alloc("standard", "204.52.221.226", Some("172.16.63.2"))];
-        assert_eq!(next_free_vm_ip(&p, &pools, &used, None), Some("172.16.63.3".parse().unwrap()));
+        assert_eq!(
+            next_free_vm_ip(&p, &pools, &used, None),
+            Some("172.16.63.3".parse().unwrap())
+        );
         let all: Vec<Allocation> = (2..=6)
-            .map(|i| alloc("standard", &format!("204.52.221.{}", 224 + i), Some(&format!("172.16.63.{i}"))))
+            .map(|i| {
+                alloc(
+                    "standard",
+                    &format!("204.52.221.{}", 224 + i),
+                    Some(&format!("172.16.63.{i}")),
+                )
+            })
             .collect();
-        assert_eq!(next_free_vm_ip(&p, &pools, &all, None), None, "/29 holds .1 gateway + .2-.6");
+        assert_eq!(
+            next_free_vm_ip(&p, &pools, &all, None),
+            None,
+            "/29 holds .1 gateway + .2-.6"
+        );
         p.vm_cidr = None;
         assert_eq!(next_free_vm_ip(&p, &pools, &[], None), None);
     }
@@ -488,11 +519,20 @@ mod tests {
         p.gateway = Some("100.64.241.225".parse().unwrap());
         let pools = vec![p.clone()];
         let public: Ipv4Addr = "204.52.221.230".parse().unwrap();
-        assert_eq!(next_free_vm_ip(&p, &pools, &[], Some(public)), Some("100.64.241.230".parse().unwrap()));
+        assert_eq!(
+            next_free_vm_ip(&p, &pools, &[], Some(public)),
+            Some("100.64.241.230".parse().unwrap())
+        );
         let used = vec![alloc("standard", "204.52.221.231", Some("100.64.241.230"))];
-        assert_eq!(next_free_vm_ip(&p, &pools, &used, Some(public)), Some("100.64.241.226".parse().unwrap()));
+        assert_eq!(
+            next_free_vm_ip(&p, &pools, &used, Some(public)),
+            Some("100.64.241.226".parse().unwrap())
+        );
         let gw: Ipv4Addr = "204.52.221.225".parse().unwrap();
-        assert_eq!(next_free_vm_ip(&p, &pools, &[], Some(gw)), Some("100.64.241.226".parse().unwrap()));
+        assert_eq!(
+            next_free_vm_ip(&p, &pools, &[], Some(gw)),
+            Some("100.64.241.226".parse().unwrap())
+        );
     }
 
     fn check(a: &Allocation, p: &HostingPool, others: &[Allocation]) -> Check {
@@ -524,7 +564,13 @@ mod tests {
         let none: Vec<HostingPool> = vec![];
         assert!(validate_pool(&pool("standard", "204.52.221.224/28"), &none, &[]).is_ok());
         assert!(validate_pool(&pool("ham", "44.30.51.224/28"), &none, &[]).is_ok());
-        for bad in ["10.0.0.0/28", "192.168.1.0/28", "100.64.0.0/28", "127.0.0.0/28", "224.0.0.0/28"] {
+        for bad in [
+            "10.0.0.0/28",
+            "192.168.1.0/28",
+            "100.64.0.0/28",
+            "127.0.0.0/28",
+            "224.0.0.0/28",
+        ] {
             assert!(
                 validate_pool(&pool("p", bad), &none, &[]).is_err(),
                 "{bad} should be rejected"
@@ -553,22 +599,40 @@ mod tests {
     fn vm_network_and_gateway_are_validated_together() {
         let mut p = pool("standard", "204.52.221.224/28");
         p.vm_cidr = Some("172.16.63.0/24".parse().unwrap());
-        assert!(validate_pool(&p, &[], &[]).is_err(), "gateway required with vm_cidr");
+        assert!(
+            validate_pool(&p, &[], &[]).is_err(),
+            "gateway required with vm_cidr"
+        );
         p.gateway = Some("172.16.63.1".parse().unwrap());
         assert!(validate_pool(&p, &[], &[]).is_ok());
         p.gateway = Some("172.16.64.1".parse().unwrap());
-        assert!(validate_pool(&p, &[], &[]).is_err(), "gateway outside vm_cidr");
+        assert!(
+            validate_pool(&p, &[], &[]).is_err(),
+            "gateway outside vm_cidr"
+        );
         p.gateway = Some("172.16.63.255".parse().unwrap());
-        assert!(validate_pool(&p, &[], &[]).is_err(), "gateway is the broadcast address");
+        assert!(
+            validate_pool(&p, &[], &[]).is_err(),
+            "gateway is the broadcast address"
+        );
         p.gateway = Some("172.16.63.1".parse().unwrap());
         p.vm_cidr = Some("8.8.8.0/24".parse().unwrap());
-        assert!(validate_pool(&p, &[], &[]).is_err(), "vm_cidr must be private");
+        assert!(
+            validate_pool(&p, &[], &[]).is_err(),
+            "vm_cidr must be private"
+        );
         p.vm_cidr = Some("100.64.241.0/24".parse().unwrap());
         p.gateway = Some("100.64.241.1".parse().unwrap());
-        assert!(validate_pool(&p, &[], &[]).is_ok(), "CGNAT vm_cidr is allowed");
+        assert!(
+            validate_pool(&p, &[], &[]).is_ok(),
+            "CGNAT vm_cidr is allowed"
+        );
         p.vm_cidr = Some("100.128.0.0/24".parse().unwrap());
         p.gateway = Some("100.128.0.1".parse().unwrap());
-        assert!(validate_pool(&p, &[], &[]).is_err(), "just above 100.64/10 is public");
+        assert!(
+            validate_pool(&p, &[], &[]).is_err(),
+            "just above 100.64/10 is public"
+        );
         p.gateway = Some("172.16.63.1".parse().unwrap());
         let mut q = pool("ham", "44.30.51.224/28");
         q.vm_cidr = Some("172.16.63.0/25".parse().unwrap());
@@ -605,7 +669,10 @@ mod tests {
         let usable = usable_addresses(&p);
         assert_eq!(usable.len(), 13);
         assert_eq!(usable[0], "204.52.221.226".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(*usable.last().unwrap(), "204.52.221.238".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            *usable.last().unwrap(),
+            "204.52.221.238".parse::<Ipv4Addr>().unwrap()
+        );
         assert!(!is_usable(&p, "204.52.221.224".parse().unwrap()));
         assert!(!is_usable(&p, "204.52.221.239".parse().unwrap()));
         assert!(!is_usable(&p, "204.52.221.225".parse().unwrap()));
@@ -614,9 +681,15 @@ mod tests {
     #[test]
     fn next_free_ip_picks_the_lowest_unallocated_and_runs_out() {
         let p = pool("tiny", "204.52.221.224/30");
-        assert_eq!(next_free_ip(&p, &[]), Some("204.52.221.225".parse().unwrap()));
+        assert_eq!(
+            next_free_ip(&p, &[]),
+            Some("204.52.221.225".parse().unwrap())
+        );
         let taken = vec![alloc("tiny", "204.52.221.225", None)];
-        assert_eq!(next_free_ip(&p, &taken), Some("204.52.221.226".parse().unwrap()));
+        assert_eq!(
+            next_free_ip(&p, &taken),
+            Some("204.52.221.226".parse().unwrap())
+        );
         let full = vec![
             alloc("tiny", "204.52.221.225", None),
             alloc("tiny", "204.52.221.226", None),
@@ -647,14 +720,26 @@ mod tests {
         let bound = HashSet::new();
         let err = validate_allocation(
             &a,
-            &AllocationContext { pool: &p, all_pools: &pools, others: &[], dedicated: &dedicated, bound_ips: &bound },
+            &AllocationContext {
+                pool: &p,
+                all_pools: &pools,
+                others: &[],
+                dedicated: &dedicated,
+                bound_ips: &bound,
+            },
         )
         .unwrap_err();
         assert!(matches!(err, HostingError::Invalid(_)));
         let bound: HashSet<Ipv4Addr> = ["204.52.221.226".parse().unwrap()].into_iter().collect();
         let err = validate_allocation(
             &a,
-            &AllocationContext { pool: &p, all_pools: &pools, others: &[], dedicated: &[], bound_ips: &bound },
+            &AllocationContext {
+                pool: &p,
+                all_pools: &pools,
+                others: &[],
+                dedicated: &[],
+                bound_ips: &bound,
+            },
         )
         .unwrap_err();
         assert!(matches!(err, HostingError::Conflict(_)));
@@ -665,8 +750,22 @@ mod tests {
         let mut p = pool("standard", "204.52.221.224/28");
         p.vm_cidr = Some("172.16.63.0/24".parse().unwrap());
         p.gateway = Some("172.16.63.1".parse().unwrap());
-        assert!(check(&alloc("standard", "204.52.221.226", Some("172.16.63.10")), &p, &[]).is_ok());
-        for bad in ["8.8.8.8", "172.16.64.10", "172.16.63.1", "172.16.63.0", "172.16.63.255", "204.52.221.230"] {
+        assert!(
+            check(
+                &alloc("standard", "204.52.221.226", Some("172.16.63.10")),
+                &p,
+                &[]
+            )
+            .is_ok()
+        );
+        for bad in [
+            "8.8.8.8",
+            "172.16.64.10",
+            "172.16.63.1",
+            "172.16.63.0",
+            "172.16.63.255",
+            "204.52.221.230",
+        ] {
             assert!(
                 check(&alloc("standard", "204.52.221.226", Some(bad)), &p, &[]).is_err(),
                 "vm_ip {bad} should be rejected"
@@ -674,19 +773,42 @@ mod tests {
         }
         let existing = vec![alloc("standard", "204.52.221.227", Some("172.16.63.10"))];
         assert!(matches!(
-            check(&alloc("standard", "204.52.221.226", Some("172.16.63.10")), &p, &existing).unwrap_err(),
+            check(
+                &alloc("standard", "204.52.221.226", Some("172.16.63.10")),
+                &p,
+                &existing
+            )
+            .unwrap_err(),
             HostingError::Conflict(_)
         ));
     }
 
     #[test]
     fn port_forward_rules() {
-        let tcp = |s, e| PortSpec { protocol: Protocol::Tcp, port_start: s, port_end: e, vm_port: None, acl_ids: vec![] };
-        let udp = |s, e| PortSpec { protocol: Protocol::Udp, port_start: s, port_end: e, vm_port: None, acl_ids: vec![] };
+        let tcp = |s, e| PortSpec {
+            protocol: Protocol::Tcp,
+            port_start: s,
+            port_end: e,
+            vm_port: None,
+            acl_ids: vec![],
+        };
+        let udp = |s, e| PortSpec {
+            protocol: Protocol::Udp,
+            port_start: s,
+            port_end: e,
+            vm_port: None,
+            acl_ids: vec![],
+        };
         assert!(validate_ports(ForwardMode::All, &[]).is_ok());
         assert!(validate_ports(ForwardMode::All, &[tcp(22, 22)]).is_err());
         assert!(validate_ports(ForwardMode::Ports, &[]).is_err());
-        assert!(validate_ports(ForwardMode::Ports, &[tcp(22, 22), tcp(80, 443), udp(53, 53)]).is_ok());
+        assert!(
+            validate_ports(
+                ForwardMode::Ports,
+                &[tcp(22, 22), tcp(80, 443), udp(53, 53)]
+            )
+            .is_ok()
+        );
         assert!(validate_ports(ForwardMode::Ports, &[tcp(0, 10)]).is_err());
         let mut remap = tcp(443, 443);
         remap.vm_port = Some(11443);

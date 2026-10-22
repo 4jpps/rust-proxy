@@ -28,8 +28,8 @@
 
 use std::sync::Arc;
 
-use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
+use rustls::server::WebPkiClientVerifier;
 
 const TRUSTBRIDGE_ROOT_PEM: &str = include_str!("trustbridge_root.crt");
 // Trusted directly (not just chained through the root) so that a
@@ -52,13 +52,17 @@ const TRUSTBRIDGE_INTERMEDIATE_PEM: &str = include_str!("trustbridge_intermediat
 /// `build_https_server_config`) -- the embedded PEMs are fixed at
 /// compile time, so this can't fail at runtime from a missing/
 /// misconfigured file the way a path-based config option could.
-pub fn build_optional_client_cert_verifier() -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+pub fn build_optional_client_cert_verifier() -> Arc<dyn rustls::server::danger::ClientCertVerifier>
+{
     let mut roots = RootCertStore::empty();
     for pem in [TRUSTBRIDGE_ROOT_PEM, TRUSTBRIDGE_INTERMEDIATE_PEM] {
         let mut reader = std::io::Cursor::new(pem.as_bytes());
         for cert in rustls_pemfile::certs(&mut reader) {
-            let cert = cert.expect("embedded TrustBridge root/intermediate PEM must parse as valid PEM/DER");
-            roots.add(cert).expect("embedded TrustBridge root/intermediate must be a valid trust anchor");
+            let cert = cert
+                .expect("embedded TrustBridge root/intermediate PEM must parse as valid PEM/DER");
+            roots
+                .add(cert)
+                .expect("embedded TrustBridge root/intermediate must be a valid trust anchor");
         }
     }
     WebPkiClientVerifier::builder(Arc::new(roots))
@@ -83,7 +87,11 @@ pub struct ClientCertIdentity {
 #[cfg(test)]
 impl ClientCertIdentity {
     pub fn cn_only(cn: impl Into<String>) -> Self {
-        Self { cn: cn.into(), org: None, org_id: None }
+        Self {
+            cn: cn.into(),
+            org: None,
+            org_id: None,
+        }
     }
 }
 
@@ -172,7 +180,8 @@ pub fn strip_identity_headers(headers: &mut hyper::HeaderMap) {
 /// name is simply not forwarded rather than sent as raw UTF-8 bytes).
 pub fn set_identity_headers(headers: &mut hyper::HeaderMap, id: &ClientCertIdentity, token: &str) {
     use hyper::header::HeaderValue;
-    let (Ok(subject), Ok(token)) = (HeaderValue::from_str(&id.cn), HeaderValue::from_str(token)) else {
+    let (Ok(subject), Ok(token)) = (HeaderValue::from_str(&id.cn), HeaderValue::from_str(token))
+    else {
         return;
     };
     headers.insert("x-client-cert-subject", subject);
@@ -228,14 +237,20 @@ mod tests {
     #[test]
     fn cn_only_cert_has_no_org_data() {
         let der = leaf(|dn| dn.push(rcgen::DnType::CommonName, "Jeff Parrish"));
-        assert_eq!(identity_from_der(&der), Some(ClientCertIdentity::cn_only("Jeff Parrish")));
+        assert_eq!(
+            identity_from_der(&der),
+            Some(ClientCertIdentity::cn_only("Jeff Parrish"))
+        );
     }
 
     #[test]
     fn extracts_org_and_organization_identifier() {
         let der = leaf(|dn| {
             dn.push(rcgen::DnType::CommonName, "Jeff Parrish");
-            dn.push(rcgen::DnType::OrganizationName, "Jeff Parrish PC Services LLC");
+            dn.push(
+                rcgen::DnType::OrganizationName,
+                "Jeff Parrish PC Services LLC",
+            );
             dn.push(org_id_type(), rcgen::DnValue::Utf8String("TB-1234".into()));
         });
         let id = identity_from_der(&der).unwrap();
@@ -252,7 +267,10 @@ mod tests {
             dn.push(rcgen::DnType::OrganizationalUnitName, "Engineering");
             dn.push(rcgen::DnType::OrganizationalUnitName, "org-id:ACME-9");
         });
-        assert_eq!(identity_from_der(&der).unwrap().org_id.as_deref(), Some("ACME-9"));
+        assert_eq!(
+            identity_from_der(&der).unwrap().org_id.as_deref(),
+            Some("ACME-9")
+        );
     }
 
     #[test]
@@ -260,9 +278,15 @@ mod tests {
         let der = leaf(|dn| {
             dn.push(rcgen::DnType::CommonName, "x");
             dn.push(rcgen::DnType::OrganizationalUnitName, "org-id:FROM-OU");
-            dn.push(org_id_type(), rcgen::DnValue::Utf8String("FROM-ATTR".into()));
+            dn.push(
+                org_id_type(),
+                rcgen::DnValue::Utf8String("FROM-ATTR".into()),
+            );
         });
-        assert_eq!(identity_from_der(&der).unwrap().org_id.as_deref(), Some("FROM-ATTR"));
+        assert_eq!(
+            identity_from_der(&der).unwrap().org_id.as_deref(),
+            Some("FROM-ATTR")
+        );
     }
 
     #[test]
@@ -298,14 +322,22 @@ mod tests {
         assert!(!h.contains_key("x-client-cert-org-id"));
 
         let mut h = hyper::HeaderMap::new();
-        let id = ClientCertIdentity { cn: "Jeff".into(), org: Some("Acme".into()), org_id: Some("A-1".into()) };
+        let id = ClientCertIdentity {
+            cn: "Jeff".into(),
+            org: Some("Acme".into()),
+            org_id: Some("A-1".into()),
+        };
         set_identity_headers(&mut h, &id, "tok");
         assert_eq!(h["x-client-cert-org"], "Acme");
         assert_eq!(h["x-client-cert-org-id"], "A-1");
 
         // A non-ASCII org name can't be a header value; the rest still goes.
         let mut h = hyper::HeaderMap::new();
-        let id = ClientCertIdentity { cn: "Jeff".into(), org: Some("Caf\u{e9}".into()), org_id: Some("A-1".into()) };
+        let id = ClientCertIdentity {
+            cn: "Jeff".into(),
+            org: Some("Caf\u{e9}".into()),
+            org_id: Some("A-1".into()),
+        };
         set_identity_headers(&mut h, &id, "tok");
         assert!(!h.contains_key("x-client-cert-org"));
         assert_eq!(h["x-client-cert-org-id"], "A-1");

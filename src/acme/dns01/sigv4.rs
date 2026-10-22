@@ -69,8 +69,9 @@ impl SigV4Signer {
         let canonical_query = canonical_query_string(query_pairs);
         let canonical_headers = format!("host:{host}\nx-amz-date:{amz_date}\n");
         let signed_headers = "host;x-amz-date";
-        let canonical_request =
-            format!("{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{hashed_payload}");
+        let canonical_request = format!(
+            "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{hashed_payload}"
+        );
         let hashed_canonical_request = hex_encode(&Sha256::digest(canonical_request.as_bytes()));
 
         let credential_scope =
