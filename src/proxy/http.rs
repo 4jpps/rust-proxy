@@ -323,6 +323,13 @@ pub async fn forward_http(
         }
     }
 
+    // The upstream connection always speaks HTTP/1.1, so the forwarded request must say so. hyper's
+    // HTTP/1 client only adds `Transfer-Encoding: chunked` to an HTTP/1.1 request; an HTTP/2
+    // request without a Content-Length (git sends large pushes that way) was forwarded with no
+    // framing at all, which HTTP/1.1 reads as an empty body, so the upstream got nothing (seen as a
+    // large git push reaching GitLab as 483 bytes and failing with a 500).
+    *req.version_mut() = hyper::Version::HTTP_11;
+
     let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
     let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));
 
@@ -1076,6 +1083,137 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-upstream").unwrap(), "yes");
+    }
+
+    /// Starts an upstream that counts the request-body bytes it receives, and a proxy in front of
+    /// it speaking HTTP/1.1 or (prior-knowledge) HTTP/2 to the client. Returns the proxy address and
+    /// a receiver for the byte count.
+    async fn counting_upstream_behind_proxy(
+        client_h2: bool,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<usize>) {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (count_tx, count_rx) = tokio::sync::oneshot::channel::<usize>();
+        let count_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(count_tx)));
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let count_tx = count_tx.clone();
+                async move {
+                    let n = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|b| b.to_bytes().len())
+                        .unwrap_or(0);
+                    if let Some(tx) = count_tx.lock().unwrap().take() {
+                        let _ = tx.send(n);
+                    }
+                    Ok::<_, std::convert::Infallible>(Response::new(
+                        Empty::<Bytes>::new()
+                            .map_err(|e: std::convert::Infallible| match e {})
+                            .boxed(),
+                    ))
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| async move {
+                let upstream_host_port = upstream_addr.to_string();
+                let opts = UpstreamOptions {
+                    websockets_enabled: false,
+                    https: false,
+                    tls_verify: true,
+                    upstream_host_port: &upstream_host_port,
+                    preserve_host: true,
+                    client_ip: "127.0.0.1".parse().unwrap(),
+                    rewrite_samesite_none_cookies: false,
+                };
+                forward_http(req, upstream_addr, opts)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
+            if client_h2 {
+                let _ =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+            } else {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        (proxy_addr, count_rx)
+    }
+
+    /// An 8 MB body sent in 64 KB pieces with no Content-Length (how git sends a large push).
+    struct StreamedBody(usize);
+
+    impl hyper::body::Body for StreamedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            if self.0 == 0 {
+                return std::task::Poll::Ready(None);
+            }
+            self.0 -= 1;
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(
+                vec![7u8; 64 * 1024],
+            )))))
+        }
+    }
+
+    fn streamed_body() -> StreamedBody {
+        StreamedBody(128)
+    }
+
+    /// Regression test: a large git push through the proxy reached GitLab as 483 bytes.
+    #[tokio::test]
+    async fn forward_http_streams_a_large_chunked_body_with_expect_continue_from_an_http1_client() {
+        let (proxy_addr, count_rx) = counting_upstream_behind_proxy(false).await;
+        let io = TokioIo::new(TcpStream::connect(proxy_addr).await.unwrap());
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/repo.git/git-receive-pack")
+            .header(hyper::header::HOST, "example.com")
+            .header(hyper::header::TRANSFER_ENCODING, "chunked")
+            .header(hyper::header::EXPECT, "100-continue")
+            .body(streamed_body())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(count_rx.await.unwrap(), 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn forward_http_streams_a_large_body_from_an_http2_client() {
+        let (proxy_addr, count_rx) = counting_upstream_behind_proxy(true).await;
+        let io = TokioIo::new(TcpStream::connect(proxy_addr).await.unwrap());
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://example.com/repo.git/git-receive-pack")
+            .body(streamed_body())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(count_rx.await.unwrap(), 8 * 1024 * 1024);
     }
 
     /// `preserve_host: false` must rewrite the `Host` header the
