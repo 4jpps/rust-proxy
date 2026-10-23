@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+- **Upstream connects give up after 3 seconds and retry.** Each proxied
+  request (and each TCP passthrough session) opens its own upstream
+  connection, and a connection attempt that got no answer used to wait
+  for the kernel's full SYN retry cycle, about two minutes, so the
+  visitor's page hung that long. Now an attempt that hasn't connected
+  within 3 seconds is abandoned and retried on a new socket, up to 3
+  attempts. A refused connection still fails at once.
+
 ## [0.4.1] - 2026-10-22
 
 - **Port translation for hosted VMs.** A forwarded port on a hosting

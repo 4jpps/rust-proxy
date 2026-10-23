@@ -14,7 +14,6 @@ use hyper::body::Incoming;
 use hyper::header::{CONNECTION, UPGRADE};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpStream;
 
 use crate::config::{RedirectStatus, RedirectTarget};
 use crate::state::AppState;
@@ -327,7 +326,7 @@ pub async fn forward_http(
     let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
     let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let tcp = TcpStream::connect(upstream).await?;
+    let tcp = super::connect::connect_upstream(upstream).await?;
     let io: TokioIo<Box<dyn UpstreamIo>> = if opts.https {
         let host_only = opts
             .upstream_host_port

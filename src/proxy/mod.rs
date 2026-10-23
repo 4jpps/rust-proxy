@@ -12,6 +12,7 @@
 
 pub mod access;
 pub mod client_cert;
+pub mod connect;
 pub mod http;
 pub mod login;
 pub mod passthrough;

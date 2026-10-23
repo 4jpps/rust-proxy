@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 #[cfg(test)]
@@ -27,7 +27,7 @@ pub async fn run_tcp_passthrough(
     loop {
         let (mut inbound, peer) = listener.accept().await?;
         tokio::spawn(async move {
-            match TcpStream::connect(upstream).await {
+            match super::connect::connect_upstream(upstream).await {
                 Ok(mut outbound) => {
                     if let Err(err) =
                         tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await
@@ -142,7 +142,7 @@ mod tests {
         tokio::spawn(run_tcp_passthrough(bind_addr, upstream_addr));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let mut client = TcpStream::connect(bind_addr).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(bind_addr).await.unwrap();
         client.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
         client.read_exact(&mut buf).await.unwrap();
