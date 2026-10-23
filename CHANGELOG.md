@@ -1,6 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.2] - 2026-10-22
+
+- **Large uploads from HTTP/2 clients reach the upstream again.** The
+  upstream always speaks HTTP/1.1, but a request from an HTTP/2 client
+  was forwarded still marked HTTP/2. When it had no Content-Length (git
+  sends large pushes that way) it went out with no body framing, which
+  HTTP/1.1 reads as an empty body: a 40 MB git push reached GitLab as 483
+  bytes and failed with a 500. Forwarded requests are now always sent as
+  HTTP/1.1, so the body is streamed chunked.
 
 - **Upstream connects give up after 3 seconds and retry.** Each proxied
   request (and each TCP passthrough session) opens its own upstream
