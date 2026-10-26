@@ -16,6 +16,7 @@ web UI and a REST API, and it installs from a signed `.deb`.
 - **Default-DROP nftables firewall** generated from your hosts and port rules. Only what you configure is reachable.
 - **TCP/UDP port passthrough** for non-HTTP services.
 - **Per-host access control**: IP allow lists, a built-in login page, and client-certificate auth, combined with OR.
+- **Mobile passes**: get past your own IP allow lists from a phone on cellular. The RustProxy Mobile Pass app signs in with a login you choose, and while its switch is on the phone's *current* IP is let in for 10 minutes per check-in. See [Access control](docs/access-control.md#mobile-passes-getting-past-ip-allow-lists-while-mobile).
 - **IP and ASN blocking**: deny lists that take IPs, CIDRs or whole AS numbers (`AS13238`), per host or global, enforced in the web layer *and* the firewall. See [Access control](docs/access-control.md#ip-and-asn-block).
 - **Client certificates, managed for you**: issue and revoke them from the admin UI through TrustBridge, with OCSP revocation checking and an organization lock that rejects certificates from anyone else.
 - **Per-host `deny_fallback`**: send blocked visitors to a public page, or lock a host to a path allow-list (for example only `/guest/`). See [deny_fallback](docs/deny-fallback.md).

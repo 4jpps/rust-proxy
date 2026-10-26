@@ -15,6 +15,7 @@ pub mod client_cert;
 pub mod connect;
 pub mod http;
 pub mod login;
+pub mod mobile_pass;
 pub mod passthrough;
 pub mod revocation;
 pub mod router;
@@ -629,6 +630,12 @@ async fn route_https_request_inner(
         return Ok(forbidden_page(&host.domain));
     }
 
+    // A phone checking in for a mobile pass: answered here, after the block lists but before any
+    // of the host's own access lists (the point is to get past them).
+    if req.uri().path() == mobile_pass::PATH {
+        return Ok(mobile_pass::handle(&state, peer_ip, req).await);
+    }
+
     // Never let a client set this header itself -- only ever set below,
     // from a TLS-layer-verified cert, once we know whether this host
     // actually wants it forwarded. Stripped unconditionally (even for
@@ -675,7 +682,14 @@ async fn route_https_request_inner(
             // The org lock was already applied at the top of this function.
             resolved_acls.allowed_client_cert_subjects.contains(&id.cn)
         });
-    let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip);
+    // A phone holding a mobile pass for one of this host's IP-allow lists counts as inside it.
+    let ip_allowed = access::ip_allowed(&resolved_acls.allow_ips, peer_ip)
+        || (state.mobile_pass_enabled()
+            && state.mobile_passes().allows(
+                &resolved_acls.mobile_login_lists,
+                peer_ip,
+                chrono::Utc::now(),
+            ));
     if host.block_exploits {
         let path_and_query = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
         let user_agent = req

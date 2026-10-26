@@ -674,6 +674,7 @@ const LOADERS = {
   localIps: () => jget('/api/network/local-ips'),
   acme: () => jget('/api/acme-settings'),
   fw: () => jget('/api/firewall-settings'),
+  mobile: () => jget('/api/mobile-pass'),
   defsite: () => jget('/api/default-site'),
   license: () => jget('/api/license'),
   siem: () => jget('/api/siem'),
@@ -766,6 +767,7 @@ const SECTIONS = {
       { id: 'rules', label: 'Port rules', keys: ['rules', 'acls'], actions: [{ label: 'New rule', act: 'rule-add' }], render: pRules },
       { id: 'acls', label: 'Access lists', keys: ['acls'], actions: [{ label: 'New access list', act: 'acl-add' }], render: pAcls },
       { id: 'firewall', label: 'Firewall settings', write: 'admin', keys: ['fw'], render: pFirewall, after: afterFirewall },
+      { id: 'mobile', label: 'Mobile passes', write: 'admin', keys: ['mobile', 'acls'], render: pMobile, after: afterMobile },
     ],
   },
   system: {
@@ -1551,6 +1553,7 @@ ACTIONS['acl-manage'] = (el) => {
     title: `Manage ${a.name}`,
     body: `<p class="lead">${esc(hint)}</p>
       ${a.kind === 'ip_block' ? `<div class="checks" style="margin-bottom:var(--s-3)">${chk({ name: 'blk-global', label: 'Global: block on every site and listener', checked: !!a.global, help: 'Off applies the list only to sites that select it.' })}</div><ul class="list" id="asn-status" aria-live="polite"></ul>` : ''}
+      ${a.kind === 'ip_allow' ? `<div class="field" style="margin-bottom:var(--s-3)"><label for="ma-mobile">Mobile pass logins</label><select id="ma-mobile" name="mobile-login"><option value="">None (no mobile passes)</option>${Object.values(aclById()).filter((x) => x.kind === 'login').map((x) => `<option value="${esc(x.id)}"${a.mobile_login_acl_id === x.id ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select><p class="faint" style="font-size:var(--fs-xs);margin-top:var(--s-1)">A phone signed in to the RustProxy Mobile Pass app with a login from this list counts as inside this list from whatever network it is on, while the app is switched on. Only its current IP, for 10 minutes per check-in. Mobile passes must also be turned on in Settings.</p></div>` : ''}
       <ul class="list entries" id="manage-list" aria-live="polite"><li class="faint">Loading…</li></ul>
       <form id="manage-add" class="addbox" novalidate><h3>Add entry</h3><div class="fgrid">
         <div class="field wide"><label for="ma-main" class="req">${esc(spec.mainLabel)}</label><input id="ma-main" type="text" name="main" placeholder="${esc(spec.ph)}" required></div>
@@ -1562,6 +1565,11 @@ ACTIONS['acl-manage'] = (el) => {
       document.getElementById('drawer').addEventListener('close', () => refresh('acls', 'hosts', 'rules'), { once: true });
       const err = (m) => { const p = $('#manage-error', root); p.textContent = m || ''; p.hidden = !m; };
       loadManage(root);
+      const mob = $('select[name=mobile-login]', root);
+      if (mob) mob.addEventListener('change', async () => {
+        const prev = a.mobile_login_acl_id || '';
+        try { await send('PUT', `/api/acls/${MANAGE.id}/mobile-login`, { login_acl_id: mob.value || null }); a.mobile_login_acl_id = mob.value || null; toast(mob.value ? 'Mobile passes accepted for this list' : 'Mobile passes off for this list', 'ok'); } catch (x) { mob.value = prev; if (x.message !== 'unauthenticated') err(x.message); }
+      });
       const gl = $('input[name=blk-global]', root);
       if (gl) gl.addEventListener('change', async () => {
         try { await send('PUT', `/api/acls/${MANAGE.id}/global`, { global: gl.checked }); toast(gl.checked ? 'List is now global' : 'List is now per-site', 'ok'); } catch (x) { gl.checked = !gl.checked; if (x.message !== 'unauthenticated') err(x.message); }
@@ -1609,6 +1617,29 @@ function pFirewall() {
     <div class="checks">${chk({ name: 'expose_admin_port', label: 'Expose the admin port through the firewall', checked: s.expose_admin_port, help: 'Off keeps the admin API reachable from this machine only.' }).replace('<input', s.from_config ? '<input disabled' : '<input')}</div>
     <div class="fgrid">${ta({ name: 'admin_allowed_ips', label: 'Allowed addresses', value: (s.admin_allowed_ips || []).join('\n'), rows: 5, mono: true, wide: true, help: 'One IP or CIDR per line. Empty allows any address. Loopback is always allowed. Saving a list that excludes your own address is refused so you cannot lock yourself out.' }).replace('<textarea', ipsLocked ? '<textarea disabled' : '<textarea')}</div>
     <div class="form-actions"><button type="submit" class="btn primary"${s.from_config && ipsLocked ? ' disabled' : ''}>Save</button></div></form>`;
+}
+function pMobile() {
+  const m = D.mobile, acls = D.acls || [], byId = Object.fromEntries(acls.map((a) => [a.id, a]));
+  const linked = acls.filter((a) => a.kind === 'ip_allow' && a.mobile_login_acl_id);
+  const mins = Math.round(m.pass_secs / 60);
+  return `<form id="mobile-form" class="card settings" novalidate><h2>Mobile passes</h2>
+    <p class="lead">Lets a phone through IP allow lists while it is away from the allowed networks, for example on cellular. The RustProxy Mobile Pass app signs in with a login from a login list, and while its switch is on, the phone's <b>current</b> IP counts as inside every IP allow list that accepts that login list. Each check-in lasts ${esc(mins)} minutes and replaces the phone's previous IP, so an address the phone has left drops out on its own. Passes are kept in memory only; no history of past IPs is stored. Only website access honors a pass, not the firewall's port rules.</p>
+    <div class="checks">${chk({ name: 'enabled', label: 'Accept mobile passes', checked: !!m.enabled, help: 'Off refuses every check-in and ends all passes immediately.' })}</div>
+    <div class="form-actions"><button type="submit" class="btn primary">Save</button></div></form>
+  <section class="card"><h2>Allow lists that accept passes</h2>${linked.length ? `<ul class="list">${linked.map((a) => `<li><span class="grow"><span class="m">${esc(a.name)}</span><span class="sub">accepts logins from ${esc((byId[a.mobile_login_acl_id] || {}).name || 'a deleted list')}</span></span></li>`).join('')}</ul>` : '<p class="muted">None yet. Open an IP allow list under Access lists and pick its "Mobile pass logins".</p>'}
+    <p class="faint" style="font-size:var(--fs-xs);margin-top:var(--s-2)">The app checks in at <span class="mono">https://&lt;any site on this proxy&gt;${esc(m.path)}</span>.</p></section>
+  <section class="card"><h2>Phones with a pass now ${m.passes.length ? '<button type="button" class="btn sm ghost" id="mobile-clear">End all</button>' : ''}</h2>${m.passes.length ? `<ul class="list">${m.passes.map((p) => `<li><span class="grow"><span class="m">${esc(p.username)} · ${esc(p.device)}</span><span class="sub mono">${esc(p.ip)} · ${esc(p.login_list_name)} · until ${esc(fmtDT(p.expires_at))}</span></span></li>`).join('')}</ul>` : '<p class="muted">No phone holds a pass.</p>'}</section>`;
+}
+function afterMobile(root) {
+  const f = $('#mobile-form', root); if (!f) return;
+  pageForm(f, async () => {
+    await send('PUT', '/api/mobile-pass', { enabled: f.enabled.checked }); toast(f.enabled.checked ? 'Mobile passes on' : 'Mobile passes off', 'ok'); await refresh('mobile');
+  });
+  const c = $('#mobile-clear', root);
+  if (c) c.addEventListener('click', async () => {
+    if (!await confirmAsync({ title: 'End all mobile passes', body: 'Every phone must sign in again (the app does this at its next check-in if it is still switched on).', confirmLabel: 'End all' })) return;
+    try { await send('DELETE', '/api/mobile-pass/passes'); toast('All passes ended', 'ok'); await refresh('mobile'); } catch (x) { if (x.message !== 'unauthenticated') toast(x.message, 'error'); }
+  });
 }
 function afterFirewall(root) {
   const f = $('#fw-form', root); if (!f) return;

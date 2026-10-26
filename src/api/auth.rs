@@ -53,6 +53,7 @@ const ADMIN_WRITE_PATHS: &[&str] = &[
     "/api/default-site",
     "/api/hosting/pools",
     "/api/trustbridge",
+    "/api/mobile-pass",
 ];
 
 fn path_is_under(path: &str, prefix: &str) -> bool {

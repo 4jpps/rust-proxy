@@ -1031,6 +1031,13 @@ pub struct AclList {
     /// to every host and listener rather than only hosts that select it.
     #[serde(default)]
     pub global: bool,
+    /// Only meaningful for `AclKind::IpAllow`: the `Login` list whose
+    /// credentials may hold a mobile pass for this list (see
+    /// `proxy::mobile_pass`). A phone signed in with one of them counts as
+    /// inside this list from whatever IP it is on, while its pass is fresh
+    /// and mobile passes are turned on in Settings.
+    #[serde(default)]
+    pub mobile_login_acl_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

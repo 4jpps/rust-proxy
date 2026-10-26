@@ -65,6 +65,18 @@ pub fn build_router(state: AppState) -> Router {
             get(get_acl_list_detail).delete(delete_acl_list),
         )
         .route("/api/acls/:id/global", axum::routing::put(set_acl_global))
+        .route(
+            "/api/acls/:id/mobile-login",
+            axum::routing::put(set_acl_mobile_login),
+        )
+        .route(
+            "/api/mobile-pass",
+            get(get_mobile_pass).put(put_mobile_pass),
+        )
+        .route(
+            "/api/mobile-pass/passes",
+            axum::routing::delete(clear_mobile_passes),
+        )
         .route("/api/acls/:id/ip-entries", post(add_acl_ip_entry))
         .route(
             "/api/acls/:id/ip-entries/:entry_id",
@@ -1209,6 +1221,8 @@ struct AclListSummary {
     kind: crate::config::AclKind,
     created_at: chrono::DateTime<chrono::Utc>,
     global: bool,
+    /// IP-allow lists: the Login list accepted for mobile passes, if any.
+    mobile_login_acl_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -1249,6 +1263,7 @@ async fn list_acls(State(state): State<AppState>) -> Result<Json<Vec<AclListSumm
                 kind: a.kind,
                 created_at: a.created_at,
                 global: a.global,
+                mobile_login_acl_id: a.mobile_login_acl_id,
             })
             .collect(),
     ))
@@ -1342,6 +1357,7 @@ async fn create_acl_list(
         kind: body.kind,
         created_at,
         global: false,
+        mobile_login_acl_id: None,
     }))
 }
 
@@ -1377,8 +1393,120 @@ struct AclListDetail {
     credentials: Vec<crate::db::AclCredentialSummary>,
     client_cert_entries: Vec<crate::db::AclClientCertEntry>,
     global: bool,
+    /// IP-allow lists: the Login list accepted for mobile passes, if any.
+    mobile_login_acl_id: Option<Uuid>,
     /// Prefix-fetch state for each `AS<n>` entry (block lists only).
     asn_status: Vec<crate::db::AsnStatus>,
+}
+
+#[derive(Deserialize)]
+struct SetMobileLoginRequest {
+    /// The Login list whose credentials may hold a mobile pass for this
+    /// IP-allow list; `null` unlinks it.
+    login_acl_id: Option<Uuid>,
+}
+
+/// Links an IP-allow list to a Login list for mobile passes (see
+/// `proxy::mobile_pass`).
+async fn set_acl_mobile_login(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetMobileLoginRequest>,
+) -> Result<StatusCode, ApiError> {
+    let list = crate::db::get_acl_list(state.db(), id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if list.kind != crate::config::AclKind::IpAllow {
+        return Err(ApiError::BadRequest(
+            "only an IP allow list can accept mobile passes".into(),
+        ));
+    }
+    if let Some(login) = body.login_acl_id {
+        let target = crate::db::get_acl_list(state.db(), login)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("no such login list".into()))?;
+        if target.kind != crate::config::AclKind::Login {
+            return Err(ApiError::BadRequest(
+                "mobile pass logins must be a login list".into(),
+            ));
+        }
+    }
+    crate::db::set_acl_mobile_login(state.db(), id, body.login_acl_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct MobilePassView {
+    login_list: Uuid,
+    login_list_name: String,
+    username: String,
+    device: String,
+    ip: String,
+    granted_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+struct MobilePassSettings {
+    enabled: bool,
+    path: &'static str,
+    pass_secs: i64,
+    passes: Vec<MobilePassView>,
+}
+
+/// Whether mobile passes are on, and the phones holding one right now.
+async fn get_mobile_pass(
+    State(state): State<AppState>,
+) -> Result<Json<MobilePassSettings>, ApiError> {
+    let names: std::collections::HashMap<Uuid, String> = crate::db::list_acl_lists(state.db())
+        .await?
+        .into_iter()
+        .map(|l| (l.id, l.name))
+        .collect();
+    let passes = state
+        .mobile_passes()
+        .list(chrono::Utc::now())
+        .into_iter()
+        .map(|p| MobilePassView {
+            login_list_name: names.get(&p.login_list).cloned().unwrap_or_default(),
+            login_list: p.login_list,
+            username: p.username,
+            device: p.device,
+            ip: p.ip.to_string(),
+            granted_at: p.granted_at,
+            expires_at: p.expires_at,
+        })
+        .collect();
+    Ok(Json(MobilePassSettings {
+        enabled: state.mobile_pass_enabled(),
+        path: crate::proxy::mobile_pass::PATH,
+        pass_secs: crate::proxy::mobile_pass::PASS_SECS,
+        passes,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PutMobilePass {
+    enabled: bool,
+}
+
+/// Turns mobile passes on or off. Turning them off also ends every pass.
+async fn put_mobile_pass(
+    State(state): State<AppState>,
+    Json(body): Json<PutMobilePass>,
+) -> Result<StatusCode, ApiError> {
+    crate::db::set_mobile_pass_enabled(state.db(), body.enabled).await?;
+    state.set_mobile_pass_enabled(body.enabled);
+    if !body.enabled {
+        state.mobile_passes().clear();
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends every mobile pass now; phones must sign in again.
+async fn clear_mobile_passes(State(state): State<AppState>) -> StatusCode {
+    state.mobile_passes().clear();
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Deserialize)]
@@ -1442,6 +1570,7 @@ async fn get_acl_list_detail(
         credentials,
         client_cert_entries,
         global: list.global,
+        mobile_login_acl_id: list.mobile_login_acl_id,
         asn_status,
     }))
 }
@@ -4457,6 +4586,137 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mobile_passes_link_an_allow_list_to_a_login_list_and_toggle_in_settings() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+        let call = |method: &'static str, uri: String, body: String| {
+            let router = router.clone();
+            let cookie = cookie.clone();
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(header::COOKIE, cookie)
+                            .body(axum::body::Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let logins = body_json(
+            call("POST", "/api/acls".into(), r#"{"name":"phones","kind":"login","credentials":[{"username":"jeff","password":"s3cret"}]}"#.into()).await,
+        )
+        .await;
+        let allow = body_json(
+            call(
+                "POST",
+                "/api/acls".into(),
+                r#"{"name":"home","kind":"ip_allow","ip_entries":["10.0.0.0/24"]}"#.into(),
+            )
+            .await,
+        )
+        .await;
+        let (login_id, allow_id) = (
+            logins["id"].as_str().unwrap(),
+            allow["id"].as_str().unwrap(),
+        );
+
+        // Only an allow list can accept passes, and only from a login list.
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{login_id}/mobile-login"),
+            format!(r#"{{"login_acl_id":"{login_id}"}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{allow_id}/mobile-login"),
+            format!(r#"{{"login_acl_id":"{allow_id}"}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{allow_id}/mobile-login"),
+            format!(r#"{{"login_acl_id":"{login_id}"}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let detail =
+            body_json(call("GET", format!("/api/acls/{allow_id}"), String::new()).await).await;
+        assert_eq!(detail["mobile_login_acl_id"], login_id);
+
+        // The allow list now carries the login list to the access check, and its
+        // credentials are what a phone signs in against.
+        let allow_uuid: Uuid = allow_id.parse().unwrap();
+        let login_uuid: Uuid = login_id.parse().unwrap();
+        let resolved = crate::db::resolve_acl_ids(state.db(), &[allow_uuid])
+            .await
+            .unwrap();
+        assert_eq!(resolved.mobile_login_lists, vec![login_uuid]);
+        let pass_logins = crate::db::mobile_pass_logins(state.db()).await.unwrap();
+        assert_eq!(pass_logins.len(), 1);
+        assert!(crate::proxy::login::verify_credentials_any(
+            &pass_logins[0].1,
+            "jeff",
+            "s3cret"
+        ));
+
+        // Off until turned on; turning it off ends every pass.
+        let settings = body_json(call("GET", "/api/mobile-pass".into(), String::new()).await).await;
+        assert_eq!(settings["enabled"], false);
+        let resp = call(
+            "PUT",
+            "/api/mobile-pass".into(),
+            r#"{"enabled":true}"#.into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state.mobile_pass_enabled());
+        assert!(
+            crate::db::load_mobile_pass_enabled(state.db())
+                .await
+                .unwrap()
+        );
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        state
+            .mobile_passes()
+            .grant(login_uuid, "jeff", "pixel", ip, chrono::Utc::now());
+        let settings = body_json(call("GET", "/api/mobile-pass".into(), String::new()).await).await;
+        assert_eq!(settings["passes"][0]["login_list_name"], "phones");
+        assert_eq!(settings["passes"][0]["ip"], "203.0.113.9");
+        let resp = call(
+            "PUT",
+            "/api/mobile-pass".into(),
+            r#"{"enabled":false}"#.into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(state.mobile_passes().list(chrono::Utc::now()).is_empty());
+
+        // Unlinking.
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{allow_id}/mobile-login"),
+            r#"{"login_acl_id":null}"#.into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            crate::db::mobile_pass_logins(state.db())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

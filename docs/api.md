@@ -125,6 +125,9 @@ curl -X POST https://proxy.example.com/api/hosts \
 | GET, DELETE | `/api/acls/:id` | DELETE is refused (409) while any host selects it |
 | POST | `/api/acls/:id/ip-entries` | `{"cidr","description"}`. For an `ip_block` list `cidr` may be `AS<n>` |
 | PUT | `/api/acls/:id/global` | `{"global":true}` makes an `ip_block` list apply to every host and the whole firewall |
+| PUT | `/api/acls/:id/mobile-login` | `{"login_acl_id":"<login list id>"}` lets that login list's phones hold [mobile passes](access-control.md#mobile-passes-getting-past-ip-allow-lists-while-mobile) for this `ip_allow` list; `null` unlinks |
+| GET, PUT | `/api/mobile-pass` | `{enabled, path, pass_secs, passes:[{login_list, login_list_name, username, device, ip, granted_at, expires_at}]}`; PUT `{"enabled":bool}` (admin), off also ends every pass |
+| DELETE | `/api/mobile-pass/passes` | Ends every mobile pass now (admin) |
 | POST | `/api/acls/:id/credentials` | `{"username","password"}` |
 | POST | `/api/acls/:id/client-cert-entries` | `{"subject","description"}` |
 

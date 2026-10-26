@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+- **Mobile passes: get past IP allow lists from your phone.** An IP allow
+  list can now accept "mobile pass logins" from a login list. The new
+  RustProxy Mobile Pass app signs in with one of those logins, and while
+  its switch is on, the phone's current IP counts as inside the list, so a
+  site locked to the home or office network still works from cellular.
+  Each check-in lasts 10 minutes and replaces the phone's previous IP;
+  passes live in memory only, so no history of addresses is kept.
+  Switching the app off ends the pass at once. Off until turned on under
+  Network > Mobile passes, which also lists the phones holding a pass.
+  Wrong passwords are rate-limited per address and reported to the SIEM.
+
 ## [0.4.2] - 2026-10-22
 
 - **Large uploads from HTTP/2 clients reach the upstream again.** The

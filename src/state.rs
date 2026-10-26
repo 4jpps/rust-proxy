@@ -129,6 +129,9 @@ struct Inner {
     /// a permit if the hosting loop is mid-sync -- an API change is never
     /// lost until the 5-minute fallback.
     hosting_dirty: Notify,
+    /// Settings toggle for mobile passes (off until turned on).
+    mobile_pass_enabled: ArcSwap<bool>,
+    mobile_passes: crate::proxy::mobile_pass::PassStore,
 }
 
 #[derive(Clone)]
@@ -173,6 +176,8 @@ impl AppState {
             hosting_allocations: ArcSwap::from_pointee(Vec::new()),
             hosting_status: ArcSwap::from_pointee(HostingStatus::default()),
             hosting_write_lock: Mutex::new(()),
+            mobile_pass_enabled: ArcSwap::from_pointee(false),
+            mobile_passes: crate::proxy::mobile_pass::PassStore::default(),
             hosting_dirty: Notify::new(),
         }))
     }
@@ -240,6 +245,18 @@ impl AppState {
 
     pub fn siem_config(&self) -> Option<&crate::config::SiemConfig> {
         self.0.siem_config.as_ref()
+    }
+
+    pub fn mobile_pass_enabled(&self) -> bool {
+        **self.0.mobile_pass_enabled.load()
+    }
+
+    pub fn set_mobile_pass_enabled(&self, on: bool) {
+        self.0.mobile_pass_enabled.store(Arc::new(on));
+    }
+
+    pub fn mobile_passes(&self) -> &crate::proxy::mobile_pass::PassStore {
+        &self.0.mobile_passes
     }
 
     pub fn required_client_cert_org(&self) -> Option<String> {

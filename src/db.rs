@@ -278,6 +278,22 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE acl_lists ADD COLUMN global_block INTEGER NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
+    // IP-allow list -> the Login list whose credentials may hold a mobile
+    // pass for it (see `proxy::mobile_pass`). Additive, like global_block.
+    let _ = sqlx::query("ALTER TABLE acl_lists ADD COLUMN mobile_login_acl_id TEXT")
+        .execute(pool)
+        .await;
+    // Single row: whether mobile passes are turned on (off until set).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS mobile_pass_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS asn_prefixes (
@@ -1265,7 +1281,7 @@ pub struct AclClientCertEntry {
 
 pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>, sqlx::Error> {
     let row =
-        sqlx::query("SELECT id, name, kind, created_at, global_block FROM acl_lists WHERE id = ?")
+        sqlx::query("SELECT id, name, kind, created_at, global_block, mobile_login_acl_id FROM acl_lists WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(pool)
             .await?;
@@ -1277,6 +1293,7 @@ pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
         global: row.get::<i64, _>("global_block") != 0,
+        mobile_login_acl_id: mobile_login_of(&row),
     }))
 }
 
@@ -1515,7 +1532,7 @@ pub async fn delete_acl_client_cert_entry(
 
 pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, name, kind, created_at, global_block FROM acl_lists ORDER BY created_at ASC",
+        "SELECT id, name, kind, created_at, global_block, mobile_login_acl_id FROM acl_lists ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -1529,9 +1546,80 @@ pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Err
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),
                 global: row.get::<i64, _>("global_block") != 0,
+                mobile_login_acl_id: mobile_login_of(&row),
             })
         })
         .collect()
+}
+
+fn mobile_login_of(row: &sqlx::sqlite::SqliteRow) -> Option<Uuid> {
+    row.get::<Option<String>, _>("mobile_login_acl_id")
+        .and_then(|s| Uuid::parse_str(&s).ok())
+}
+
+/// Links an IP-allow list to the Login list whose credentials may hold a
+/// mobile pass for it (`None` unlinks). False when the list doesn't exist.
+pub async fn set_acl_mobile_login(
+    pool: &SqlitePool,
+    id: Uuid,
+    login_acl_id: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE acl_lists SET mobile_login_acl_id = ? WHERE id = ?")
+        .bind(login_acl_id.map(|u| u.to_string()))
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Every Login list some IP-allow list accepts mobile passes from, with its
+/// credentials: what a phone's sign-in is checked against.
+pub async fn mobile_pass_logins(
+    pool: &SqlitePool,
+) -> Result<Vec<(Uuid, Vec<HostAuth>)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT l.id AS id FROM acl_lists a JOIN acl_lists l ON l.id = a.mobile_login_acl_id \
+         WHERE a.kind = 'ip_allow' AND l.kind = 'login'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::new();
+    for row in rows {
+        let id: String = row.get("id");
+        let Ok(uuid) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let creds = sqlx::query(
+            "SELECT username, password_hash FROM acl_credentials WHERE acl_list_id = ?",
+        )
+        .bind(&id)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| HostAuth {
+            username: r.get("username"),
+            password_hash: r.get("password_hash"),
+        })
+        .collect();
+        out.push((uuid, creds));
+    }
+    Ok(out)
+}
+
+/// Whether mobile passes are turned on (off when never set).
+pub async fn load_mobile_pass_enabled(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query("SELECT enabled FROM mobile_pass_settings WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some_and(|r| r.get::<i64, _>("enabled") != 0))
+}
+
+pub async fn set_mobile_pass_enabled(pool: &SqlitePool, value: bool) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO mobile_pass_settings (id, enabled) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled")
+        .bind(value as i64)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn set_acl_global(
@@ -1725,6 +1813,9 @@ pub struct ResolvedAcls {
     /// list. The presented subject must be one of these to satisfy the
     /// gate, so empty means no certificate is trusted.
     pub allowed_client_cert_subjects: Vec<String>,
+    /// Login lists whose mobile passes count as inside the selected
+    /// IP-allow lists (see `proxy::mobile_pass`).
+    pub mobile_login_lists: Vec<Uuid>,
 }
 
 pub async fn resolve_acl_ids(
@@ -1748,6 +1839,15 @@ pub async fn resolve_acl_ids(
         match acl_kind_from_str(&list_row.get::<String, _>("kind")) {
             AclKind::IpAllow => {
                 resolved.has_ip_allow_acl = true;
+                if let Ok(Some(row)) =
+                    sqlx::query("SELECT mobile_login_acl_id FROM acl_lists WHERE id = ?")
+                        .bind(acl_id.to_string())
+                        .fetch_optional(pool)
+                        .await
+                    && let Some(login) = mobile_login_of(&row)
+                {
+                    resolved.mobile_login_lists.push(login);
+                }
                 let rows = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?")
                     .bind(acl_id.to_string())
                     .fetch_all(pool)

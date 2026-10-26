@@ -31,6 +31,53 @@ curl -X POST https://proxy.example.com/api/acls/$ID/ip-entries \
   -d '{"cidr":"192.0.2.0/24","description":"branch office"}'
 ```
 
+### Mobile passes (getting past IP allow lists while mobile)
+
+An IP allow list only lets in the networks it names, which shuts you out
+of your own sites from a phone on cellular or a hotel's Wi-Fi. A mobile
+pass is the way around that for **your own phone**, without opening the
+site to everyone or adding a login page in front of it (a page an app
+such as a dashboard client can't get past).
+
+How it works:
+
+1. Turn mobile passes on: **Network > Mobile passes > Accept mobile
+   passes** (`PUT /api/mobile-pass {"enabled":true}`). Off by default;
+   turning it off refuses every check-in and ends all passes at once.
+2. Pick which logins may hold a pass for an IP allow list: open the list
+   under **Access lists** and choose its **Mobile pass logins**, a
+   [login list](#login) (`PUT /api/acls/:id/mobile-login
+   {"login_acl_id":"<login list id>"}`).
+3. On the phone, the **RustProxy Mobile Pass** app signs in with one of
+   that login list's usernames and passwords. While the app's switch is
+   on, the phone's **current** IP counts as inside every IP allow list
+   that accepts that login list.
+
+What a pass is, exactly:
+
+- **Only the current IP.** The app checks in every few minutes and the
+  moment the phone changes networks. Each check-in *replaces* that
+  phone's IP, so the network it just left is no longer let in.
+- **Short.** A pass lasts 10 minutes from its last check-in. A phone that
+  goes offline, or whose app is switched off without reaching the proxy,
+  drops out on its own.
+- **Switched off means off.** Turning the app's switch off signs the
+  phone out and ends its pass immediately.
+- **Nothing remembered.** Passes are held in memory only. No list of past
+  IPs is stored, and a restart ends every pass (the app signs in again at
+  its next check-in).
+- **Website access only.** A pass satisfies a site's IP allow check, not
+  the firewall's port rules or block lists. A blocked IP stays blocked.
+
+The app checks in at `https://<any site on this proxy>/.rust-proxy/mobile-pass`
+(`POST {"username","password","device"}` signs in, `DELETE` with the same
+body signs out). A wrong password is answered 401 and reported to the SIEM
+(`mobile_pass_failure`); 10 failures from one address within 15 minutes
+lock that address out of check-ins for the rest of the window. While
+mobile passes are off the path answers 404. The phones holding a pass
+right now are listed on the Mobile passes page, which can also end them
+all.
+
 ### IP and ASN block
 
 A deny list. Entries are single IPs, CIDRs (IPv4 or IPv6) or **AS numbers**
@@ -144,7 +191,9 @@ configured, the option does nothing.
 For a host that selects ACLs, a visitor gets through if **any** of these
 is true:
 
-1. Their source IP is in a selected IP-allow list.
+1. Their source IP is in a selected IP-allow list, or holds a
+   [mobile pass](#mobile-passes-getting-past-ip-allow-lists-while-mobile)
+   for one.
 2. They presented an accepted client certificate (client-cert ACL selected).
 3. They hold a valid login session (login ACL selected), after the login page.
 
