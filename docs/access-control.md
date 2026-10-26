@@ -66,6 +66,16 @@ What a pass is, exactly:
 - **Nothing remembered.** Passes are held in memory only. No list of past
   IPs is stored, and a restart ends every pass (the app signs in again at
   its next check-in).
+- **Changing the login ends it.** Changing or deleting a login in the
+  list, deleting the list, or unlinking it from the allow list ends its
+  passes immediately.
+- **It trusts the address, so keep the site's own sign-in.** While a
+  pass is live, *anyone* reaching the proxy from that same public IP is
+  treated as inside the allow list, exactly as with an address typed into
+  the list. On cellular that IP is usually shared by many of the
+  carrier's customers (carrier-grade NAT), and the same goes for hotel
+  or café Wi-Fi. Use mobile passes for sites that still ask for their own
+  password (a dashboard, an admin page), not as their only protection.
 - **Website access only.** A pass satisfies a site's IP allow check, not
   the firewall's port rules or block lists. A blocked IP stays blocked.
 
@@ -73,7 +83,9 @@ The app checks in at `https://<any site on this proxy>/.rust-proxy/mobile-pass`
 (`POST {"username","password","device"}` signs in, `DELETE` with the same
 body signs out). A wrong password is answered 401 and reported to the SIEM
 (`mobile_pass_failure`); 10 failures from one address within 15 minutes
-lock that address out of check-ins for the rest of the window. While
+lock that address out of check-ins for the rest of the window (each
+attempt is counted before its password is checked, so parallel guesses
+don't get extra tries). While
 mobile passes are off the path answers 404. The phones holding a pass
 right now are listed on the Mobile passes page, which can also end them
 all.

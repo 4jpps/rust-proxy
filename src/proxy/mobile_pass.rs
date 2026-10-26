@@ -124,16 +124,27 @@ impl PassStore {
             .clear();
     }
 
-    fn locked_out(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut f = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        f.retain(|_, (_, since)| now.duration_since(*since) < FAIL_WINDOW);
-        f.get(&ip).is_some_and(|(n, _)| *n >= MAX_FAILS)
+    /// Ends every pass granted under this Login list, e.g. because its credentials changed or it
+    /// stopped being accepted for mobile passes. A pass never outlives the login it was granted on.
+    pub fn revoke_login_list(&self, login_list: Uuid) {
+        self.passes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p| p.login_list != login_list);
     }
 
-    fn failed(&self, ip: IpAddr, now: Instant) {
+    /// Takes one attempt slot for `ip` before its password is checked, so parallel guesses can't
+    /// all slip past the limit; false once `MAX_FAILS` are used in `FAIL_WINDOW`. A successful
+    /// sign-in gives the slots back (`succeeded`).
+    fn try_attempt(&self, ip: IpAddr, now: Instant) -> bool {
         let mut f = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        f.retain(|_, (_, since)| now.duration_since(*since) < FAIL_WINDOW);
         let entry = f.entry(ip).or_insert((0, now));
+        if entry.0 >= MAX_FAILS {
+            return false;
+        }
         entry.0 += 1;
+        true
     }
 
     fn succeeded(&self, ip: IpAddr) {
@@ -174,7 +185,7 @@ pub async fn handle(
     }
     let now = Instant::now();
     let store = state.mobile_passes();
-    if store.locked_out(peer_ip, now) {
+    if !store.try_attempt(peer_ip, now) {
         report(false, "", "", peer_ip, "too many failed sign-ins");
         return json(
             StatusCode::TOO_MANY_REQUESTS,
@@ -223,7 +234,6 @@ pub async fn handle(
         .map(|(id, _)| *id)
         .collect();
     if matched.is_empty() {
-        store.failed(peer_ip, now);
         report(
             false,
             &sign_in.username,
@@ -336,15 +346,31 @@ mod tests {
     }
 
     #[test]
-    fn repeated_failures_lock_out_that_ip() {
+    fn attempts_are_counted_before_checking_and_lock_out_that_ip() {
         let store = PassStore::default();
         let now = Instant::now();
         for _ in 0..MAX_FAILS {
-            assert!(!store.locked_out(ip("192.0.2.1"), now));
-            store.failed(ip("192.0.2.1"), now);
+            assert!(store.try_attempt(ip("192.0.2.1"), now));
         }
-        assert!(store.locked_out(ip("192.0.2.1"), now));
-        assert!(!store.locked_out(ip("192.0.2.2"), now));
-        assert!(!store.locked_out(ip("192.0.2.1"), now + FAIL_WINDOW + Duration::from_secs(1)));
+        assert!(!store.try_attempt(ip("192.0.2.1"), now));
+        assert!(store.try_attempt(ip("192.0.2.2"), now));
+        assert!(store.try_attempt(ip("192.0.2.1"), now + FAIL_WINDOW + Duration::from_secs(1)));
+        // A success gives the slots back.
+        store.succeeded(ip("192.0.2.2"));
+        for _ in 0..MAX_FAILS {
+            assert!(store.try_attempt(ip("192.0.2.2"), now));
+        }
+    }
+
+    #[test]
+    fn changing_a_login_list_ends_its_passes() {
+        let store = PassStore::default();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Utc::now();
+        store.grant(a, "jeff", "pixel", ip("203.0.113.5"), t0);
+        store.grant(b, "mike", "iphone", ip("203.0.113.6"), t0);
+        store.revoke_login_list(a);
+        assert!(!store.allows(&[a], ip("203.0.113.5"), t0));
+        assert!(store.allows(&[b], ip("203.0.113.6"), t0));
     }
 }

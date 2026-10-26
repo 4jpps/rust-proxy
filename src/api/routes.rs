@@ -1379,6 +1379,8 @@ async fn delete_acl_list(
     if !found {
         return Err(ApiError::NotFound);
     }
+    // A deleted login list's mobile passes end with it.
+    state.mobile_passes().revoke_login_list(id);
     crate::blocklist::rebuild(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1432,6 +1434,13 @@ async fn set_acl_mobile_login(
         }
     }
     crate::db::set_acl_mobile_login(state.db(), id, body.login_acl_id).await?;
+    // The login list this allow list stops accepting (or is switched away from) loses its passes;
+    // phones still entitled through another allow list get them back at their next check-in.
+    if let Some(prev) = list.mobile_login_acl_id
+        && Some(prev) != body.login_acl_id
+    {
+        state.mobile_passes().revoke_login_list(prev);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1753,6 +1762,8 @@ async fn update_acl_credential(
     if !found {
         return Err(ApiError::NotFound);
     }
+    // A changed username or password ends the list's mobile passes; phones sign in again.
+    state.mobile_passes().revoke_login_list(id);
     Ok(Json(crate::db::AclCredentialSummary {
         id: credential_id,
         username: username.to_string(),
@@ -1762,12 +1773,14 @@ async fn update_acl_credential(
 
 async fn delete_acl_credential(
     State(state): State<AppState>,
-    Path((_id, credential_id)): Path<(Uuid, Uuid)>,
+    Path((id, credential_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let found = crate::db::delete_acl_credential(state.db(), credential_id).await?;
     if !found {
         return Err(ApiError::NotFound);
     }
+    // A deleted login's mobile pass ends now, not when it would have run out.
+    state.mobile_passes().revoke_login_list(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
