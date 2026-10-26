@@ -48,7 +48,7 @@ How it works:
    under **Access lists** and choose its **Mobile pass logins**, a
    [login list](#login) (`PUT /api/acls/:id/mobile-login
    {"login_acl_id":"<login list id>"}`).
-3. On the phone, the **RustProxy Mobile Pass** app signs in with one of
+3. On the phone, the **RustProxy Mobile Pass** app ([download](https://gitlab.jpps.us/jpps/rustproxy-mobile-pass/-/releases)) signs in with one of
    that login list's usernames and passwords. While the app's switch is
    on, the phone's **current** IP counts as inside every IP allow list
    that accepts that login list.
