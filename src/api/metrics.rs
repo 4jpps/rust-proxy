@@ -37,7 +37,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     if let Some(soonest) = certs.values().map(|c| c.not_after).min() {
         gauge(
             "certificate_nearest_expiry_seconds",
-            "Seconds until the soonest certificate expiry.",
+            "Seconds until the soonest certificate expiry; negative once it has expired.",
             (soonest - chrono::Utc::now()).num_seconds() as f64,
         );
     }
@@ -114,7 +114,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         let _ = writeln!(
             out,
             "rustproxy_check_ok{{check=\"{}\"}} {}",
-            c.name,
+            label_value(c.name),
             u8::from(c.ok)
         );
     }
@@ -126,7 +126,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let _ = writeln!(
         out,
         "rustproxy_build_info{{version=\"{}\"}} 1",
-        env!("CARGO_PKG_VERSION")
+        label_value(env!("CARGO_PKG_VERSION"))
     );
 
     (
@@ -137,6 +137,15 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         out,
     )
         .into_response()
+}
+
+/// A label value escaped per the Prometheus text format: backslash,
+/// double quote and line feed. Today's values are fixed strings; this keeps
+/// a future label from breaking the whole scrape.
+fn label_value(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[derive(Debug, Serialize)]
@@ -180,4 +189,15 @@ pub async fn get_limits(State(state): State<AppState>) -> Json<LimitsView> {
         tls_handshake_timeouts_total: limits::total(&TLS_HANDSHAKE_TIMEOUTS),
         rate_limited_total: limits::total(&RATE_LIMITED),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_values_are_escaped() {
+        assert_eq!(label_value("disk"), "disk");
+        assert_eq!(label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
 }

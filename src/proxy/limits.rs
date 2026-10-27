@@ -89,11 +89,23 @@ impl ConnLimiter {
     }
 
     /// The `n` clients holding the most connections, busiest first.
+    /// The lock (which every accept also takes) is held only for the
+    /// copy; selecting and sorting happen after it is released.
     pub fn top(&self, n: usize) -> Vec<(IpAddr, usize)> {
-        let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all: Vec<(IpAddr, usize)> = counts.iter().map(|(k, v)| (*k, *v)).collect();
-        all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        all.truncate(n);
+        let mut all: Vec<(IpAddr, usize)> = {
+            let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+            counts.iter().map(|(k, v)| (*k, *v)).collect()
+        };
+        let busiest_first =
+            |a: &(IpAddr, usize), b: &(IpAddr, usize)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
+        if n == 0 {
+            return Vec::new();
+        }
+        if all.len() > n {
+            all.select_nth_unstable_by(n - 1, busiest_first);
+            all.truncate(n);
+        }
+        all.sort_by(busiest_first);
         all
     }
 
@@ -182,6 +194,11 @@ impl RateLimiter {
             tokens: cap,
             last: now,
         });
+        // f64 tokens: rounding error can't build up over a long run,
+        // because the balance is clamped to `cap` on every refill and is
+        // whole requests apart in between; each step is off by at most a
+        // few ulps of a number no larger than `cap`. The property test
+        // `never_more_than_burst_plus_rate` checks the bound.
         let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
         b.tokens = (b.tokens + elapsed * rate).min(cap);
         b.last = now;
@@ -226,6 +243,7 @@ mod tests {
         assert!(l.try_acquire(a).is_none());
         assert!(l.try_acquire(b).is_some(), "other clients are unaffected");
         assert_eq!(l.top(5), vec![(a, 2)], "b's guard was dropped right away");
+        assert!(l.top(0).is_empty());
         drop(g1);
         assert!(l.try_acquire(a).is_some());
     }
@@ -254,6 +272,19 @@ mod tests {
         assert_eq!(l.current(ip), 1000);
         drop(guards);
         assert_eq!(l.clients(), 0);
+    }
+
+    #[test]
+    fn top_returns_the_busiest_clients_in_order() {
+        let l = ConnLimiter::new(0);
+        let mut guards = Vec::new();
+        for (i, n) in [3usize, 9, 1, 7, 5].iter().enumerate() {
+            let ip = IpAddr::from([192, 0, 2, i as u8 + 1]);
+            guards.extend((0..*n).map(|_| l.try_acquire(ip).unwrap()));
+        }
+        let counts: Vec<usize> = l.top(3).iter().map(|(_, n)| *n).collect();
+        assert_eq!(counts, [9, 7, 5]);
+        assert_eq!(l.top(50).len(), 5);
     }
 
     proptest! {

@@ -681,7 +681,9 @@ fn parse_byte_range(header: &str, len: u64) -> ByteRange {
             .flatten()
     };
     match (parse(a), parse(b), a.is_empty()) {
-        // Suffix: the last n bytes.
+        // Suffix: the last n bytes. `-0` is unsatisfiable by definition:
+        // RFC 9110 §14.1.1 counts a suffix range as satisfiable only with a
+        // non-zero suffix length, so it gets 416 like an out-of-bounds range.
         (None, Some(n), true) => {
             if n == 0 || len == 0 {
                 ByteRange::Unsatisfiable
@@ -2025,6 +2027,9 @@ mod tests {
             ("bytes=0-1,5-6", 200, &data[..], None),
             ("items=0-1", 200, &data[..], None),
             ("bytes=9-3", 200, &data[..], None),
+            ("bytes=5-3", 200, &data[..], None),
+            ("bytes=-0", 416, &data[..0], Some("bytes */1000")),
+            ("bytes=-5000", 206, &data[..], Some("bytes 0-999/1000")),
         ] {
             let resp = serve_static_response(&get(Some(range)), root.path()).await;
             assert_eq!(resp.status().as_u16(), status, "{range}");
