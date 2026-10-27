@@ -92,6 +92,10 @@ pub struct Challenge {
     #[serde(rename = "type")]
     pub typ: String,
     pub url: String,
+    /// Parsed for completeness and the type tests; issuance polls the
+    /// authorization's status instead, which is what RFC 8555 §7.5.1
+    /// says a client should wait on.
+    #[allow(dead_code)]
     pub status: ChallengeStatus,
     pub token: String,
 }

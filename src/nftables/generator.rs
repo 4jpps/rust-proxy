@@ -61,6 +61,9 @@ pub const TABLE_NAME: &str = "rust_proxy";
 /// its ACL is enforced directly at the firewall instead. A rule absent
 /// from this map gets no source restriction at all, same as before this
 /// map existed.
+// Every input is a distinct piece of live state the ruleset depends on;
+// bundling them into a struct would only rename the same list.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_ruleset(
     hosts: &[ProxyHost],
     port_rules: &[PortRule],
