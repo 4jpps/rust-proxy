@@ -222,8 +222,12 @@ impl DnsProvider for NamecheapDns01 {
 fn xml_attr(e: &BytesStart, name: &str) -> String {
     e.attributes()
         .flatten()
-        .find(|a| a.key.as_ref() == name.as_bytes())
-        .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+        .find(|a| a.key.as_ref() == name)
+        .and_then(|a| {
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
+        })
         .unwrap_or_default()
 }
 
@@ -236,23 +240,32 @@ fn parse_get_hosts_response(body: &str) -> Result<Vec<HostRecord>, Dns01Error> {
     let mut reader = Reader::from_str(body);
     let mut hosts = Vec::new();
     let mut errors = Vec::new();
+    let mut error = String::new();
     let mut in_error = false;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(e)) if e.name().as_ref() == b"host" => hosts.push(HostRecord {
+            Ok(Event::Empty(e)) if e.name().as_ref() == "host" => hosts.push(HostRecord {
                 typ: xml_attr(&e, "Type"),
                 name: xml_attr(&e, "Name"),
                 address: xml_attr(&e, "Address"),
                 mx_pref: xml_attr(&e, "MXPref"),
                 ttl: xml_attr(&e, "TTL"),
             }),
-            Ok(Event::Start(e)) if e.name().as_ref() == b"Error" => in_error = true,
-            Ok(Event::End(e)) if e.name().as_ref() == b"Error" => in_error = false,
-            Ok(Event::Text(t)) if in_error => {
-                if let Ok(text) = t.unescape() {
-                    errors.push(text.into_owned());
+            Ok(Event::Start(e)) if e.name().as_ref() == "Error" => {
+                in_error = true;
+                error.clear();
+            }
+            Ok(Event::End(e)) if e.name().as_ref() == "Error" => {
+                in_error = false;
+                if !error.is_empty() {
+                    errors.push(std::mem::take(&mut error));
                 }
+            }
+            // Only text and entity events: a catch-all here would also swallow
+            // Eof inside an unterminated <Error> and loop forever.
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_error => {
+                error.extend(super::xml_text_piece(&ev))
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -279,20 +292,29 @@ fn parse_get_hosts_response(body: &str) -> Result<Vec<HostRecord>, Dns01Error> {
 fn parse_set_hosts_response(body: &str) -> Result<(), Dns01Error> {
     let mut reader = Reader::from_str(body);
     let mut errors = Vec::new();
+    let mut error = String::new();
     let mut in_error = false;
     let mut is_success = false;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(e)) if e.name().as_ref() == b"DomainDNSSetHostsResult" => {
+            Ok(Event::Empty(e)) if e.name().as_ref() == "DomainDNSSetHostsResult" => {
                 is_success = xml_attr(&e, "IsSuccess").eq_ignore_ascii_case("true");
             }
-            Ok(Event::Start(e)) if e.name().as_ref() == b"Error" => in_error = true,
-            Ok(Event::End(e)) if e.name().as_ref() == b"Error" => in_error = false,
-            Ok(Event::Text(t)) if in_error => {
-                if let Ok(text) = t.unescape() {
-                    errors.push(text.into_owned());
+            Ok(Event::Start(e)) if e.name().as_ref() == "Error" => {
+                in_error = true;
+                error.clear();
+            }
+            Ok(Event::End(e)) if e.name().as_ref() == "Error" => {
+                in_error = false;
+                if !error.is_empty() {
+                    errors.push(std::mem::take(&mut error));
                 }
+            }
+            // Only text and entity events: a catch-all here would also swallow
+            // Eof inside an unterminated <Error> and loop forever.
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_error => {
+                error.extend(super::xml_text_piece(&ev))
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -499,5 +521,26 @@ mod tests {
             .delete_txt_record(&zone, "_acme-challenge")
             .await
             .unwrap();
+    }
+
+    /// quick-xml 0.37+ reports entities as separate events; an error message
+    /// and an attribute holding them must still come back whole.
+    #[test]
+    fn entities_in_error_text_and_attributes_are_kept() {
+        let body = r#"<ApiResponse><Errors><Error Number="1">Bad &amp; wrong &#60;input&gt;</Error><Error>second</Error></Errors></ApiResponse>"#;
+        let err = parse_get_hosts_response(body).unwrap_err().to_string();
+        assert!(err.contains("Bad & wrong <input>"), "{err}");
+        assert!(err.contains("second"), "{err}");
+        let body = r#"<ApiResponse><CommandResponse><DomainDNSGetHostsResult><host Type="TXT" Name="_acme" Address="a&amp;b" MXPref="10" TTL="60"/></DomainDNSGetHostsResult></CommandResponse></ApiResponse>"#;
+        let hosts = parse_get_hosts_response(body).unwrap();
+        assert_eq!(hosts[0].address, "a&b");
+    }
+
+    /// A reply cut off inside an element must end the parse, not spin.
+    #[test]
+    fn truncated_xml_inside_an_error_ends() {
+        let body = "<ApiResponse><Errors><Error>cut off here";
+        assert!(parse_get_hosts_response(body).is_ok());
+        assert!(parse_set_hosts_response(body).is_err());
     }
 }

@@ -239,15 +239,29 @@ fn parse_list_hosted_zones_response(
     let mut found: Option<DnsZone> = None;
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) if e.name().as_ref() == b"Id" => in_id = true,
-            Ok(Event::End(e)) if e.name().as_ref() == b"Id" => in_id = false,
-            Ok(Event::Start(e)) if e.name().as_ref() == b"Name" => in_name = true,
-            Ok(Event::End(e)) if e.name().as_ref() == b"Name" => in_name = false,
-            Ok(Event::Text(t)) if in_id => current_id = t.unescape().ok().map(|s| s.into_owned()),
-            Ok(Event::Text(t)) if in_name => {
-                current_name = t.unescape().ok().map(|s| s.into_owned())
+            Ok(Event::Start(e)) if e.name().as_ref() == "Id" => {
+                in_id = true;
+                current_id = Some(String::new());
             }
-            Ok(Event::End(e)) if e.name().as_ref() == b"HostedZone" => {
+            Ok(Event::End(e)) if e.name().as_ref() == "Id" => in_id = false,
+            Ok(Event::Start(e)) if e.name().as_ref() == "Name" => {
+                in_name = true;
+                current_name = Some(String::new());
+            }
+            Ok(Event::End(e)) if e.name().as_ref() == "Name" => in_name = false,
+            // Only text and entity events, so Eof inside an unterminated
+            // element still reaches the break below.
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_id || in_name => {
+                let target = if in_id {
+                    &mut current_id
+                } else {
+                    &mut current_name
+                };
+                if let (Some(text), Some(piece)) = (target.as_mut(), super::xml_text_piece(&ev)) {
+                    text.push_str(&piece);
+                }
+            }
+            Ok(Event::End(e)) if e.name().as_ref() == "HostedZone" => {
                 if let (Some(id), Some(name)) = (current_id.take(), current_name.take()) {
                     let stripped_name = name.trim_end_matches('.').to_ascii_lowercase();
                     if found.is_none() && stripped_name == wanted {
@@ -281,12 +295,10 @@ fn route53_error_message(body: &str) -> String {
     let mut message = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) if e.name().as_ref() == b"Message" => in_message = true,
-            Ok(Event::End(e)) if e.name().as_ref() == b"Message" => in_message = false,
-            Ok(Event::Text(t)) if in_message => {
-                if let Ok(text) = t.unescape() {
-                    message.push_str(&text);
-                }
+            Ok(Event::Start(e)) if e.name().as_ref() == "Message" => in_message = true,
+            Ok(Event::End(e)) if e.name().as_ref() == "Message" => in_message = false,
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_message => {
+                message.extend(super::xml_text_piece(&ev))
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -475,5 +487,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn error_message_keeps_entities() {
+        let body = "<ErrorResponse><Error><Message>Invalid &quot;name&quot; &amp; value</Message></Error></ErrorResponse>";
+        assert_eq!(route53_error_message(body), r#"Invalid "name" & value"#);
+    }
+
+    #[test]
+    fn truncated_xml_inside_an_element_ends() {
+        assert_eq!(
+            route53_error_message("<ErrorResponse><Error><Message>cut off"),
+            "cut off"
+        );
+        let body = "<ListHostedZonesResponse><HostedZones><HostedZone><Id>/hostedzone/Z1";
+        assert!(
+            parse_list_hosted_zones_response(body, "example.com")
+                .unwrap()
+                .is_none()
+        );
     }
 }
