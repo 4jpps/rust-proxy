@@ -117,6 +117,30 @@ pub(crate) fn relative_record_name(fqdn: &str, zone_name: &str) -> String {
         .to_string()
 }
 
+/// The text one XML event contributes to an element's content: a text
+/// piece, or a resolved entity reference. quick-xml (0.37 on) reports
+/// `&amp;` and `&#38;` as separate `GeneralRef` events between the text
+/// pieces, so callers append every piece until the element ends. An
+/// unknown named entity is kept as written. `None` for any other event.
+pub(crate) fn xml_text_piece(event: &quick_xml::events::Event) -> Option<String> {
+    use quick_xml::events::Event;
+    match event {
+        Event::Text(t) => Some(t.xml10_content().into_owned()),
+        Event::GeneralRef(r) => Some(match r.resolve_char_ref() {
+            Ok(Some(c)) => c.to_string(),
+            _ => match r.as_ref() {
+                "amp" => "&".into(),
+                "lt" => "<".into(),
+                "gt" => ">".into(),
+                "quot" => "\"".into(),
+                "apos" => "'".into(),
+                other => format!("&{other};"),
+            },
+        }),
+        _ => None,
+    }
+}
+
 pub(crate) fn join_api_errors<'a>(messages: impl IntoIterator<Item = &'a str>) -> String {
     let joined = messages.into_iter().collect::<Vec<_>>().join("; ");
     if joined.is_empty() {
