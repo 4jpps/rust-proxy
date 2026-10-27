@@ -41,6 +41,7 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::put(update_port_rule).delete(delete_port_rule),
         )
         .route("/api/certs", get(list_certs).post(upload_cert))
+        .route("/api/certs/renew", post(renew_cert))
         .route("/api/certs/:domain", axum::routing::delete(delete_cert))
         .route("/api/me", get(get_me))
         .route("/api/me/password", post(change_my_password))
@@ -2301,6 +2302,81 @@ async fn upload_cert(
         not_after,
         days_remaining: (not_after - chrono::Utc::now()).num_days(),
     }))
+}
+
+#[derive(Deserialize)]
+struct RenewCertRequest {
+    domain: String,
+}
+
+/// Domains with a renewal running right now, so a double click (or two
+/// admins) can't start a second ACME order for the same name.
+static RENEWING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `POST /api/certs/renew {"domain"}`: renews an Auto-SSL certificate now
+/// instead of waiting for the renewal loop, and answers once it is issued
+/// or has failed. Works for an enabled site with ACME on and for a tracked
+/// standalone DNS-01 certificate; an uploaded certificate is refused.
+async fn renew_cert(
+    State(state): State<AppState>,
+    Json(body): Json<RenewCertRequest>,
+) -> Result<StatusCode, ApiError> {
+    let domain = body.domain.trim().to_ascii_lowercase();
+    let host = state
+        .hosts()
+        .iter()
+        .find(|h| h.enabled && h.acme_enabled && h.domain.eq_ignore_ascii_case(&domain))
+        .cloned();
+    let standalone = if host.is_none() {
+        crate::db::list_standalone_certs(state.db())
+            .await?
+            .into_iter()
+            .find(|c| c.domain.eq_ignore_ascii_case(&domain))
+    } else {
+        None
+    };
+    if host.is_none() && standalone.is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "{domain} isn't renewed by Auto-SSL (no enabled site with Auto-SSL on, and no tracked DNS-01 certificate), so upload a new certificate instead"
+        )));
+    }
+    if !RENEWING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(domain.clone())
+    {
+        return Err(ApiError::Conflict(format!(
+            "{domain} is already being renewed"
+        )));
+    }
+    let result = async {
+        let http = reqwest::Client::new();
+        let client = crate::acme::init_acme_client(&state).await?;
+        match (&host, &standalone) {
+            (Some(host), _) => crate::acme::issue_certificate(&state, &client, &http, host).await,
+            (None, Some(c)) => {
+                crate::acme::issue_standalone_dns01_certificate(
+                    &state,
+                    &client,
+                    &http,
+                    &c.domain,
+                    c.dns_credential_id,
+                    c.organization.clone(),
+                    c.organizational_unit.clone(),
+                )
+                .await
+            }
+            (None, None) => unreachable!("checked above"),
+        }
+    }
+    .await;
+    RENEWING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&domain);
+    result.map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_cert(
@@ -4766,6 +4842,54 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn renew_now_refuses_a_certificate_auto_ssl_does_not_manage() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+        let renew = |domain: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/certs/renew")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, cookie.clone())
+                .body(axum::body::Body::from(format!(
+                    r#"{{"domain":"{domain}"}}"#
+                )))
+                .unwrap()
+        };
+        // No site and no tracked DNS-01 certificate: nothing to renew.
+        let resp = router
+            .clone()
+            .oneshot(renew("uploaded.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_json(resp).await;
+        assert!(
+            msg["error"]
+                .as_str()
+                .unwrap()
+                .contains("upload a new certificate"),
+            "{msg}"
+        );
+        // A renewal already running for the domain is refused, not doubled.
+        assert!(RENEWING.lock().unwrap().insert("busy.example.com".into()));
+        let host: crate::config::ProxyHost = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "domain": "busy.example.com", "upstream": "127.0.0.1:9",
+            "enabled": true, "acme_enabled": true,
+        }))
+        .unwrap();
+        state.set_hosts(vec![host]);
+        let resp = router
+            .clone()
+            .oneshot(renew("Busy.Example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        RENEWING.lock().unwrap().remove("busy.example.com");
     }
 
     #[tokio::test]
