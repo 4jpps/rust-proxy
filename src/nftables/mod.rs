@@ -6,6 +6,7 @@
 //! live state.
 
 pub mod generator;
+pub mod passes;
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -94,7 +95,15 @@ pub async fn run_sync_loop(state: AppState) -> anyhow::Result<()> {
 
 async fn sync_once(state: &AppState) -> anyhow::Result<()> {
     let ruleset = build_ruleset(state).await?;
+    // The pass sets are declared by this ruleset, so they are refilled
+    // under the same lock right after it lands.
+    let mut sets = passes::lock().await;
     let result = apply(&ruleset).await;
+    if result.is_ok() {
+        sets.main = passes::declared(&ruleset);
+        passes::refill(state, &sets).await;
+    }
+    drop(sets);
     let prev = state.firewall_status();
     let now = Utc::now();
     state.set_firewall_status(match &result {
@@ -152,7 +161,10 @@ pub async fn build_ruleset_with(state: &AppState, overrides: &Overrides) -> anyh
     // Only AclKind::IpAllow contributes here (IpBlock lists are handled
     // separately below); a Login-kind list selected on a port rule is
     // silently ignored (see PortRule::acl_ids' doc comment).
+    // A rule restricted that way also accepts the live mobile passes of
+    // any IP-allow list selected on it that opens the firewall for them.
     let mut rule_allow_ips = std::collections::HashMap::new();
+    let mut rule_passes = std::collections::HashMap::new();
     for rule in port_rules
         .iter()
         .filter(|r| r.enabled && !r.acl_ids.is_empty())
@@ -160,6 +172,12 @@ pub async fn build_ruleset_with(state: &AppState, overrides: &Overrides) -> anyh
         let resolved = crate::db::resolve_acl_ids(state.db(), &rule.acl_ids).await?;
         if resolved.has_ip_allow_acl {
             rule_allow_ips.insert(rule.id, resolved.allow_ips);
+            let mut logins = resolved.firewall_mobile_login_lists;
+            logins.sort();
+            logins.dedup();
+            if state.mobile_pass_enabled() && !logins.is_empty() {
+                rule_passes.insert(rule.id, logins);
+            }
         }
     }
 
@@ -171,6 +189,7 @@ pub async fn build_ruleset_with(state: &AppState, overrides: &Overrides) -> anyh
     let mut blocks = generator::NftBlocks {
         global: index.global_nets().to_vec(),
         rule: std::collections::HashMap::new(),
+        passes: rule_passes,
     };
     for rule in port_rules
         .iter()

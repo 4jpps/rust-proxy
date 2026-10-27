@@ -10,7 +10,9 @@
 //! passes live in memory only, so no list of past IPs is ever kept.
 //!
 //! Off unless turned on in Settings (`mobile_pass_settings`); while off the path is a plain 404.
-//! Only the HTTP/HTTPS access check honors a pass, not the nftables firewall. Failed sign-ins are
+//! The HTTP/HTTPS access check always honors a pass. The nftables firewall (port rules and hosted
+//! ports) honors it only for an IP-allow list with "also open port rules" set, through timed
+//! nftables sets kept in step with this store (see `nftables::passes`). Failed sign-ins are
 //! limited per source IP and reported to the SIEM like the host login gate's.
 
 use std::collections::HashMap;
@@ -60,6 +62,9 @@ pub struct Pass {
 pub struct PassStore {
     passes: Mutex<Vec<Pass>>,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// Signalled on every grant or revoke, so the firewall's pass sets follow
+    /// (see `nftables::passes`).
+    changed: tokio::sync::Notify,
 }
 
 impl PassStore {
@@ -87,6 +92,14 @@ impl PassStore {
         });
         let extra = passes.len().saturating_sub(MAX_PASSES);
         passes.drain(..extra);
+        drop(passes);
+        self.changed.notify_one();
+    }
+
+    /// Resolves after the next grant or revoke (or at once if one happened
+    /// since the last wait).
+    pub async fn wait_for_change(&self) {
+        self.changed.notified().await;
     }
 
     /// Ends every pass this login holds for this device; how many there were.
@@ -96,7 +109,10 @@ impl PassStore {
         passes.retain(|p| {
             !(logins.contains(&p.login_list) && p.username == username && p.device == device)
         });
-        before - passes.len()
+        let ended = before - passes.len();
+        drop(passes);
+        self.changed.notify_one();
+        ended
     }
 
     /// Whether `ip` holds a fresh pass from any of `login_lists`.
@@ -124,6 +140,7 @@ impl PassStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.changed.notify_one();
     }
 
     /// Ends every pass granted under this Login list, e.g. because its credentials changed or it
@@ -133,6 +150,7 @@ impl PassStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|p| p.login_list != login_list);
+        self.changed.notify_one();
     }
 
     /// Takes one attempt slot for `ip` before its password is checked, so parallel guesses can't

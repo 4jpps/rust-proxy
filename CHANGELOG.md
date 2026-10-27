@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+- **Mobile passes can open port rules too.** An IP allow list that accepts
+  mobile passes has a new option, **Also open port rules and hosted
+  ports** (off by default). With it on, every port rule and hosted VM port
+  that uses the list (SSH, for example) also accepts a phone holding a
+  pass, from its current IP only. The IP is kept in an nftables set whose
+  entries expire with the 90-second pass, and it is removed at once when
+  the phone signs out or its IP changes. Connections a pass let in (an
+  open SSH session, say) are cut when the pass ends, not just new ones.
+
 ## [0.5.0] - 2026-10-27
 
 - **Every setting in the admin UI.** System > Server shows everything in

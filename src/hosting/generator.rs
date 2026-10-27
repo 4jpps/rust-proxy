@@ -13,15 +13,19 @@ use uuid::Uuid;
 
 use super::model::{Allocation, ForwardMode, PortSpec};
 use crate::config::Protocol;
+use crate::nftables::generator::PASS_CT_MARK;
 
 pub const TABLE: &str = "rust_proxy_hosting";
 
 /// IPv4 source networks to refuse for hosted addresses: `global` for every
-/// hosted VM, `acl` per block list, which a forwarded port can select.
+/// hosted VM, `acl` per block list, which a forwarded port can select. Also
+/// carries `passes`: per IP-allow list, the Login lists whose mobile passes
+/// it accepts at the firewall (`AclList::mobile_pass_firewall`).
 #[derive(Debug, Default, Clone)]
 pub struct HostingBlocks {
     pub global: Vec<Ipv4Net>,
     pub acl: HashMap<Uuid, Vec<Ipv4Net>>,
+    pub passes: HashMap<Uuid, Vec<Uuid>>,
 }
 
 fn net_set(nets: &[Ipv4Net]) -> String {
@@ -117,6 +121,20 @@ pub fn generate_ruleset_full(
     let _ = writeln!(out, "add table ip {TABLE}");
     let _ = writeln!(out, "delete table ip {TABLE}");
     let _ = writeln!(out, "table ip {TABLE} {{");
+    let mut pass_logins: Vec<Uuid> = blocks.passes.values().flatten().copied().collect();
+    pass_logins.sort();
+    pass_logins.dedup();
+    for login in &pass_logins {
+        let _ = writeln!(
+            out,
+            "    set {} {{ type ipv4_addr; flags timeout; }}",
+            crate::nftables::generator::pass_set_name(*login, false)
+        );
+    }
+
+    // Forward-chain lines that keep each pass-admitted connection alive only
+    // while the rule that admitted it still would (see `PASS_CT_MARK`).
+    let mut revalidate: Vec<String> = Vec::new();
 
     let _ = writeln!(out, "    chain prerouting {{");
     let _ = writeln!(
@@ -140,8 +158,12 @@ pub fn generate_ruleset_full(
                     groups.entry(key).or_default().push(p);
                 }
                 for (acls, specs) in &groups {
-                    let source = if acls.is_empty() {
-                        String::new()
+                    // Each source clause gets its own DNAT rule: the lists'
+                    // own networks, then each accepted Login list's live
+                    // mobile passes.
+                    // (match, pass set name if the match is a pass set)
+                    let sources: Vec<(String, Option<String>)> = if acls.is_empty() {
+                        vec![(String::new(), None)]
                     } else {
                         let mut nets: Vec<Ipv4Net> = acls
                             .iter()
@@ -149,11 +171,25 @@ pub fn generate_ruleset_full(
                             .collect();
                         nets.sort();
                         nets.dedup();
-                        if nets.is_empty() {
+                        let mut logins: Vec<Uuid> = acls
+                            .iter()
+                            .flat_map(|id| blocks.passes.get(id).into_iter().flatten().copied())
+                            .collect();
+                        logins.sort();
+                        logins.dedup();
+                        let mut sources = Vec::new();
+                        if !nets.is_empty() {
+                            let items: Vec<String> = nets.iter().map(Ipv4Net::to_string).collect();
+                            sources.push((format!("ip saddr {{ {} }} ", items.join(", ")), None));
+                        }
+                        for login in logins {
+                            let set = crate::nftables::generator::pass_set_name(login, false);
+                            sources.push((format!("ip saddr @{set} "), Some(set)));
+                        }
+                        if sources.is_empty() {
                             continue;
                         }
-                        let items: Vec<String> = nets.iter().map(Ipv4Net::to_string).collect();
-                        format!("ip saddr {{ {} }} ", items.join(", "))
+                        sources
                     };
                     let mut blocked: Vec<Ipv4Net> = acls
                         .iter()
@@ -183,10 +219,30 @@ pub fn generate_ruleset_full(
                                 Some(vp) => format!("{vm}:{vp}"),
                                 None => vm.to_string(),
                             };
-                            let _ = writeln!(
-                                out,
-                                "        ip daddr {public} {source}{name} dport {set} dnat to {to}"
-                            );
+                            for (source, pass_set) in &sources {
+                                // The mark goes after every match, so only a
+                                // connection this rule really admits gets it.
+                                let mark = if pass_set.is_some() {
+                                    format!("ct mark set {PASS_CT_MARK} ")
+                                } else {
+                                    String::new()
+                                };
+                                let _ = writeln!(
+                                    out,
+                                    "        ip daddr {public} {source}{name} dport {set} {mark}dnat to {to}"
+                                );
+                                if let Some(pass_set) = pass_set {
+                                    // After DNAT the packet is addressed to the
+                                    // VM, on the translated port if there is one.
+                                    let vm_ports = match vm_port {
+                                        Some(vp) => vp.to_string(),
+                                        None => set.clone(),
+                                    };
+                                    revalidate.push(format!(
+                                        "ct direction original ct mark {PASS_CT_MARK} ip daddr {vm} ip saddr @{pass_set} {name} dport {vm_ports} accept"
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -254,6 +310,13 @@ pub fn generate_ruleset_full(
             out,
             "        ip saddr {} ip daddr {{ {PRIVATE_NETS} }} ct state new drop",
             ip_set(&vms)
+        );
+        for line in &revalidate {
+            let _ = writeln!(out, "        {line}");
+        }
+        let _ = writeln!(
+            out,
+            "        ct direction original ct mark {PASS_CT_MARK} drop"
         );
     }
     let _ = writeln!(out, "    }}");
@@ -538,6 +601,7 @@ mod tests {
         let blocks = HostingBlocks {
             global: vec!["203.0.113.0/24".parse().unwrap()],
             acl: HashMap::new(),
+            passes: HashMap::new(),
         };
         let a = alloc(
             "204.52.221.226",
@@ -641,5 +705,57 @@ mod tests {
                 "own sshd stays shut: {out}"
             );
         }
+    }
+
+    #[test]
+    fn acl_restricted_port_also_forwards_for_mobile_passes() {
+        let (acl, login) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut ssh = spec(Protocol::Tcp, 22, 22);
+        ssh.acl_ids = vec![acl];
+        let a = alloc(
+            "44.30.51.254",
+            Some("100.64.244.254"),
+            ForwardMode::Ports,
+            vec![ssh],
+        );
+        let set = crate::nftables::generator::pass_set_name(login, false);
+        let blocks = HostingBlocks {
+            passes: HashMap::from([(acl, vec![login])]),
+            ..Default::default()
+        };
+        // With the list's own networks and passes: one DNAT rule for each.
+        let sources = HashMap::from([(acl, vec!["172.16.0.0/16".parse().unwrap()])]);
+        let out = generate_ruleset_full(std::slice::from_ref(&a), &[], &sources, &blocks);
+        assert!(
+            out.contains(&format!(
+                "    set {set} {{ type ipv4_addr; flags timeout; }}\n"
+            )),
+            "{out}"
+        );
+        assert!(out.contains("ip daddr 44.30.51.254 ip saddr { 172.16.0.0/16 } tcp dport { 22 } dnat to 100.64.244.254\n"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "ip daddr 44.30.51.254 ip saddr @{set} tcp dport {{ 22 }} ct mark set {} dnat to 100.64.244.254\n",
+                crate::nftables::generator::PASS_CT_MARK
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "ct direction original ct mark {0} ip daddr 100.64.244.254 ip saddr @{set} tcp dport {{ 22 }} accept\n        ct direction original ct mark {0} drop\n",
+                crate::nftables::generator::PASS_CT_MARK
+            )),
+            "{out}"
+        );
+        // A list with no entries of its own still forwards for pass holders, and only them.
+        let out = generate_ruleset_full(std::slice::from_ref(&a), &[], &HashMap::new(), &blocks);
+        assert_eq!(out.matches("dnat to").count(), 1, "{out}");
+        assert!(
+            out.contains(&format!(
+                "ip saddr @{set} tcp dport {{ 22 }} ct mark set {} dnat",
+                crate::nftables::generator::PASS_CT_MARK
+            )),
+            "{out}"
+        );
     }
 }

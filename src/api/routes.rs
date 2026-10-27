@@ -1300,6 +1300,8 @@ struct AclListSummary {
     global: bool,
     /// IP-allow lists: the Login list accepted for mobile passes, if any.
     mobile_login_acl_id: Option<Uuid>,
+    /// IP-allow lists: whether passes also open its port rules and hosted ports.
+    mobile_pass_firewall: bool,
 }
 
 #[derive(Deserialize)]
@@ -1341,6 +1343,7 @@ async fn list_acls(State(state): State<AppState>) -> Result<Json<Vec<AclListSumm
                 created_at: a.created_at,
                 global: a.global,
                 mobile_login_acl_id: a.mobile_login_acl_id,
+                mobile_pass_firewall: a.mobile_pass_firewall,
             })
             .collect(),
     ))
@@ -1435,6 +1438,7 @@ async fn create_acl_list(
         created_at,
         global: false,
         mobile_login_acl_id: None,
+        mobile_pass_firewall: false,
     }))
 }
 
@@ -1474,6 +1478,8 @@ struct AclListDetail {
     global: bool,
     /// IP-allow lists: the Login list accepted for mobile passes, if any.
     mobile_login_acl_id: Option<Uuid>,
+    /// IP-allow lists: whether passes also open its port rules and hosted ports.
+    mobile_pass_firewall: bool,
     /// Prefix-fetch state for each `AS<n>` entry (block lists only).
     asn_status: Vec<crate::db::AsnStatus>,
 }
@@ -1483,6 +1489,10 @@ struct SetMobileLoginRequest {
     /// The Login list whose credentials may hold a mobile pass for this
     /// IP-allow list; `null` unlinks it.
     login_acl_id: Option<Uuid>,
+    /// Whether passes also open the firewall for the port rules and hosted
+    /// ports that select this list. Left out, the setting is unchanged.
+    #[serde(default)]
+    firewall: Option<bool>,
 }
 
 /// Links an IP-allow list to a Login list for mobile passes (see
@@ -1511,6 +1521,11 @@ async fn set_acl_mobile_login(
         }
     }
     crate::db::set_acl_mobile_login(state.db(), id, body.login_acl_id).await?;
+    if let Some(on) = body.firewall {
+        crate::db::set_acl_mobile_pass_firewall(state.db(), id, on).await?;
+    }
+    // Port rules and hosted ports selecting this list gain or lose their pass sets.
+    state.notify_config_change();
     // The login list this allow list stops accepting (or is switched away from) loses its passes;
     // phones still entitled through another allow list get them back at their next check-in.
     if let Some(prev) = list.mobile_login_acl_id
@@ -1586,6 +1601,8 @@ async fn put_mobile_pass(
     if !body.enabled {
         state.mobile_passes().clear();
     }
+    // The firewall's pass rules exist only while mobile passes are on.
+    state.notify_config_change();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1657,6 +1674,7 @@ async fn get_acl_list_detail(
         client_cert_entries,
         global: list.global,
         mobile_login_acl_id: list.mobile_login_acl_id,
+        mobile_pass_firewall: list.mobile_pass_firewall,
         asn_status,
     }))
 }
@@ -4825,6 +4843,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.mobile_login_lists, vec![login_uuid]);
+        // Passes open websites only until the firewall option is ticked; a later
+        // change of login list alone leaves the option as it was.
+        assert!(resolved.firewall_mobile_login_lists.is_empty());
+        assert_eq!(detail["mobile_pass_firewall"], false);
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{allow_id}/mobile-login"),
+            format!(r#"{{"login_acl_id":"{login_id}","firewall":true}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = call(
+            "PUT",
+            format!("/api/acls/{allow_id}/mobile-login"),
+            format!(r#"{{"login_acl_id":"{login_id}"}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let detail =
+            body_json(call("GET", format!("/api/acls/{allow_id}"), String::new()).await).await;
+        assert_eq!(detail["mobile_pass_firewall"], true);
+        let resolved = crate::db::resolve_acl_ids(state.db(), &[allow_uuid])
+            .await
+            .unwrap();
+        assert_eq!(resolved.firewall_mobile_login_lists, vec![login_uuid]);
         let pass_logins = crate::db::mobile_pass_logins(state.db()).await.unwrap();
         assert_eq!(pass_logins.len(), 1);
         assert!(crate::proxy::login::verify_credentials_any(

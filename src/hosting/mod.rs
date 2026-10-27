@@ -129,6 +129,8 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
     }
     let mut acl_sources: std::collections::HashMap<Uuid, Vec<Ipv4Net>> =
         std::collections::HashMap::new();
+    let mut pass_logins: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        std::collections::HashMap::new();
     for acl_id in allocations
         .iter()
         .filter(|a| a.is_active())
@@ -137,6 +139,9 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
     {
         let resolved = crate::db::resolve_acl_ids(state.db(), &[acl_id]).await?;
         if resolved.has_ip_allow_acl {
+            if state.mobile_pass_enabled() && !resolved.firewall_mobile_login_lists.is_empty() {
+                pass_logins.insert(acl_id, resolved.firewall_mobile_login_lists.clone());
+            }
             let nets = resolved
                 .allow_ips
                 .into_iter()
@@ -159,6 +164,7 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
     };
     let mut blocks = generator::HostingBlocks {
         global: v4(index.global_nets()),
+        passes: pass_logins,
         ..Default::default()
     };
     for acl_id in allocations
@@ -172,13 +178,15 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
             blocks.acl.insert(acl_id, nets);
         }
     }
-    apply_ruleset(&generator::generate_ruleset_full(
-        &allocations,
-        &proxy_served,
-        &acl_sources,
-        &blocks,
-    ))
-    .await?;
+    // Recreating the table empties its pass sets; refill them under the
+    // same lock as the apply (see `nftables::passes`).
+    let ruleset =
+        generator::generate_ruleset_full(&allocations, &proxy_served, &acl_sources, &blocks);
+    let mut sets = crate::nftables::passes::lock().await;
+    apply_ruleset(&ruleset).await?;
+    sets.hosting = crate::nftables::passes::declared(&ruleset);
+    crate::nftables::passes::refill(state, &sets).await;
+    drop(sets);
     EVER_APPLIED.store(true, Ordering::Relaxed);
     for ip in &remove {
         run_checked("ip", &["addr", "del", &format!("{ip}/32"), "dev", "lo"]).await?;

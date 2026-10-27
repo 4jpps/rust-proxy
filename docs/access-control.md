@@ -78,8 +78,16 @@ What a pass is, exactly:
   carrier's customers (carrier-grade NAT), and the same goes for hotel
   or café Wi-Fi. Use mobile passes for sites that still ask for their own
   password (a dashboard, an admin page), not as their only protection.
-- **Website access only.** A pass satisfies a site's IP allow check, not
-  the firewall's port rules or block lists. A blocked IP stays blocked.
+- **Websites, and optionally ports.** A pass always satisfies a site's IP
+  allow check. To let it through the firewall too, tick **Also open port
+  rules and hosted ports** on the allow list. Every port rule and hosted VM
+  port that uses the list (SSH, for example) then also accepts the phone's
+  current IP, through an nftables set whose entries expire with the pass.
+  When the pass ends (sign-out, a new IP or expiry), connections it let in
+  are cut too, not just new ones refused.
+  Off by default. The same shared-address caution applies, and matters
+  more for a port with no password of its own. Block lists still win: a
+  blocked IP stays blocked.
 
 The app checks in at `https://<any site on this proxy>/.rust-proxy/mobile-pass`
 (`POST {"username","password","device"}` signs in, `DELETE` with the same
@@ -232,7 +240,9 @@ it from every host first.
 ## Port rules
 
 A port rule (TCP/UDP passthrough) can also select ACLs, but only IP-allow
-and IP-block lists have any effect there. A block list drops that rule's
+and IP-block lists have any effect there. An allow list that accepts
+mobile passes with **Also open port rules and hosted ports** ticked also
+lets those phones in. A block list drops that rule's
 traffic from the listed sources in the firewall. A login list is accepted but contributes
 nothing, because passthrough has no HTTP layer to show a login page on.
 Passthrough produces no application-level events either.

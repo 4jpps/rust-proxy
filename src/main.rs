@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         api::run(state.clone()),
         nftables::run_sync_loop(state.clone()),
         hosting::run_sync_loop(state.clone()),
+        nftables::passes::run(state.clone()),
         acme::run_renewal_loop(state.clone()),
     )?;
 
