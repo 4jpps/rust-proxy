@@ -306,6 +306,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE acl_lists ADD COLUMN mobile_login_acl_id TEXT")
         .execute(pool)
         .await;
+    // IP-allow list: whether its mobile passes also open the port rules and
+    // hosted ports that select it, at the firewall (off until set).
+    let _ = sqlx::query(
+        "ALTER TABLE acl_lists ADD COLUMN mobile_pass_firewall INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
     // Single row: whether mobile passes are turned on (off until set).
     sqlx::query(
         r#"
@@ -1304,7 +1311,7 @@ pub struct AclClientCertEntry {
 
 pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>, sqlx::Error> {
     let row =
-        sqlx::query("SELECT id, name, kind, created_at, global_block, mobile_login_acl_id FROM acl_lists WHERE id = ?")
+        sqlx::query("SELECT id, name, kind, created_at, global_block, mobile_login_acl_id, mobile_pass_firewall FROM acl_lists WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(pool)
             .await?;
@@ -1317,6 +1324,7 @@ pub async fn get_acl_list(pool: &SqlitePool, id: Uuid) -> Result<Option<AclList>
             .unwrap_or_else(|_| Utc::now()),
         global: row.get::<i64, _>("global_block") != 0,
         mobile_login_acl_id: mobile_login_of(&row),
+        mobile_pass_firewall: row.get::<i64, _>("mobile_pass_firewall") != 0,
     }))
 }
 
@@ -1555,7 +1563,7 @@ pub async fn delete_acl_client_cert_entry(
 
 pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, name, kind, created_at, global_block, mobile_login_acl_id FROM acl_lists ORDER BY created_at ASC",
+        "SELECT id, name, kind, created_at, global_block, mobile_login_acl_id, mobile_pass_firewall FROM acl_lists ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -1570,6 +1578,7 @@ pub async fn list_acl_lists(pool: &SqlitePool) -> Result<Vec<AclList>, sqlx::Err
                     .unwrap_or_else(|_| Utc::now()),
                 global: row.get::<i64, _>("global_block") != 0,
                 mobile_login_acl_id: mobile_login_of(&row),
+                mobile_pass_firewall: row.get::<i64, _>("mobile_pass_firewall") != 0,
             })
         })
         .collect()
@@ -1589,6 +1598,21 @@ pub async fn set_acl_mobile_login(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("UPDATE acl_lists SET mobile_login_acl_id = ? WHERE id = ?")
         .bind(login_acl_id.map(|u| u.to_string()))
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Sets whether an IP-allow list's mobile passes also open the port rules and
+/// hosted ports that select it. False when the list doesn't exist.
+pub async fn set_acl_mobile_pass_firewall(
+    pool: &SqlitePool,
+    id: Uuid,
+    on: bool,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE acl_lists SET mobile_pass_firewall = ? WHERE id = ?")
+        .bind(i64::from(on))
         .bind(id.to_string())
         .execute(pool)
         .await?;
@@ -1839,6 +1863,9 @@ pub struct ResolvedAcls {
     /// Login lists whose mobile passes count as inside the selected
     /// IP-allow lists (see `proxy::mobile_pass`).
     pub mobile_login_lists: Vec<Uuid>,
+    /// The subset of `mobile_login_lists` whose IP-allow list also opens
+    /// the firewall for passes (`AclList::mobile_pass_firewall`).
+    pub firewall_mobile_login_lists: Vec<Uuid>,
 }
 
 pub async fn resolve_acl_ids(
@@ -1862,14 +1889,18 @@ pub async fn resolve_acl_ids(
         match acl_kind_from_str(&list_row.get::<String, _>("kind")) {
             AclKind::IpAllow => {
                 resolved.has_ip_allow_acl = true;
-                if let Ok(Some(row)) =
-                    sqlx::query("SELECT mobile_login_acl_id FROM acl_lists WHERE id = ?")
-                        .bind(acl_id.to_string())
-                        .fetch_optional(pool)
-                        .await
+                if let Ok(Some(row)) = sqlx::query(
+                    "SELECT mobile_login_acl_id, mobile_pass_firewall FROM acl_lists WHERE id = ?",
+                )
+                .bind(acl_id.to_string())
+                .fetch_optional(pool)
+                .await
                     && let Some(login) = mobile_login_of(&row)
                 {
                     resolved.mobile_login_lists.push(login);
+                    if row.get::<i64, _>("mobile_pass_firewall") != 0 {
+                        resolved.firewall_mobile_login_lists.push(login);
+                    }
                 }
                 let rows = sqlx::query("SELECT cidr FROM acl_ip_entries WHERE acl_list_id = ?")
                     .bind(acl_id.to_string())

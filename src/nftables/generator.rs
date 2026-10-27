@@ -34,11 +34,30 @@ use crate::config::{
 };
 
 /// Source networks to drop at the firewall: `global` for every packet, and
-/// `rule` per port rule (from `IpBlock` lists selected on it).
+/// `rule` per port rule (from `IpBlock` lists selected on it). Also carries
+/// `passes`: per port rule, the Login lists whose mobile passes it accepts
+/// (from IP-allow lists with `mobile_pass_firewall` set).
 #[derive(Debug, Default, Clone)]
 pub struct NftBlocks {
     pub global: Vec<IpNet>,
     pub rule: HashMap<Uuid, Vec<IpNet>>,
+    pub passes: HashMap<Uuid, Vec<Uuid>>,
+}
+
+/// The nftables set holding the IPs of `login_list`'s live mobile passes,
+/// one per address family. Elements carry their own timeout, so a pass
+/// lapses in the kernel on the same schedule as in `PassStore`.
+pub fn pass_set_name(login_list: Uuid, v6: bool) -> String {
+    format!("mp{}_{}", if v6 { 6 } else { 4 }, login_list.simple())
+}
+
+/// Every Login list some port rule takes passes from, sorted: the sets the
+/// ruleset declares.
+pub fn pass_set_logins(blocks: &NftBlocks) -> Vec<Uuid> {
+    let mut logins: Vec<Uuid> = blocks.passes.values().flatten().copied().collect();
+    logins.sort();
+    logins.dedup();
+    logins
 }
 
 pub const TABLE_NAME: &str = "rust_proxy";
@@ -89,6 +108,18 @@ pub fn generate_ruleset(
     let _ = writeln!(out, "add table inet {TABLE_NAME}");
     let _ = writeln!(out, "flush table inet {TABLE_NAME}");
     let _ = writeln!(out, "table inet {TABLE_NAME} {{");
+    for login in pass_set_logins(blocks) {
+        let _ = writeln!(
+            out,
+            "    set {} {{ type ipv4_addr; flags timeout; }}",
+            pass_set_name(login, false)
+        );
+        let _ = writeln!(
+            out,
+            "    set {} {{ type ipv6_addr; flags timeout; }}",
+            pass_set_name(login, true)
+        );
+    }
     let _ = writeln!(out, "    chain inbound {{");
     let _ = writeln!(
         out,
@@ -116,7 +147,13 @@ pub fn generate_ruleset(
             write_host_rules(&mut out, host, &on_dedicated);
         }
         for rule in port_rules.iter().filter(|r| r.enabled) {
-            write_port_rule(&mut out, rule, rule_allow_ips.get(&rule.id), &on_dedicated);
+            write_port_rule(
+                &mut out,
+                rule,
+                rule_allow_ips.get(&rule.id),
+                pass_logins(blocks, rule),
+                &on_dedicated,
+            );
         }
         write_dedicated_drop(&mut out, dedicated_ips);
     }
@@ -130,7 +167,13 @@ pub fn generate_ruleset(
     }
 
     for rule in port_rules.iter().filter(|r| r.enabled) {
-        write_port_rule(&mut out, rule, rule_allow_ips.get(&rule.id), &elsewhere);
+        write_port_rule(
+            &mut out,
+            rule,
+            rule_allow_ips.get(&rule.id),
+            pass_logins(blocks, rule),
+            &elsewhere,
+        );
     }
 
     let _ = writeln!(out, "    }}");
@@ -396,10 +439,15 @@ fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) ->
     let _ = writeln!(out);
 }
 
+fn pass_logins<'a>(blocks: &'a NftBlocks, rule: &PortRule) -> &'a [Uuid] {
+    blocks.passes.get(&rule.id).map_or(&[], Vec::as_slice)
+}
+
 fn write_port_rule(
     out: &mut String,
     rule: &PortRule,
     allow_ips: Option<&Vec<IpNet>>,
+    pass_logins: &[Uuid],
     keep: &dyn Fn(IpAddr) -> bool,
 ) {
     let bind_ips: Vec<IpAddr> = port_rule_bind_ips(rule)
@@ -439,6 +487,16 @@ fn write_port_rule(
                 // bind's family -- deliberately no accept rule for it
                 // (default-DROP blocks it), same reasoning as the admin
                 // rule's identical case.
+                // A phone holding a pass from an accepted Login list is let
+                // in from its current IP, whatever the list's own entries.
+                let keyword = if bind_ip.is_ipv4() { "ip" } else { "ip6" };
+                for login in pass_logins {
+                    let _ = writeln!(
+                        out,
+                        "        {proto} dport {port_expr} {daddr}{keyword} saddr @{} accept",
+                        pass_set_name(*login, bind_ip.is_ipv6())
+                    );
+                }
             }
             None => {
                 let _ = writeln!(out, "        {proto} dport {port_expr} {daddr}accept");
@@ -589,6 +647,7 @@ mod tests {
                 "2001:db8::/32".parse().unwrap(),
             ],
             rule: HashMap::new(),
+            passes: HashMap::new(),
         };
         let out = generate_ruleset(&[], &[], &admin(), true, &HashMap::new(), &[], &[], &blocks);
         let drop4 = out
@@ -1088,6 +1147,80 @@ mod tests {
         );
     }
 
+    /// A rule whose IP-allow list opens the firewall for mobile passes also
+    /// accepts that list's pass set, per family, and the set is declared.
+    #[test]
+    fn port_rule_accepts_mobile_passes_when_its_list_opens_the_firewall() {
+        let rule = port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh");
+        let mut v6 = port_rule("10.0.0.4", 22, 22, Protocol::Tcp, "ssh v6");
+        v6.bind_ip_v4 = None;
+        v6.bind_ip_v6 = Some("2001:db8::3".parse().unwrap());
+        let login = Uuid::new_v4();
+        let mut rule_allow_ips = HashMap::new();
+        rule_allow_ips.insert(rule.id, vec!["192.168.1.0/24".parse().unwrap()]);
+        rule_allow_ips.insert(v6.id, vec![]);
+        let blocks = NftBlocks {
+            passes: HashMap::from([(rule.id, vec![login]), (v6.id, vec![login])]),
+            ..Default::default()
+        };
+        let out = generate_ruleset(
+            &[],
+            &[rule, v6],
+            &admin(),
+            true,
+            &rule_allow_ips,
+            &[],
+            &[],
+            &blocks,
+        );
+        let (s4, s6) = (pass_set_name(login, false), pass_set_name(login, true));
+        assert!(
+            out.contains(&format!(
+                "    set {s4} {{ type ipv4_addr; flags timeout; }}"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "    set {s6} {{ type ipv6_addr; flags timeout; }}"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("tcp dport 22 ip daddr 10.0.0.3 ip saddr { 192.168.1.0/24 } accept"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "tcp dport 22 ip daddr 10.0.0.3 ip saddr @{s4} accept"
+            )),
+            "{out}"
+        );
+        // No v6 entries of its own: only pass holders get in.
+        assert!(
+            out.contains(&format!(
+                "tcp dport 22 ip6 daddr 2001:db8::3 ip6 saddr @{s6} accept"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("ip6 daddr 2001:db8::3 accept"), "{out}");
+        // Without the option nothing about passes appears.
+        let plain = generate_ruleset(
+            &[],
+            &[port_rule("10.0.0.3", 22, 22, Protocol::Tcp, "ssh")],
+            &admin(),
+            true,
+            &HashMap::new(),
+            &[],
+            &[],
+            &NftBlocks::default(),
+        );
+        assert!(
+            !plain.contains("mp4_") && !plain.contains("set "),
+            "{plain}"
+        );
+    }
+
     /// A port rule absent from the map (no IP-allow ACL selected) is
     /// unrestricted, exactly as before this feature existed.
     #[test]
@@ -1408,6 +1541,7 @@ mod tests {
                         .map(|(a, p)| IpNet::new(IpAddr::from(std::net::Ipv4Addr::from(a)), p).unwrap().trunc())
                         .collect(),
                     rule: HashMap::new(),
+                    passes: HashMap::new(),
                 }
             }
         }

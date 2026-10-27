@@ -1072,6 +1072,11 @@ pub struct AclList {
     /// and mobile passes are turned on in Settings.
     #[serde(default)]
     pub mobile_login_acl_id: Option<Uuid>,
+    /// Only meaningful with `mobile_login_acl_id` set: a pass also opens the
+    /// firewall for the port rules and hosted ports that select this list,
+    /// not just its HTTP/HTTPS hosts.
+    #[serde(default)]
+    pub mobile_pass_firewall: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
