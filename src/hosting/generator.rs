@@ -178,8 +178,9 @@ pub fn generate_ruleset_full(
                         }
                         for login in logins {
                             sources.push(format!(
-                                "ip saddr @{} ",
-                                crate::nftables::generator::pass_set_name(login, false)
+                                "ip saddr @{} ct mark set {} ",
+                                crate::nftables::generator::pass_set_name(login, false),
+                                crate::nftables::generator::PASS_CT_MARK
                             ));
                         }
                         if sources.is_empty() {
@@ -274,6 +275,13 @@ pub fn generate_ruleset_full(
         out,
         "        type filter hook forward priority -10; policy accept;"
     );
+    // A forwarded connection a mobile pass let in ends with the pass (see
+    // `nftables::generator::PASS_CT_MARK`).
+    if !active.is_empty() {
+        for rule in crate::nftables::generator::pass_revocation_rules(&pass_logins, "ip") {
+            let _ = writeln!(out, "        {rule}");
+        }
+    }
     if !active.is_empty() {
         let vms: Vec<Ipv4Addr> = active.iter().filter_map(|a| a.vm_ip).collect();
         if !blocks.global.is_empty() && !vms.is_empty() {
@@ -706,7 +714,15 @@ mod tests {
         assert!(out.contains("ip daddr 44.30.51.254 ip saddr { 172.16.0.0/16 } tcp dport { 22 } dnat to 100.64.244.254\n"), "{out}");
         assert!(
             out.contains(&format!(
-                "ip daddr 44.30.51.254 ip saddr @{set} tcp dport {{ 22 }} dnat to 100.64.244.254\n"
+                "ip daddr 44.30.51.254 ip saddr @{set} ct mark set {} tcp dport {{ 22 }} dnat to 100.64.244.254\n",
+                crate::nftables::generator::PASS_CT_MARK
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "ct direction original ct mark {} ip saddr != @{set} drop",
+                crate::nftables::generator::PASS_CT_MARK
             )),
             "{out}"
         );
@@ -714,7 +730,10 @@ mod tests {
         let out = generate_ruleset_full(std::slice::from_ref(&a), &[], &HashMap::new(), &blocks);
         assert_eq!(out.matches("dnat to").count(), 1, "{out}");
         assert!(
-            out.contains(&format!("ip saddr @{set} tcp dport {{ 22 }} dnat")),
+            out.contains(&format!(
+                "ip saddr @{set} ct mark set {} tcp dport {{ 22 }} dnat",
+                crate::nftables::generator::PASS_CT_MARK
+            )),
             "{out}"
         );
     }

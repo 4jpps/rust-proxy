@@ -83,6 +83,8 @@ What a pass is, exactly:
   rules and hosted ports** on the allow list. Every port rule and hosted VM
   port that uses the list (SSH, for example) then also accepts the phone's
   current IP, through an nftables set whose entries expire with the pass.
+  When the pass ends (sign-out, a new IP or expiry), connections it let in
+  are cut too, not just new ones refused.
   Off by default. The same shared-address caution applies, and matters
   more for a port with no password of its own. Block lists still win: a
   blocked IP stays blocked.

@@ -8,7 +8,8 @@
   that uses the list (SSH, for example) also accepts a phone holding a
   pass, from its current IP only. The IP is kept in an nftables set whose
   entries expire with the 90-second pass, and it is removed at once when
-  the phone signs out or its IP changes.
+  the phone signs out or its IP changes. Connections a pass let in (an
+  open SSH session, say) are cut when the pass ends, not just new ones.
 
 ## [0.5.0] - 2026-10-27
 

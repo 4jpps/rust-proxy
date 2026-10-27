@@ -51,6 +51,40 @@ pub fn pass_set_name(login_list: Uuid, v6: bool) -> String {
     format!("mp{}_{}", if v6 { 6 } else { 4 }, login_list.simple())
 }
 
+/// Conntrack mark on a connection a mobile pass let in. The accept that
+/// admits it through a pass set sets the mark; a marked connection whose
+/// source is no longer in any pass set is dropped before the
+/// established-connection accept, so signing out, a new IP or expiry ends
+/// open sessions too, not just new connections. Shared with the hosting table.
+pub const PASS_CT_MARK: &str = "0x6d706173";
+
+/// The rules that end pass-admitted connections once their pass is gone,
+/// for the sets of `logins` in `table_family` ("inet" also covers IPv6).
+/// With no pass sets left, every pass-admitted connection is dropped.
+pub fn pass_revocation_rules(logins: &[Uuid], table_family: &str) -> Vec<String> {
+    if logins.is_empty() {
+        return vec![format!("ct direction original ct mark {PASS_CT_MARK} drop")];
+    }
+    let not_in = |v6: bool| -> String {
+        let keyword = if v6 { "ip6" } else { "ip" };
+        logins
+            .iter()
+            .map(|l| format!("{keyword} saddr != @{} ", pass_set_name(*l, v6)))
+            .collect()
+    };
+    let mut rules = vec![format!(
+        "ct direction original ct mark {PASS_CT_MARK} {}drop",
+        not_in(false)
+    )];
+    if table_family == "inet" {
+        rules.push(format!(
+            "ct direction original ct mark {PASS_CT_MARK} {}drop",
+            not_in(true)
+        ));
+    }
+    rules
+}
+
 /// Every Login list some port rule takes passes from, sorted: the sets the
 /// ruleset declares.
 pub fn pass_set_logins(blocks: &NftBlocks) -> Vec<Uuid> {
@@ -128,6 +162,9 @@ pub fn generate_ruleset(
     let _ = writeln!(out);
     let _ = writeln!(out, "        iif \"lo\" accept");
     write_block_rules(&mut out, port_rules, blocks);
+    for rule in pass_revocation_rules(&pass_set_logins(blocks), "inet") {
+        let _ = writeln!(out, "        {rule}");
+    }
     let _ = writeln!(out, "        ct state established,related accept");
     let _ = writeln!(
         out,
@@ -493,7 +530,7 @@ fn write_port_rule(
                 for login in pass_logins {
                     let _ = writeln!(
                         out,
-                        "        {proto} dport {port_expr} {daddr}{keyword} saddr @{} accept",
+                        "        {proto} dport {port_expr} {daddr}{keyword} saddr @{} ct mark set {PASS_CT_MARK} accept",
                         pass_set_name(*login, bind_ip.is_ipv6())
                     );
                 }
@@ -1192,18 +1229,25 @@ mod tests {
         );
         assert!(
             out.contains(&format!(
-                "tcp dport 22 ip daddr 10.0.0.3 ip saddr @{s4} accept"
+                "tcp dport 22 ip daddr 10.0.0.3 ip saddr @{s4} ct mark set {PASS_CT_MARK} accept"
             )),
             "{out}"
         );
         // No v6 entries of its own: only pass holders get in.
         assert!(
             out.contains(&format!(
-                "tcp dport 22 ip6 daddr 2001:db8::3 ip6 saddr @{s6} accept"
+                "tcp dport 22 ip6 daddr 2001:db8::3 ip6 saddr @{s6} ct mark set {PASS_CT_MARK} accept"
             )),
             "{out}"
         );
         assert!(!out.contains("ip6 daddr 2001:db8::3 accept"), "{out}");
+        // An open connection is cut once its source leaves the pass set, and
+        // that check comes before established connections are accepted.
+        let cut4 = format!("ct direction original ct mark {PASS_CT_MARK} ip saddr != @{s4} drop");
+        let cut6 = format!("ct direction original ct mark {PASS_CT_MARK} ip6 saddr != @{s6} drop");
+        let established = out.find("ct state established,related accept").unwrap();
+        assert!(out.find(&cut4).is_some_and(|i| i < established), "{out}");
+        assert!(out.find(&cut6).is_some_and(|i| i < established), "{out}");
         // Without the option nothing about passes appears.
         let plain = generate_ruleset(
             &[],
@@ -1557,7 +1601,11 @@ mod tests {
                                                blocks in arb_blocks()) {
                 let out = render(&hosts, &rules, &blocks);
                 let mut plain_hosts = hosts.clone();
-                plain_hosts.iter_mut().for_each(|h| h.domain = "x".into());
+                // A wildcard can't use http-01, so whether port 80 opens
+                // depends on it; keep that one property of the domain.
+                plain_hosts.iter_mut().for_each(|h| {
+                    h.domain = if crate::config::is_wildcard_domain(&h.domain) { "*.x" } else { "x" }.into()
+                });
                 let mut plain_rules = rules.clone();
                 plain_rules.iter_mut().for_each(|r| r.description = "x".into());
                 let plain = render(&plain_hosts, &plain_rules, &blocks);
