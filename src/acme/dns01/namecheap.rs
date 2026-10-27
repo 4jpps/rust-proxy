@@ -262,7 +262,11 @@ fn parse_get_hosts_response(body: &str) -> Result<Vec<HostRecord>, Dns01Error> {
                     errors.push(std::mem::take(&mut error));
                 }
             }
-            Ok(ev) if in_error => error.extend(super::xml_text_piece(&ev)),
+            // Only text and entity events: a catch-all here would also swallow
+            // Eof inside an unterminated <Error> and loop forever.
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_error => {
+                error.extend(super::xml_text_piece(&ev))
+            }
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(err) => {
@@ -307,7 +311,11 @@ fn parse_set_hosts_response(body: &str) -> Result<(), Dns01Error> {
                     errors.push(std::mem::take(&mut error));
                 }
             }
-            Ok(ev) if in_error => error.extend(super::xml_text_piece(&ev)),
+            // Only text and entity events: a catch-all here would also swallow
+            // Eof inside an unterminated <Error> and loop forever.
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_error => {
+                error.extend(super::xml_text_piece(&ev))
+            }
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(err) => {
@@ -526,5 +534,13 @@ mod tests {
         let body = r#"<ApiResponse><CommandResponse><DomainDNSGetHostsResult><host Type="TXT" Name="_acme" Address="a&amp;b" MXPref="10" TTL="60"/></DomainDNSGetHostsResult></CommandResponse></ApiResponse>"#;
         let hosts = parse_get_hosts_response(body).unwrap();
         assert_eq!(hosts[0].address, "a&b");
+    }
+
+    /// A reply cut off inside an element must end the parse, not spin.
+    #[test]
+    fn truncated_xml_inside_an_error_ends() {
+        let body = "<ApiResponse><Errors><Error>cut off here";
+        assert!(parse_get_hosts_response(body).is_ok());
+        assert!(parse_set_hosts_response(body).is_err());
     }
 }

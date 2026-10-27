@@ -249,7 +249,9 @@ fn parse_list_hosted_zones_response(
                 current_name = Some(String::new());
             }
             Ok(Event::End(e)) if e.name().as_ref() == "Name" => in_name = false,
-            Ok(ev) if in_id || in_name => {
+            // Only text and entity events, so Eof inside an unterminated
+            // element still reaches the break below.
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_id || in_name => {
                 let target = if in_id {
                     &mut current_id
                 } else {
@@ -295,7 +297,9 @@ fn route53_error_message(body: &str) -> String {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) if e.name().as_ref() == "Message" => in_message = true,
             Ok(Event::End(e)) if e.name().as_ref() == "Message" => in_message = false,
-            Ok(ev) if in_message => message.extend(super::xml_text_piece(&ev)),
+            Ok(ev @ (Event::Text(_) | Event::GeneralRef(_))) if in_message => {
+                message.extend(super::xml_text_piece(&ev))
+            }
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(_) => break,
@@ -489,5 +493,19 @@ mod tests {
     fn error_message_keeps_entities() {
         let body = "<ErrorResponse><Error><Message>Invalid &quot;name&quot; &amp; value</Message></Error></ErrorResponse>";
         assert_eq!(route53_error_message(body), r#"Invalid "name" & value"#);
+    }
+
+    #[test]
+    fn truncated_xml_inside_an_element_ends() {
+        assert_eq!(
+            route53_error_message("<ErrorResponse><Error><Message>cut off"),
+            "cut off"
+        );
+        let body = "<ListHostedZonesResponse><HostedZones><HostedZone><Id>/hostedzone/Z1";
+        assert!(
+            parse_list_hosted_zones_response(body, "example.com")
+                .unwrap()
+                .is_none()
+        );
     }
 }
