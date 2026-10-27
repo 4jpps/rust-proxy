@@ -88,7 +88,7 @@ for the API.
 |--------|------|---------------|
 | GET | `/api/dashboard` | Counts of hosts, port rules and certificates, plus the configured `bind_ranges` |
 | GET | `/api/hosts` | |
-| POST | `/api/hosts` | See the field table in [Configuration](configuration.md#hosts): `domain`, `bind_ip_v4`, `bind_ip_v6`, `bind_port`, `upstream`, `upstream_https`, `upstream_tls_verify`, `upstream_preserve_host`, `websockets`, `force_https`, `acme_enabled`, `acme_challenge_type`, `acl_ids`, `dns_credential_id`, `redirect`, `path_rewrite`, `static_root`, `rewrite_samesite_none_cookies`, `pass_client_cert_header`, `deny_fallback`, `locations`, `block_exploits`, `fixed_response`, `hsts`, `hsts_subdomains`, `enabled` |
+| POST | `/api/hosts` | See the field table in [Configuration](configuration.md#hosts): `domain`, `bind_ip_v4`, `bind_ip_v6`, `bind_port`, `upstream`, `upstream_https`, `upstream_tls_verify`, `upstream_preserve_host`, `websockets`, `force_https`, `acme_enabled`, `acme_challenge_type`, `acl_ids`, `dns_credential_id`, `redirect`, `path_rewrite`, `static_root`, `rewrite_samesite_none_cookies`, `pass_client_cert_header`, `deny_fallback`, `locations`, `block_exploits`, `fixed_response`, `hsts`, `hsts_subdomains`, `rate_limit_per_minute`, `enabled` |
 | PUT | `/api/hosts/:id` | Same shape as POST |
 | DELETE | `/api/hosts/:id` | |
 | GET | `/api/port-rules` | |
@@ -144,7 +144,10 @@ Entries are removed with `DELETE` on the same path plus `/:entry_id` (or
 | GET, PUT | `/api/siem` | See [Logging and SIEM](logging-and-siem.md) |
 | POST | `/api/siem/test` | Sends a `siem_test` event |
 | | `/api/hosting/*` | See [Hosting](hosting.md) |
+| GET | `/api/firewall/preview` | The ruleset that would be applied now, diffed against the last one applied: `{changed, added, removed, diff: [{op, text}], last_applied_at, last_apply_ok, admin_reachable_from_you, your_ip}`. `op` is `" "`, `"-"` or `"+"`; unchanged runs collapse to `…` |
+| POST | `/api/firewall/preview` | Same, for a what-if: any of `{hosts, port_rules, admin_allowed_ips}` replaces the live value. Nothing is saved or applied. `admin_reachable_from_you` says whether your address could still reach the admin port |
 | GET | `/api/version` | No authentication needed |
+| GET | `/healthz` | No authentication needed. See [Deployment](deployment.md#health-check) |
 
 ## Audit trail
 

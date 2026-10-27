@@ -131,6 +131,7 @@ impl AccountKey {
         Ok(sig.as_ref().to_vec())
     }
 
+    #[cfg(test)]
     pub fn public_key_der(&self) -> Vec<u8> {
         self.key_pair.public_key().as_ref().to_vec()
     }

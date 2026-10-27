@@ -65,6 +65,12 @@ or several disjoint ranges, it just works. Populate it only if you want
 a typo in a `bind_ip` caught at validation time against a range you
 control.
 
+`max_connections_per_ip` (default 256) caps how many connections one
+client can hold open at once across the HTTPS, port 80 and TCP
+passthrough listeners. IPv6 clients are counted per /64. A browser uses
+well under ten per site, so the default only stops floods. `0` turns the
+cap off. UDP port rules apply the same number per listener, separately.
+
 ### `[siem]`
 
 See [Logging and SIEM](logging-and-siem.md).
@@ -229,6 +235,17 @@ only subdomains with no site of their own get the 404.
 A request for a hostname that matches no site at all (for example a bare IP
 address or a domain nobody configured) is answered by the
 [Default site](#default-site) setting.
+
+### Rate limit
+
+`rate_limit_per_minute` caps how many requests one visitor (an address,
+or a /64 for IPv6) can make to the site each minute. Short bursts of up
+to a sixth of the minute's allowance (at least 10) are allowed. Over the
+limit, the visitor gets `429 Too Many Requests` with a `Retry-After`
+header. A single web page often makes 20 to 100 requests, so start around
+600 and lower it only for sites that need it, like a login or API
+endpoint. `0` (the default) means no limit. In the admin UI it is
+"Requests per minute, per visitor" under Access.
 
 ### HSTS
 

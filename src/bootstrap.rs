@@ -116,6 +116,13 @@ async fn start_siem(state: &AppState) {
 /// Everything `main()` needs before it can spawn the long-running
 /// service tasks.
 pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
+    build_app_state_with(cfg, true).await
+}
+
+/// `build_app_state`, optionally without starting the SIEM forwarder --
+/// `rust-proxy check` builds a throwaway state and must not open
+/// outbound connections.
+pub async fn build_app_state_with(cfg: Config, start_services: bool) -> anyhow::Result<AppState> {
     let db_pool = crate::db::connect(&cfg.admin.db_path).await?;
 
     let (hosts, port_rules) = load_or_seed_hosts_and_port_rules(&db_pool, &cfg).await?;
@@ -151,7 +158,9 @@ pub async fn build_app_state(cfg: Config) -> anyhow::Result<AppState> {
         hosting_pools = seeded;
     }
     state.set_hosting(hosting_pools, hosting_allocations);
-    start_siem(&state).await;
+    if start_services {
+        start_siem(&state).await;
+    }
     Ok(state)
 }
 
@@ -219,6 +228,8 @@ mod tests {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
+                max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
+                udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },
             admin: crate::config::AdminConfig {
                 bind_ip_v4: Some(Ipv4Addr::UNSPECIFIED),
@@ -288,6 +299,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });

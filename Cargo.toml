@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 socket2 = { version = "0.5", features = ["all"] }
 regex = "1"
 hyper = { version = "1", features = ["full"] }
@@ -65,10 +66,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ipnet = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
+proptest = "1"
 
 [package.metadata.deb]
 maintainer = "Jeff Parrish PC Services LLC <https://www.jpps.us>"

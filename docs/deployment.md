@@ -86,6 +86,34 @@ sudo apt update && sudo apt install --only-upgrade rust-proxy
 journalctl -u rust-proxy --no-pager | tail -20
 ```
 
+For a manual binary swap, check the new binary against the live
+configuration before restarting:
+
+```sh
+/tmp/rust-proxy-new check --config /etc/rust-proxy/config.toml
+```
+
+`check` validates the config, upgrades a private snapshot of the
+database (the live file is never written), loads hosts and certificates,
+and has `nft -c` validate the firewall ruleset without loading it. It
+exits non-zero if anything would fail. Add `--print-ruleset` to see the
+ruleset. Run it as root so `nft -c` can run.
+
+## Health check
+
+`GET /healthz` on the admin port needs no login (the admin port is
+already limited by the admin allow list). It returns `200` when every
+check passes and `503` otherwise, with one entry per check: database,
+firewall (last apply succeeded within 15 minutes), certificates (nearest
+expiry at least 7 days away), disk (at least 5% free where the database
+lives), file descriptors (under 90% of the limit), hosting (when used),
+and how many clients hold connections. It never changes anything and
+answers from a 5-second cache.
+
+```sh
+curl -s http://127.0.0.1:8084/healthz
+```
+
 Read [`CHANGELOG.md`](../CHANGELOG.md) first. The project is pre-1.0 and
 configuration or API details can change between releases.
 

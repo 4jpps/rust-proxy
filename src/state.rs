@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig, PortRule, ProxyHost};
 use crate::hosting::HostingStatus;
 use crate::hosting::model::{Allocation, HostingPool};
+use crate::nftables::FirewallStatus;
 
 /// One domain's live TLS material, ready for SNI dispatch.
 #[derive(Clone, Debug)]
@@ -122,6 +123,12 @@ struct Inner {
     hosting_pools: ArcSwap<Vec<HostingPool>>,
     hosting_allocations: ArcSwap<Vec<Allocation>>,
     hosting_status: ArcSwap<HostingStatus>,
+    /// Outcome of the main table's last nftables sync, plus the exact
+    /// ruleset text it applied (for `/healthz` and the firewall preview).
+    firewall_status: ArcSwap<FirewallStatus>,
+    /// Per-client concurrent connection cap shared by every proxy listener.
+    conn_limiter: Arc<crate::proxy::limits::ConnLimiter>,
+    rate_limiter: crate::proxy::limits::RateLimiter,
     /// Pools and allocations are validated against each other, so they
     /// share one write lock.
     hosting_write_lock: Mutex<()>,
@@ -150,7 +157,11 @@ impl AppState {
         initial_acme_contact_email: Option<String>,
         initial_expose_admin_port: Option<bool>,
     ) -> Self {
+        let conn_limiter =
+            crate::proxy::limits::ConnLimiter::new(cfg.network.max_connections_per_ip);
         Self(Arc::new(Inner {
+            conn_limiter,
+            rate_limiter: Default::default(),
             network: cfg.network,
             admin: cfg.admin,
             acme: cfg.acme,
@@ -175,6 +186,7 @@ impl AppState {
             hosting_pools: ArcSwap::from_pointee(Vec::new()),
             hosting_allocations: ArcSwap::from_pointee(Vec::new()),
             hosting_status: ArcSwap::from_pointee(HostingStatus::default()),
+            firewall_status: ArcSwap::from_pointee(FirewallStatus::default()),
             hosting_write_lock: Mutex::new(()),
             mobile_pass_enabled: ArcSwap::from_pointee(false),
             mobile_passes: crate::proxy::mobile_pass::PassStore::default(),
@@ -233,6 +245,22 @@ impl AppState {
 
     pub fn set_hosting_status(&self, status: HostingStatus) {
         self.0.hosting_status.store(Arc::new(status));
+    }
+
+    pub fn conn_limiter(&self) -> &Arc<crate::proxy::limits::ConnLimiter> {
+        &self.0.conn_limiter
+    }
+
+    pub fn rate_limiter(&self) -> &crate::proxy::limits::RateLimiter {
+        &self.0.rate_limiter
+    }
+
+    pub fn firewall_status(&self) -> Arc<FirewallStatus> {
+        self.0.firewall_status.load_full()
+    }
+
+    pub fn set_firewall_status(&self, status: FirewallStatus) {
+        self.0.firewall_status.store(Arc::new(status));
     }
 
     pub fn network(&self) -> &NetworkConfig {
@@ -487,6 +515,8 @@ mod tests {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
+                max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
+                udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -560,6 +590,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }]);
@@ -651,6 +683,8 @@ mod tests {
                     fixed_response: None,
                     hsts: false,
                     hsts_subdomains: false,
+                    rate_limit_per_minute: 0,
+                    rate_limit_burst: 0,
                     pass_client_cert_header: false,
                     enabled: true,
                 }]);

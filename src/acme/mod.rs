@@ -130,7 +130,13 @@ pub fn http01_fallback_allowed(host: &ProxyHost) -> bool {
         && !crate::config::is_wildcard_domain(&host.domain)
 }
 
-const POLL_INTERVAL: Duration = Duration::from_secs(3);
+// Tests replay whole polling sequences against a mock CA; 3 s per poll
+// would make each case take minutes.
+const POLL_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(3)
+};
 const POLL_MAX_ATTEMPTS: u32 = 40; // ~2 minutes at 3s each
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(3600 * 12);
 /// How often to retry ACME account setup (key load/generate, directory
@@ -763,6 +769,19 @@ pub async fn init_acme_client(state: &AppState) -> Result<AcmeClient, IssuanceEr
     Ok(client)
 }
 
+/// A missing cert is always issued; an existing one once fewer than
+/// `renew_before` remain before it expires (or after it already has).
+fn needs_issuance(
+    not_after: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    renew_before: chrono::Duration,
+) -> bool {
+    match not_after {
+        Some(not_after) => not_after - now < renew_before,
+        None => true,
+    }
+}
+
 async fn renew_if_needed(
     state: &AppState,
     client: &AcmeClient,
@@ -770,11 +789,8 @@ async fn renew_if_needed(
     host: &ProxyHost,
 ) -> Result<(), IssuanceError> {
     let renew_before = chrono::Duration::days(state.acme().renew_before_days);
-    let needs_issuance = match state.certs().get(&host.domain) {
-        Some(entry) => entry.not_after - chrono::Utc::now() < renew_before,
-        None => true,
-    };
-    if !needs_issuance {
+    let not_after = state.certs().get(&host.domain).map(|e| e.not_after);
+    if !needs_issuance(not_after, chrono::Utc::now(), renew_before) {
         return Ok(());
     }
     tracing::info!(domain = %host.domain, "issuing/renewing certificate");
@@ -788,7 +804,11 @@ mod tests {
     use std::path::PathBuf;
     use wiremock::MockServer;
 
-    fn host(domain: &str, force_https: bool, challenge_type: AcmeChallengeType) -> ProxyHost {
+    pub(super) fn host(
+        domain: &str,
+        force_https: bool,
+        challenge_type: AcmeChallengeType,
+    ) -> ProxyHost {
         ProxyHost {
             id: uuid::Uuid::new_v4(),
             domain: domain.into(),
@@ -815,6 +835,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1042,6 +1064,8 @@ mod tests {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
+                max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
+                udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
@@ -1160,5 +1184,370 @@ mod tests {
 
         load_certs_from_disk(&state).unwrap();
         assert!(state.certs().is_empty());
+    }
+}
+
+/// Property tests for the ACME flow: the pure decisions (challenge
+/// method, fallback, port 80, renewal timing, SAN list, record names,
+/// encodings) over random inputs, and `complete_order` -- the
+/// authorization/finalize/download state machine -- replayed against a
+/// mock CA with random status sequences.
+#[cfg(test)]
+mod props {
+    use super::*;
+    use crate::acme::dns01::relative_record_name;
+    use crate::acme::jws::b64url;
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    fn label() -> impl Strategy<Value = String> {
+        "[a-z0-9]([a-z0-9-]{0,10}[a-z0-9])?"
+    }
+
+    fn domain() -> impl Strategy<Value = String> {
+        (proptest::collection::vec(label(), 1..4), any::<bool>()).prop_map(|(labels, wild)| {
+            let d = format!("{}.test", labels.join("."));
+            if wild { format!("*.{d}") } else { d }
+        })
+    }
+
+    fn challenge_type() -> impl Strategy<Value = AcmeChallengeType> {
+        prop_oneof![
+            Just(AcmeChallengeType::Auto),
+            Just(AcmeChallengeType::Dns01),
+            Just(AcmeChallengeType::Http01),
+        ]
+    }
+
+    fn host_with(domain: String, typ: AcmeChallengeType, enabled: bool) -> ProxyHost {
+        let mut h = super::tests::host(&domain, false, typ);
+        h.acme_enabled = enabled;
+        h
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn wildcards_only_ever_use_dns01(d in domain(), typ in challenge_type(), enabled in any::<bool>()) {
+            let h = host_with(d.clone(), typ, enabled);
+            if d.starts_with("*.") {
+                prop_assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Dns01);
+                prop_assert!(!http01_fallback_allowed(&h));
+                prop_assert!(!opens_port_80_for_acme(&h));
+            }
+        }
+
+        /// The http-01 fallback only exists to rescue a failed dns-01
+        /// attempt, so it must never be offered when dns-01 isn't first.
+        #[test]
+        fn fallback_is_always_from_dns01_to_http01(d in domain(), typ in challenge_type(), enabled in any::<bool>()) {
+            let h = host_with(d, typ, enabled);
+            if http01_fallback_allowed(&h) {
+                prop_assert_eq!(resolve_challenge_type(&h), ChallengeMethod::Dns01);
+                prop_assert_eq!(h.acme_challenge_type, AcmeChallengeType::Auto);
+                prop_assert!(opens_port_80_for_acme(&h));
+            }
+            if !enabled {
+                prop_assert!(!http01_fallback_allowed(&h));
+                prop_assert!(!opens_port_80_for_acme(&h));
+            }
+        }
+
+        #[test]
+        fn port_80_opens_exactly_when_http01_could_be_used(d in domain(), typ in challenge_type(), enabled in any::<bool>()) {
+            let h = host_with(d.clone(), typ, enabled);
+            let could_use_http01 = enabled && !d.starts_with("*.")
+                && matches!(typ, AcmeChallengeType::Http01 | AcmeChallengeType::Auto);
+            prop_assert_eq!(opens_port_80_for_acme(&h), could_use_http01);
+        }
+
+        #[test]
+        fn san_list_covers_the_domain_and_a_wildcards_apex(d in domain()) {
+            let sans = domains_for_issuance(&d);
+            prop_assert_eq!(&sans[0], &d);
+            match d.strip_prefix("*.") {
+                Some(apex) => {
+                    prop_assert_eq!(sans.len(), 2);
+                    prop_assert_eq!(sans[1].as_str(), apex);
+                }
+                None => prop_assert_eq!(sans.len(), 1),
+            }
+            prop_assert!(sans.iter().skip(1).all(|s| !s.contains('*')));
+        }
+
+        #[test]
+        fn challenge_record_never_carries_the_wildcard(d in domain()) {
+            let name = acme_challenge_record_name(&d);
+            prop_assert!(name.starts_with("_acme-challenge."));
+            prop_assert!(!name.contains('*'));
+            let bare = d.strip_prefix("*.").unwrap_or(&d);
+            prop_assert_eq!(name, acme_challenge_record_name(bare));
+        }
+
+        /// Relative names strip the zone only at a label boundary.
+        #[test]
+        fn relative_record_names_respect_label_boundaries(prefix in label(), zone_labels in proptest::collection::vec(label(), 1..3), glue in label()) {
+            let zone = format!("{}.test", zone_labels.join("."));
+            let fqdn = format!("_acme-challenge.{prefix}.{zone}");
+            let rel = relative_record_name(&fqdn, &zone);
+            prop_assert_eq!(format!("{rel}.{zone}"), fqdn.clone());
+            // A different zone that only shares a string suffix is not stripped.
+            let lookalike = format!("_acme-challenge.{prefix}{glue}{zone}");
+            prop_assert_eq!(relative_record_name(&lookalike, &zone), lookalike.clone());
+        }
+
+        #[test]
+        fn renewal_is_monotonic_in_time(left_secs in -100_000_000i64..100_000_000, later in 0i64..100_000_000, days in 1i64..90) {
+            let now = chrono::Utc::now();
+            let not_after = now + chrono::Duration::seconds(left_secs);
+            let before = chrono::Duration::days(days);
+            let due = needs_issuance(Some(not_after), now, before);
+            prop_assert_eq!(due, left_secs < before.num_seconds());
+            // Once due, it stays due as time passes.
+            if due {
+                prop_assert!(needs_issuance(Some(not_after), now + chrono::Duration::seconds(later), before));
+            }
+            prop_assert!(needs_issuance(None, now, before));
+        }
+
+        #[test]
+        fn b64url_is_unpadded_url_safe_and_reversible(data in proptest::collection::vec(any::<u8>(), 0..300)) {
+            use base64::Engine as _;
+            let s = b64url(&data);
+            prop_assert!(s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+            prop_assert_eq!(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&s).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn dns01_txt_value_is_a_sha256_digest_and_depends_on_token_and_key() {
+        let (k1, _) = AccountKey::generate().unwrap();
+        let (k2, _) = AccountKey::generate().unwrap();
+        let v = dns01_txt_value("tok", &k1);
+        assert_eq!(v.len(), 43); // 32 bytes, unpadded base64url
+        assert_eq!(v, dns01_txt_value("tok", &k1));
+        assert_ne!(v, dns01_txt_value("tok2", &k1));
+        assert_ne!(v, dns01_txt_value("tok", &k2));
+    }
+
+    // ---- complete_order against a mock CA ----
+
+    #[derive(Debug, Clone)]
+    struct Scenario {
+        /// Per authorization: pending polls, then its final status.
+        authzs: Vec<(usize, &'static str)>,
+        /// Processing polls after finalize, then the final order status.
+        order: (usize, &'static str),
+        has_cert_url: bool,
+    }
+
+    fn scenario() -> impl Strategy<Value = Scenario> {
+        let authz_final = prop_oneof![
+            6 => Just("valid"),
+            1 => Just("invalid"),
+            1 => Just("deactivated"),
+            1 => Just("expired"),
+            1 => Just("revoked"),
+        ];
+        let order_final = prop_oneof![5 => Just("valid"), 1 => Just("invalid")];
+        (
+            proptest::collection::vec((0usize..4, authz_final), 1..3),
+            (0usize..4, order_final),
+            prop_oneof![5 => Just(true), 1 => Just(false)],
+        )
+            .prop_map(|(authzs, order, has_cert_url)| Scenario {
+                authzs,
+                order,
+                has_cert_url,
+            })
+    }
+
+    /// Replays a fixed list of bodies, one per request, repeating the last.
+    struct Seq {
+        bodies: Vec<serde_json::Value>,
+        next: AtomicUsize,
+    }
+
+    impl Respond for Seq {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            let i = self
+                .next
+                .fetch_add(1, Ordering::SeqCst)
+                .min(self.bodies.len() - 1);
+            ResponseTemplate::new(200)
+                .insert_header("replay-nonce", format!("n{i}"))
+                .set_body_json(self.bodies[i].clone())
+        }
+    }
+
+    fn seq(bodies: Vec<serde_json::Value>) -> Seq {
+        Seq {
+            bodies,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn ok() -> ResponseTemplate {
+        ResponseTemplate::new(200).insert_header("replay-nonce", "n")
+    }
+
+    async fn run_scenario(sc: &Scenario) -> (Result<IssuedCert, IssuanceError>, Vec<String>) {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("HEAD"))
+            .and(path("/nonce"))
+            .respond_with(ok())
+            .mount(&server)
+            .await;
+
+        let mut pending = Vec::new();
+        for (i, (polls, fin)) in sc.authzs.iter().enumerate() {
+            let body = |status: &str| {
+                serde_json::json!({
+                    "identifier": {"type": "dns", "value": "a.test"},
+                    "status": status,
+                    "challenges": [{"type": "dns-01", "url": format!("{base}/chall/{i}"), "status": "pending", "token": "t"}],
+                })
+            };
+            let mut bodies: Vec<_> = (0..*polls).map(|_| body("pending")).collect();
+            bodies.push(body(fin));
+            Mock::given(method("POST"))
+                .and(path(format!("/authz/{i}")))
+                .respond_with(seq(bodies))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(format!("/chall/{i}")))
+                .respond_with(ok().set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            pending.push((format!("{base}/authz/{i}"), format!("{base}/chall/{i}")));
+        }
+
+        let order = |status: &str| {
+            let mut o = serde_json::json!({"status": status, "authorizations": [], "finalize": format!("{base}/finalize")});
+            if status == "valid" && sc.has_cert_url {
+                o["certificate"] = serde_json::json!(format!("{base}/cert"));
+            }
+            o
+        };
+        Mock::given(method("POST"))
+            .and(path("/finalize"))
+            .respond_with(ok().set_body_json(order("processing")))
+            .mount(&server)
+            .await;
+        let mut bodies: Vec<_> = (0..sc.order.0).map(|_| order("processing")).collect();
+        bodies.push(order(sc.order.1));
+        Mock::given(method("POST"))
+            .and(path("/order"))
+            .respond_with(seq(bodies))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/cert"))
+            .respond_with(
+                ok().set_body_string(
+                    "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let (key, _) = AccountKey::generate().unwrap();
+        let dir = types::Directory {
+            new_nonce: format!("{base}/nonce"),
+            new_account: format!("{base}/acct"),
+            new_order: format!("{base}/new-order"),
+        };
+        let client = AcmeClient::with_directory(reqwest::Client::new(), key, dir);
+        let identity = CsrIdentity {
+            organization: None,
+            organizational_unit: None,
+        };
+        let result = complete_order(
+            &client,
+            &pending,
+            &format!("{base}/order"),
+            &format!("{base}/finalize"),
+            &["a.test".to_string()],
+            identity,
+        )
+        .await;
+        let paths = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| r.url.path().to_string())
+            .collect();
+        (result, paths)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn complete_order_reaches_the_right_outcome(sc in scenario()) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let (result, posts) = rt.block_on(run_scenario(&sc));
+
+            // Every challenge is triggered, before any authorization is polled.
+            let first_poll = posts.iter().position(|p| p.starts_with("/authz/")).unwrap();
+            prop_assert_eq!(posts[..first_poll].iter().filter(|p| p.starts_with("/chall/")).count(), sc.authzs.len());
+
+            let failed = sc.authzs.iter().position(|(_, s)| *s != "valid");
+            match (failed, result) {
+                (Some(i), Err(IssuanceError::AuthorizationFailed(_, status))) => {
+                    prop_assert_eq!(format!("{status:?}").to_lowercase(), sc.authzs[i].1);
+                    // Nothing is finalized after a failed authorization.
+                    prop_assert!(!posts.iter().any(|p| p == "/finalize"));
+                    // Authorizations after the failed one are never polled.
+                    prop_assert!(!posts.iter().any(|p| p.starts_with("/authz/") && p[7..].parse::<usize>().unwrap() > i));
+                }
+                (None, Ok(cert)) => {
+                    prop_assert!(sc.order.1 == "valid" && sc.has_cert_url);
+                    prop_assert!(cert.chain_pem.contains("BEGIN CERTIFICATE"));
+                    prop_assert!(cert.key_pem.contains("PRIVATE KEY"));
+                }
+                (None, Err(IssuanceError::OrderNotFinalized(status))) => {
+                    prop_assert!(sc.order.1 != "valid" || !sc.has_cert_url, "{:?}", status);
+                    prop_assert!(!posts.iter().any(|p| p == "/cert"));
+                }
+                (f, r) => prop_assert!(false, "scenario {:?}: failed={:?} got {:?}", sc, f, r.map(|_| "cert")),
+            }
+
+            // Each authorization is polled exactly until it leaves pending.
+            for (i, (polls, _)) in sc.authzs.iter().enumerate() {
+                let n = posts.iter().filter(|p| **p == format!("/authz/{i}")).count();
+                prop_assert!(n == 0 || n == polls + 1, "authz {} polled {} times", i, n);
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_authorization_times_out_after_the_poll_limit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sc = Scenario {
+            authzs: vec![(POLL_MAX_ATTEMPTS as usize + 5, "valid")],
+            order: (0, "valid"),
+            has_cert_url: true,
+        };
+        let (result, posts) = rt.block_on(run_scenario(&sc));
+        assert!(
+            matches!(result, Err(IssuanceError::Timeout("authorization"))),
+            "{:?}",
+            result.map(|_| ())
+        );
+        assert_eq!(
+            posts.iter().filter(|p| *p == "/authz/0").count(),
+            POLL_MAX_ATTEMPTS as usize
+        );
     }
 }

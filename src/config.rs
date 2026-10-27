@@ -300,6 +300,29 @@ pub struct NetworkConfig {
     /// accept`. rust-proxy does not serve DHCP itself.
     #[serde(default)]
     pub dhcp_interfaces: Vec<String>,
+    /// Most connections one client may hold open at once across every
+    /// proxy listener (HTTPS, port 80, TCP passthrough); IPv6 clients are
+    /// counted per /64. A browser uses well under ten per site, so the
+    /// default only stops floods. 0 turns the cap off.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+    /// How long a UDP port-rule session may sit silent before it is closed
+    /// (default 120 s). Raise it for protocols with long quiet spells, such
+    /// as SIP or WireGuard with a long keepalive.
+    #[serde(default = "default_udp_idle_timeout_seconds")]
+    pub udp_idle_timeout_seconds: u64,
+}
+
+pub const DEFAULT_UDP_IDLE_TIMEOUT_SECONDS: u64 = 120;
+
+fn default_udp_idle_timeout_seconds() -> u64 {
+    DEFAULT_UDP_IDLE_TIMEOUT_SECONDS
+}
+
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
+
+fn default_max_connections_per_ip() -> usize {
+    DEFAULT_MAX_CONNECTIONS_PER_IP
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,6 +744,17 @@ pub struct ProxyHost {
     /// Subdomains"). Only valid together with `hsts`.
     #[serde(default)]
     pub hsts_subdomains: bool,
+    /// Most requests one client (address, or /64 for IPv6) may make to
+    /// this site per minute; over it they get 429 Too Many Requests with
+    /// Retry-After. 0 (the default) means no limit.
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
+    /// How many requests a client may make back to back before the
+    /// per-minute rate applies (the token bucket's size). 0 uses a sixth of
+    /// the per-minute limit, at least 10. Raise it for login or 2FA pages
+    /// that fire a quick run of requests.
+    #[serde(default)]
+    pub rate_limit_burst: u32,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -1326,6 +1360,18 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), ConfigError> {
             "hosts entry has an empty domain".into(),
         ));
     }
+    // Hostname characters only (IDNs go in as punycode). Anything else --
+    // spaces, line breaks, quotes -- is never a real domain, and the domain
+    // is written into the firewall ruleset and logs.
+    if let Some(bad) = domain.chars().find(|c| c.is_control()).or_else(|| {
+        trimmed
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*')))
+    }) {
+        return Err(ConfigError::Validation(format!(
+            "invalid domain {domain:?} -- {bad:?} is not allowed in a domain name"
+        )));
+    }
     match trimmed.strip_prefix("*.") {
         Some(rest) if rest.is_empty() || rest.contains('*') => {
             Err(ConfigError::Validation(format!(
@@ -1431,6 +1477,29 @@ fn validate_port(port: u16, ctx: &str) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn domain_validation_allows_hostnames_and_rejects_everything_else() {
+        for ok in [
+            "jpps.us",
+            "*.jpps.us",
+            "xn--bcher-kva.example",
+            "_dmarc.jpps.us",
+            " pad.jpps.us ",
+        ] {
+            assert!(validate_domain(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "a.com\n}",
+            "a com",
+            "a.com;",
+            "a\"b.com",
+            "a.com\r",
+            "bücher.de",
+        ] {
+            assert!(validate_domain(bad).is_err(), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     fn base_toml() -> String {
@@ -1679,6 +1748,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1718,6 +1789,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1756,6 +1829,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1791,6 +1866,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1830,6 +1907,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1869,6 +1948,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1971,6 +2052,8 @@ gateway = "172.16.63.1"
                 fixed_response: None,
                 hsts: false,
                 hsts_subdomains: false,
+                rate_limit_per_minute: 0,
+                rate_limit_burst: 0,
                 pass_client_cert_header: false,
                 enabled: true,
             });
@@ -2011,6 +2094,8 @@ gateway = "172.16.63.1"
                 fixed_response: None,
                 hsts: false,
                 hsts_subdomains: false,
+                rate_limit_per_minute: 0,
+                rate_limit_burst: 0,
                 pass_client_cert_header: false,
                 enabled: true,
             });
@@ -2047,6 +2132,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -2094,6 +2181,8 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });

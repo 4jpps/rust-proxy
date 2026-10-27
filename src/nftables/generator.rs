@@ -61,6 +61,9 @@ pub const TABLE_NAME: &str = "rust_proxy";
 /// its ACL is enforced directly at the firewall instead. A rule absent
 /// from this map gets no source restriction at all, same as before this
 /// map existed.
+// Every input is a distinct piece of live state the ruleset depends on;
+// bundling them into a struct would only rename the same list.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_ruleset(
     hosts: &[ProxyHost],
     port_rules: &[PortRule],
@@ -353,6 +356,21 @@ fn write_admin_rule(out: &mut String, admin: &AdminConfig, expose_admin_port: bo
 /// request ever reached the app. See `write_port_rule` for the one place
 /// an ACL *is* enforced at the firewall layer (a raw port rule has no
 /// application layer to fall back to).
+/// Longest stored text a `#` comment line carries.
+const MAX_COMMENT_CHARS: usize = 120;
+
+/// Makes stored, user-editable text (a domain, a port rule description)
+/// safe to put after `#` in the ruleset. An nft comment runs to the end
+/// of the line, so a newline in the text would turn the rest of it into
+/// live rules -- every control character becomes a space and the result
+/// is capped to one short line.
+fn comment_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_COMMENT_CHARS)
+        .collect()
+}
+
 fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) -> bool) {
     let bind_ips: Vec<IpAddr> = host_bind_ips(host)
         .into_iter()
@@ -361,7 +379,7 @@ fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) ->
     if bind_ips.is_empty() {
         return;
     }
-    let _ = writeln!(out, "        # host: {}", host.domain);
+    let _ = writeln!(out, "        # host: {}", comment_text(&host.domain));
     for bind_ip in bind_ips {
         let daddr = daddr_clause(bind_ip);
         let _ = writeln!(out, "        tcp dport {} {daddr}accept", host.bind_port);
@@ -401,7 +419,11 @@ fn write_port_rule(
         rule.port_start.to_string()
     };
     if !rule.description.is_empty() {
-        let _ = writeln!(out, "        # port rule: {}", rule.description);
+        let _ = writeln!(
+            out,
+            "        # port rule: {}",
+            comment_text(&rule.description)
+        );
     }
     for bind_ip in bind_ips {
         let daddr = daddr_clause(bind_ip);
@@ -476,6 +498,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -1282,5 +1306,173 @@ mod tests {
             &NftBlocks::default(),
         );
         assert!(!none.contains("dport 67"), "got: {none}");
+    }
+
+    #[test]
+    fn newline_in_description_or_domain_stays_inside_the_comment() {
+        let evil = "x\n        tcp dport 1-65535 accept\n}\n}\ntable ip nat {";
+        let rule = port_rule("10.0.0.2", 2000, 2000, Protocol::Tcp, evil);
+        let h = host(evil, "10.0.0.3", 443, false);
+        let out = generate_ruleset(
+            &[h],
+            &[rule],
+            &admin(),
+            true,
+            &HashMap::new(),
+            &[],
+            &[],
+            &NftBlocks::default(),
+        );
+        // The text survives only inside `#` lines, flattened to one line.
+        let code: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        assert!(
+            !code
+                .iter()
+                .any(|l| l.contains("1-65535") || l.contains("ip nat")),
+            "got: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.trim_start().starts_with("# port rule: x ")
+                    && l.contains("table ip nat {"))
+        );
+    }
+
+    /// Property tests: random hosts, port rules and block lists, checking
+    /// invariants every generated ruleset must hold. Stands in for
+    /// `cargo fuzz` here (that needs nightly and a library crate; this runs
+    /// in the normal `cargo test` and CI). `PROPTEST_CASES=20000 cargo test
+    /// props` for a longer run.
+    mod props {
+        use super::*;
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        fn render(hosts: &[ProxyHost], rules: &[PortRule], blocks: &NftBlocks) -> String {
+            generate_ruleset(
+                hosts,
+                rules,
+                &admin(),
+                true,
+                &HashMap::new(),
+                &[],
+                &[],
+                blocks,
+            )
+        }
+
+        /// Everything except `#` comment lines: what nft actually executes.
+        fn code_lines(s: &str) -> Vec<&str> {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect()
+        }
+
+        /// Free text skewed toward what could break out of a comment:
+        /// line breaks, braces, semicolons, other control characters.
+        fn arb_text() -> impl Strategy<Value = String> {
+            prop_oneof![
+                any::<String>(),
+                "[a-z0-9 .{};#\n\r\t\x0b\x0c\x00\u{85}\u{2028}]{0,40}",
+            ]
+        }
+
+        prop_compose! {
+            fn arb_rule()(net in 1u8..250, start in 1u16..65000, len in 0u16..40,
+                          udp in any::<bool>(), enabled in any::<bool>(),
+                          desc in arb_text()) -> PortRule {
+                let proto = if udp { Protocol::Udp } else { Protocol::Tcp };
+                let mut r = port_rule(&format!("10.1.{net}.1"), start, start + len, proto, &desc);
+                r.enabled = enabled;
+                r
+            }
+        }
+
+        prop_compose! {
+            fn arb_host()(net in 1u8..250, port in 1u16..65535, https in any::<bool>(),
+                          enabled in any::<bool>(), domain in arb_text()) -> ProxyHost {
+                let mut h = host(&domain, &format!("10.2.{net}.1"), port, https);
+                h.enabled = enabled;
+                h
+            }
+        }
+
+        prop_compose! {
+            fn arb_blocks()(nets in vec((any::<u32>(), 8u8..=32), 0..5)) -> NftBlocks {
+                NftBlocks {
+                    global: nets
+                        .into_iter()
+                        .map(|(a, p)| IpNet::new(IpAddr::from(std::net::Ipv4Addr::from(a)), p).unwrap().trunc())
+                        .collect(),
+                    rule: HashMap::new(),
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Domains and descriptions are free text from the admin API.
+            /// Whatever they contain, only comment lines may differ.
+            #[test]
+            fn stored_text_never_reaches_rules(hosts in vec(arb_host(), 0..6),
+                                               rules in vec(arb_rule(), 0..6),
+                                               blocks in arb_blocks()) {
+                let out = render(&hosts, &rules, &blocks);
+                let mut plain_hosts = hosts.clone();
+                plain_hosts.iter_mut().for_each(|h| h.domain = "x".into());
+                let mut plain_rules = rules.clone();
+                plain_rules.iter_mut().for_each(|r| r.description = "x".into());
+                let plain = render(&plain_hosts, &plain_rules, &blocks);
+                prop_assert_eq!(code_lines(&out), code_lines(&plain));
+            }
+
+            #[test]
+            fn ruleset_is_well_formed(hosts in vec(arb_host(), 0..6),
+                                      rules in vec(arb_rule(), 0..6),
+                                      blocks in arb_blocks()) {
+                let out = render(&hosts, &rules, &blocks);
+                let code = code_lines(&out).join("\n");
+                prop_assert_eq!(code.matches('{').count(), code.matches('}').count());
+                let header = format!("add table inet {TABLE_NAME}\nflush table inet {TABLE_NAME}\n");
+                prop_assert!(out.starts_with(&header));
+                prop_assert!(out.contains("policy drop;"));
+                const STARTS: &[&str] = &["add ", "flush ", "table ", "chain ", "type ", "iif", "ct ",
+                                          "icmp", "tcp ", "udp ", "ip ", "ip6 ", "}"];
+                for line in code_lines(&out) {
+                    let t = line.trim();
+                    prop_assert!(t.is_empty() || STARTS.iter().any(|s| t.starts_with(s)),
+                                 "unexpected line: {:?}", t);
+                }
+            }
+
+            #[test]
+            fn every_enabled_port_rule_is_opened_and_no_disabled_one(rules in vec(arb_rule(), 0..6)) {
+                let out = render(&[], &rules, &NftBlocks::default());
+                for r in &rules {
+                    let proto = if r.protocol == Protocol::Udp { "udp" } else { "tcp" };
+                    let expr = if r.is_range() { format!("{}-{}", r.port_start, r.port_end) } else { r.port_start.to_string() };
+                    let line = format!("{proto} dport {expr} ip daddr {} accept", r.bind_ip_v4.unwrap());
+                    let opened_elsewhere = rules.iter().any(|o| o.enabled && o.id != r.id && o.protocol == r.protocol
+                        && o.port_start == r.port_start && o.port_end == r.port_end && o.bind_ip_v4 == r.bind_ip_v4);
+                    prop_assert_eq!(out.contains(&line), r.enabled || opened_elsewhere, "{}", line);
+                }
+            }
+
+            /// Global block lists must drop before anything is accepted by port.
+            #[test]
+            fn global_blocks_come_before_any_port_accept(hosts in vec(arb_host(), 0..4),
+                                                         rules in vec(arb_rule(), 0..4),
+                                                         blocks in arb_blocks()) {
+                prop_assume!(!blocks.global.is_empty());
+                let out = render(&hosts, &rules, &blocks);
+                let drop_at = out.find("ip saddr {").expect("global drop line");
+                let first_port_accept = out.find(" dport ").expect("always-open rules exist");
+                prop_assert!(drop_at < first_port_accept);
+            }
+        }
     }
 }

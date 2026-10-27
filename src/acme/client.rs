@@ -76,8 +76,9 @@ impl AcmeClient {
         })
     }
 
-    /// For tests / callers that already have a directory and don't want a
-    /// second discovery round-trip.
+    /// For tests that already have a directory and don't want a second
+    /// discovery round-trip.
+    #[cfg(test)]
     pub fn with_directory(
         http: reqwest::Client,
         account_key: AccountKey,
@@ -92,6 +93,7 @@ impl AcmeClient {
         }
     }
 
+    #[cfg(test)]
     pub async fn kid(&self) -> Option<String> {
         self.kid.lock().await.clone()
     }

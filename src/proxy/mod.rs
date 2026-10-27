@@ -14,6 +14,7 @@ pub mod access;
 pub mod client_cert;
 pub mod connect;
 pub mod http;
+pub mod limits;
 pub mod login;
 pub mod mobile_pass;
 pub mod passthrough;
@@ -31,7 +32,7 @@ use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 #[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -84,7 +85,15 @@ fn reconcile(
         spawn_redirect_listener(state.clone(), key.0, key.1)
     });
     reconcile_map(passthroughs, &passthrough_keys(&port_rules), |key| {
-        spawn_passthrough_listener(&port_rules, key.0, key.1, key.2)
+        spawn_passthrough_listener(
+            &port_rules,
+            key.0,
+            key.1,
+            key.2,
+            state.conn_limiter().clone(),
+            state.network().max_connections_per_ip,
+            std::time::Duration::from_secs(state.network().udp_idle_timeout_seconds.max(1)),
+        )
     });
 }
 
@@ -179,10 +188,19 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 tracing::debug!(%peer_ip, "connection dropped: globally blocked");
                 continue;
             }
+            let Some(slot) = state.conn_limiter().try_acquire(peer_ip) else {
+                tracing::debug!(%peer_ip, "connection dropped: per-client connection limit");
+                limits::count(&limits::CONNECTIONS_REFUSED);
+                continue;
+            };
             let config_with_client_auth = config_with_client_auth.clone();
             let config_no_client_auth = config_no_client_auth.clone();
             let state = state.clone();
             tokio::spawn(async move {
+                let _slot = slot;
+                // A client that connects and then stalls must not hold the
+                // socket: the whole handshake shares one deadline.
+                let deadline = tokio::time::Instant::now() + limits::TLS_HANDSHAKE_TIMEOUT;
                 // Two-phase accept: read just far enough to see the
                 // ClientHello (which carries SNI) before committing to a
                 // `ServerConfig`, so the choice of whether to solicit a
@@ -190,15 +208,23 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 // actually for -- see `should_request_client_cert`'s doc
                 // comment for why this replaced a single config shared by
                 // every connection on this listener.
-                let start = match tokio_rustls::LazyConfigAcceptor::new(
-                    rustls::server::Acceptor::default(),
-                    stream,
+                let start = match tokio::time::timeout_at(
+                    deadline,
+                    tokio_rustls::LazyConfigAcceptor::new(
+                        rustls::server::Acceptor::default(),
+                        stream,
+                    ),
                 )
                 .await
                 {
-                    Ok(s) => s,
-                    Err(err) => {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(err)) => {
                         tracing::debug!(error = %err, "tls clienthello read failed");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!(%peer_ip, "tls clienthello timed out");
+                        limits::count(&limits::TLS_HANDSHAKE_TIMEOUTS);
                         return;
                     }
                 };
@@ -211,13 +237,19 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 } else {
                     config_no_client_auth
                 };
-                let tls_stream = match start.into_stream(config).await {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::debug!(error = %err, "tls handshake failed");
-                        return;
-                    }
-                };
+                let tls_stream =
+                    match tokio::time::timeout_at(deadline, start.into_stream(config)).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(err)) => {
+                            tracing::debug!(error = %err, "tls handshake failed");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%peer_ip, "tls handshake timed out");
+                            limits::count(&limits::TLS_HANDSHAKE_TIMEOUTS);
+                            return;
+                        }
+                    };
                 let client_cert_subject =
                     client_cert::client_cert_identity(tls_stream.get_ref().1.peer_certificates());
                 let client_cert_leaf: Option<Vec<u8>> = tls_stream
@@ -266,7 +298,7 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 // (WebSocket passthrough, see `http::forward_http`) work
                 // on the HTTP/1 side; HTTP/2 clients get real h2
                 // multiplexing with no code-path changes needed here.
-                if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                if let Err(err) = server_builder()
                     .serve_connection_with_upgrades(io, service)
                     .await
                 {
@@ -275,6 +307,23 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
             });
         }
     })
+}
+
+/// HTTP/1 and HTTP/2 serving with the stalled-client timeouts from
+/// `limits`: header read (also the keep-alive idle limit) for HTTP/1,
+/// keep-alive pings for HTTP/2.
+fn server_builder() -> hyper_util::server::conn::auto::Builder<TokioExecutor> {
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits::HEADER_READ_TIMEOUT);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(limits::H2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(limits::H2_KEEPALIVE_TIMEOUT);
+    builder
 }
 
 /// ALPN offers `h2` before `http/1.1` (server preference order) but
@@ -513,6 +562,25 @@ async fn route_https_request(
         router::match_host(&state.hosts(), bind_ip, bind_port, name)
             .and_then(|h| h.hsts_header_value())
     });
+    // Per-site rate limit, before anything else (login page, ACLs,
+    // upstream) spends work on the request.
+    if let Some(wait) = lookup_name.as_deref().and_then(|name| {
+        let hosts = state.hosts();
+        let host = router::match_host(&hosts, bind_ip, bind_port, name)?;
+        state
+            .rate_limiter()
+            .check(
+                host.id,
+                peer_ip,
+                host.rate_limit_per_minute,
+                host.rate_limit_burst,
+            )
+            .err()
+    }) {
+        tracing::debug!(%peer_ip, host = lookup_name.as_deref().unwrap_or("-"), "rate limited");
+        limits::count(&limits::RATE_LIMITED);
+        return Ok(too_many_requests(wait));
+    }
     let mut result = route_https_request_inner(
         state,
         bind_ip,
@@ -1057,6 +1125,11 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
                 tracing::debug!(%peer_ip, "connection dropped: globally blocked");
                 continue;
             }
+            let Some(slot) = state.conn_limiter().try_acquire(peer_ip) else {
+                tracing::debug!(%peer_ip, "connection dropped: per-client connection limit");
+                limits::count(&limits::CONNECTIONS_REFUSED);
+                continue;
+            };
             let io = TokioIo::new(stream);
             let state = state.clone();
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {
@@ -1090,7 +1163,10 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
                 }
             });
             tokio::spawn(async move {
+                let _slot = slot;
                 let _ = hyper::server::conn::http1::Builder::new()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(limits::HEADER_READ_TIMEOUT)
                     .serve_connection(io, service)
                     .await;
             });
@@ -1103,6 +1179,9 @@ fn spawn_passthrough_listener(
     bind_ip: IpAddr,
     port: u16,
     protocol: Protocol,
+    limiter: Arc<limits::ConnLimiter>,
+    max_per_client: usize,
+    udp_idle: std::time::Duration,
 ) -> JoinHandle<()> {
     let target = port_rules
         .iter()
@@ -1126,8 +1205,11 @@ fn spawn_passthrough_listener(
             return;
         };
         let result = match protocol {
-            Protocol::Tcp => passthrough::run_tcp_passthrough(bind_addr, upstream).await,
-            Protocol::Udp => passthrough::run_udp_passthrough(bind_addr, upstream).await,
+            Protocol::Tcp => passthrough::run_tcp_passthrough(bind_addr, upstream, limiter).await,
+            Protocol::Udp => {
+                passthrough::run_udp_passthrough(bind_addr, upstream, max_per_client, udp_idle)
+                    .await
+            }
         };
         if let Err(err) = result {
             tracing::error!(%bind_addr, error = %err, "passthrough listener exited");
@@ -1344,6 +1426,24 @@ fn forbidden_page(domain: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
         .expect("static forbidden page response is always valid")
 }
 
+/// 429 for a client over a site's `rate_limit_per_minute`, with how many
+/// whole seconds to wait.
+fn too_many_requests(wait: std::time::Duration) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+    Response::builder()
+        .status(hyper::StatusCode::TOO_MANY_REQUESTS)
+        .header(hyper::header::RETRY_AFTER, secs.to_string())
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(
+            http_body_util::Full::new(Bytes::from_static(
+                b"Too many requests. Please slow down and try again shortly.\n",
+            ))
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed(),
+        )
+        .expect("static 429 response is always valid")
+}
+
 fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
@@ -1357,6 +1457,15 @@ fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn too_many_requests_says_when_to_retry() {
+        let resp = too_many_requests(std::time::Duration::from_millis(1200));
+        assert_eq!(resp.status(), hyper::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()[hyper::header::RETRY_AFTER], "2");
+        let short = too_many_requests(std::time::Duration::from_millis(10));
+        assert_eq!(short.headers()[hyper::header::RETRY_AFTER], "1");
+    }
+
     use super::*;
     use crate::config::{
         AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig, PortRule, Protocol,
@@ -1584,6 +1693,8 @@ mod tests {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
+                max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
+                udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
@@ -1717,6 +1828,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2202,6 +2315,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2265,6 +2380,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2297,6 +2414,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: true,
             enabled: true,
         }
@@ -2731,6 +2850,8 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
