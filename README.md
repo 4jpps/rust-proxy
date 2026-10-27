@@ -6,6 +6,8 @@
 
 **A self-hosted reverse proxy with built-in ACME, a default-deny firewall, and per-host access control.**
 
+Primary home: https://gitlab.jpps.us/jpps/rust-proxy (issues, merge requests and releases live there). The GitHub copy at https://github.com/4jpps/rust-proxy is a read-only mirror, updated automatically from GitLab.
+
 rust-proxy is a single Rust daemon that terminates TLS, gets and renews
 its own certificates, routes traffic to your internal services, and
 manages the host's nftables firewall to match. It has a small embedded
