@@ -13,6 +13,16 @@ instructions are in [Getting started](getting-started.md#1-install).
 service, and enables a nightly backup timer. Open the admin UI once to
 finish setup.
 
+`/etc/rust-proxy` is `root:rust-proxy 0770` and `config.toml` is `0660`,
+so the admin UI's System > Server page can save it. It writes a temp file
+in that folder and renames it over `config.toml`. For a manual install,
+set the same:
+
+```sh
+sudo chown root:rust-proxy /etc/rust-proxy /etc/rust-proxy/config.toml
+sudo chmod 770 /etc/rust-proxy && sudo chmod 660 /etc/rust-proxy/config.toml
+```
+
 ## The systemd unit
 
 `deploy/rust-proxy.service` runs the daemon as the non-root `rust-proxy`

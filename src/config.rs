@@ -1197,7 +1197,13 @@ impl Config {
         }
         let raw =
             std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_path_buf(), e))?;
-        let cfg: Config = toml::from_str(&raw)?;
+        Self::parse(&raw)
+    }
+
+    /// Parses and validates config.toml text -- the same rules startup
+    /// applies, used by the Server settings page before it writes a file.
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let cfg: Config = toml::from_str(raw)?;
         cfg.validate()?;
         Ok(cfg)
     }

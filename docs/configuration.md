@@ -2,7 +2,7 @@
 
 rust-proxy has two layers of configuration:
 
-- **`/etc/rust-proxy/config.toml`**: daemon-level settings (admin listener, ACME paths, network limits, SIEM, optional admin identity). Read at startup.
+- **`/etc/rust-proxy/config.toml`**: daemon-level settings (admin listener, ACME paths, network limits, SIEM, optional admin identity). Read at startup. Every setting can be changed from the admin UI under **System > Server**, so you never need to edit the file by hand (see below).
 - **The sqlite database** (`admin.db_path`): hosts, port rules, ACLs, DNS credentials, API tokens, certificates. Managed from the admin UI or the [API](api.md), and applied live with no restart.
 
 `hosts` and `port_rules` in `config.toml` only **seed an empty database on
@@ -13,6 +13,30 @@ starts with a working default.
 
 The shipped example file is heavily commented. This page explains the
 parts you are most likely to change.
+
+## System > Server
+
+The **Server** page under System shows every `config.toml` setting:
+network, admin UI, certificates and the identity forward token. Only the
+**primary admin** (the owner account created by the setup wizard, signed in
+with its password) can change them. Other admins and API tokens see the page
+read-only, and secrets are never shown.
+
+- **Saving.** Saving edits `config.toml` in place and keeps your comments.
+  The result is checked with the same rules startup uses, so a bad value is
+  refused and nothing is written. The previous file is kept as
+  `config.toml.bak`.
+- **Restart.** These settings apply after a restart. **Restart RustProxy**
+  runs the pre-flight first (the same checks as `rust-proxy check`) and does
+  not restart if it fails.
+- **Other buttons.** **Run pre-flight** shows the check on its own.
+  **Back up database now** writes a copy to a `backups` folder next to the
+  database.
+- **Settings with their own page.** Admin allowed addresses, "expose admin
+  port", the ACME contact email and SIEM forwarding normally live on their
+  own pages. If `config.toml` sets one of them, it overrides that page.
+  **Move** copies the value to the page and then removes it from
+  `config.toml`, so nothing changes in effect.
 
 ## `config.toml`
 

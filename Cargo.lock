@@ -2033,6 +2033,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "toml",
+ "toml_edit 0.22.27",
  "tower",
  "tower-cookies",
  "tower-http",

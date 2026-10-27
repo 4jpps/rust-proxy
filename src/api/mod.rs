@@ -12,6 +12,7 @@ pub mod hosting;
 pub mod license;
 pub mod metrics;
 pub mod routes;
+pub mod server_settings;
 pub mod trustbridge;
 
 use std::net::{IpAddr, SocketAddr};

@@ -678,6 +678,7 @@ const LOADERS = {
   defsite: () => jget('/api/default-site'),
   license: () => jget('/api/license'),
   siem: () => jget('/api/siem'),
+  server: () => jget('/api/server-settings'),
   pools: () => jget('/api/hosting/pools'),
   allocs: () => jget('/api/hosting/allocations'),
   hstatus: () => jget('/api/hosting/status'),
@@ -778,6 +779,7 @@ const SECTIONS = {
       { id: 'acme', label: 'ACME', write: 'admin', keys: ['acme'], render: pAcme, after: afterAcme },
       { id: 'clientcerts', label: 'Client certificates', write: 'admin', keys: ['tb', 'tbCerts'], actions: [{ label: 'Issue certificate', act: 'tb-cert-add' }], render: pClientCerts, after: afterClientCerts },
       { id: 'siem', label: 'SIEM', write: 'admin', keys: ['siem'], render: pSiem, after: afterSiem },
+      { id: 'server', label: 'Server', only: 'admin', keys: ['server'], render: pServer, after: afterServer },
       { id: 'about', label: 'About', keys: ['dash', 'license'], render: pAbout, after: afterAbout },
     ],
   },
@@ -1616,7 +1618,7 @@ ACTIONS['acl-manage'] = (el) => {
 function noteBanner(text) { return text ? `<div class="banner warn"><div class="grow">${esc(text)}</div></div>` : ''; }
 function pFirewall() {
   const s = D.fw, ipsLocked = s.allowed_ips_from_config;
-  return `${noteBanner(s.from_config ? "Set via config.toml's admin.expose_admin_port, which always takes precedence. Edit it there instead." : '')}${noteBanner(ipsLocked ? "The allowed addresses are set in config.toml (admin.allowed_ips), which always takes precedence. Edit them there instead." : '')}
+  return `${noteBanner(s.from_config ? "Set in config.toml (admin.expose_admin_port), which takes precedence. Change it under System > Server, or move it here from there." : '')}${noteBanner(ipsLocked ? "The allowed addresses are set in config.toml (admin.allowed_ips), which take precedence. Change them under System > Server, or move them here from there." : '')}
   <form id="fw-form" class="card settings" novalidate><h2>Admin port</h2>
     <div class="checks">${chk({ name: 'expose_admin_port', label: 'Expose the admin port through the firewall', checked: s.expose_admin_port, help: 'Off keeps the admin API reachable from this machine only.' }).replace('<input', s.from_config ? '<input disabled' : '<input')}</div>
     <div class="fgrid">${ta({ name: 'admin_allowed_ips', label: 'Allowed addresses', value: (s.admin_allowed_ips || []).join('\n'), rows: 5, mono: true, wide: true, help: 'One IP or CIDR per line. Empty allows any address. Loopback is always allowed. Saving a list that excludes your own address is refused so you cannot lock yourself out.' }).replace('<textarea', ipsLocked ? '<textarea disabled' : '<textarea')}</div>
@@ -1676,7 +1678,7 @@ function afterDefaultSite(root) {
 }
 function pAcme() {
   const s = D.acme;
-  return `${noteBanner(s.from_config ? "Set via config.toml's acme.contact_email, which always takes precedence. Edit it there instead." : '')}
+  return `${noteBanner(s.from_config ? "Set in config.toml (acme.contact_email), which takes precedence. Change it under System > Server, or move it here from there." : '')}
   <form id="acme-form" class="card settings" novalidate><h2>ACME account</h2>
     <p class="lead">The contact address sent to Let's Encrypt. It is required before any certificate can be issued.</p>
     <div class="fgrid">${fld({ name: 'contact_email', label: 'Contact email', type: 'email', value: s.contact_email || '', placeholder: 'admin@yourdomain.com', wide: true, attrs: s.from_config ? 'disabled' : '' })}</div>
@@ -1686,11 +1688,98 @@ function afterAcme(root) {
   const f = $('#acme-form', root); if (!f) return;
   pageForm(f, async () => { await send('PUT', '/api/acme-settings', { contact_email: f.contact_email.value }); toast('ACME settings saved', 'ok'); await refresh('acme', 'dash'); });
 }
+// System > Server: every config.toml setting. Built from the field list the
+// server sends, so a new setting needs no change here. Only the primary admin
+// can save; everyone else sees it read-only.
+function serverInput(f, dis) {
+  const name = f.key, v = f.value;
+  const help = f.help + (f.page && !f.in_file && f.kind !== 'opt_bool' ? ` Not set here, so ${f.page} applies.` : '');
+  switch (f.kind) {
+    case 'list': return ta({ name, label: f.label, value: (v || []).join('\n'), rows: 3, mono: true, help }).replace('<textarea', `<textarea ${dis}`);
+    case 'int': return fld({ name, label: f.label, type: 'number', value: v ?? '', help, attrs: `min="0" ${dis}` });
+    case 'text': case 'opt_text': return fld({ name, label: f.label, value: v ?? '', help, mono: true, attrs: dis });
+    case 'opt_bool': return sel({ name, label: f.label, value: v === null ? '' : String(v), help, attrs: dis, options: [['', f.page ? `Not set (${f.page} applies)` : 'Not set'], ['true', 'On'], ['false', 'Off']] });
+    case 'secret': return fld({ name, label: f.label, type: 'password', value: '', placeholder: f.in_file ? 'Set. Leave blank to keep it.' : 'Not set', help, attrs: `autocomplete="new-password" ${dis}` }) +
+      (dis ? '' : `<div class="field"><span class="lbl">&nbsp;</span><div class="row-actions"><button type="button" class="btn sm" data-srv-gen>Generate new</button>${f.in_file ? '<button type="button" class="btn sm ghost" data-srv-clear>Remove</button>' : ''}</div></div>`);
+    default: return `<div class="field"><span class="lbl">${esc(f.label)}</span><span class="mono">${esc(v ?? '')}</span><span class="help">${esc(help)}</span></div>`;
+  }
+}
+function pServer() {
+  const s = D.server, dis = s.can_edit ? '' : 'disabled';
+  const groups = [...new Set(s.fields.map((f) => f.group))];
+  const moves = s.fields.filter((f) => f.page && f.in_file);
+  return `${s.restart_pending ? '<div class="banner warn"><div class="grow">Saved settings are waiting for a restart. RustProxy is still running on the previous ones.</div></div>' : ''}
+  ${s.can_edit ? '' : noteBanner('Only the primary admin, signed in with a password, can change these settings.')}
+  <section class="card settings"><h2>Server</h2>
+    <p class="lead">Everything RustProxy reads from <span class="mono">${esc(s.config_path)}</span>. Changes are checked before they are saved, the previous file is kept as <span class="mono">config.toml.bak</span>, and they apply after a restart.</p>
+    <div class="form-actions"><button type="button" class="btn" data-srv="preflight"${dis ? ' disabled' : ''}>Run pre-flight</button><button type="button" class="btn primary" data-srv="restart"${dis ? ' disabled' : ''}>Restart RustProxy</button><button type="button" class="btn ghost" data-srv="backup"${dis ? ' disabled' : ''}>Back up database now</button></div>
+    <pre class="mono" id="srv-out" hidden style="white-space:pre-wrap;margin-top:var(--s-3)"></pre>
+  </section>
+  ${moves.length || s.siem_in_file ? `<section class="card"><h2>Set in config.toml, normally on their own page</h2><p class="lead">Moving one copies its current value to that page, so nothing changes in effect, and removes it from config.toml.</p><ul class="list">${moves.map((f) => `<li><span class="grow"><span class="m">${esc(f.label)}</span> <span class="sub">· normally on ${esc(f.page)}</span></span>${s.can_edit ? `<button type="button" class="btn sm" data-srv-move="${esc(f.key)}">Move</button>` : ''}</li>`).join('')}${s.siem_in_file ? `<li><span class="grow"><span class="m">SIEM forwarding ([siem] section)</span> <span class="sub">· normally on System > SIEM</span></span>${s.can_edit ? '<button type="button" class="btn sm" data-srv-move="siem">Move</button>' : ''}</li>` : ''}</ul></section>` : ''}
+  <form id="srv-form" class="card settings" novalidate>
+    ${groups.map((g) => `<fieldset><legend>${esc(g)}</legend><div class="fgrid">${s.fields.filter((f) => f.group === g).map((f) => serverInput(f, dis)).join('')}</div></fieldset>`).join('')}
+    <div class="form-actions"><button type="submit" class="btn primary"${dis ? ' disabled' : ''}>Save</button></div>
+  </form>`;
+}
+function serverValue(f, el) {
+  switch (f.kind) {
+    case 'list': return lines(el.value);
+    case 'int': return el.value.trim() === '' ? null : Number(el.value);
+    case 'opt_bool': return el.value === '' ? null : el.value === 'true';
+    case 'opt_text': return el.value.trim() || null;
+    default: return el.value.trim();
+  }
+}
+function afterServer(root) {
+  const s = D.server, f = $('#srv-form', root), out = $('#srv-out', root);
+  if (!f || !s.can_edit) return;
+  const show = (text) => { out.hidden = false; out.textContent = text; };
+  pageForm(f, async () => {
+    const changes = {};
+    for (const fd of s.fields) {
+      const el = f.elements[fd.key]; if (!el || fd.kind === 'read_only') continue;
+      if (fd.kind === 'secret') { if (el.value.trim()) changes[fd.key] = el.value.trim(); continue; }
+      const nv = serverValue(fd, el);
+      if (JSON.stringify(nv) !== JSON.stringify(fd.value ?? (fd.kind === 'list' ? [] : null))) changes[fd.key] = nv;
+    }
+    if (!Object.keys(changes).length) { toast('Nothing changed', 'info'); return; }
+    await send('PUT', '/api/server-settings', { changes });
+    toast('Saved to config.toml. Restart to apply.', 'ok'); await refresh('server');
+  });
+  root.querySelectorAll('[data-srv-move]').forEach((b) => b.addEventListener('click', async () => {
+    try { await send('POST', '/api/server-settings/move', { key: b.dataset.srvMove }); toast('Moved. Restart to apply.', 'ok'); await refresh('server'); } catch (x) { if (x.message !== 'unauthenticated') toast(x.message, 'error'); }
+  }));
+  const gen = $('[data-srv-gen]', root);
+  if (gen) gen.addEventListener('click', async () => {
+    if (!await confirmAsync({ title: 'Generate a new forward token', body: 'Upstreams that check the old token will stop trusting identity headers until they are given the new one. It is shown once.', confirmLabel: 'Generate' })) return;
+    try { const r = await send('POST', '/api/server-settings/generate-token'); show(`New identity forward token (shown once):\n${r.token}`); await refresh('server'); } catch (x) { if (x.message !== 'unauthenticated') toast(x.message, 'error'); }
+  });
+  const clr = $('[data-srv-clear]', root);
+  if (clr) clr.addEventListener('click', async () => {
+    try { await send('PUT', '/api/server-settings', { changes: { client_cert_forward_token: null } }); toast('Token removed. Restart to apply.', 'ok'); await refresh('server'); } catch (x) { if (x.message !== 'unauthenticated') toast(x.message, 'error'); }
+  });
+  root.querySelectorAll('[data-srv]').forEach((b) => b.addEventListener('click', async () => {
+    const act = b.dataset.srv;
+    if (act === 'restart' && !await confirmAsync({ title: 'Restart RustProxy', body: 'Runs the pre-flight first. If it passes, every site and the admin UI are down for a few seconds while RustProxy restarts on the saved settings.', confirmLabel: 'Restart' })) return;
+    setBusy(b, true);
+    try {
+      if (act === 'preflight') { const r = await send('POST', '/api/server/preflight'); show(r.lines.join('\n')); toast(r.ok ? 'Pre-flight passed' : 'Pre-flight failed', r.ok ? 'ok' : 'error'); }
+      if (act === 'backup') { const r = await send('POST', '/api/server/backup'); show(`Backup written: ${r.path} (${r.bytes} bytes)`); toast('Backed up', 'ok'); }
+      if (act === 'restart') {
+        const r = await send('POST', '/api/server/restart'); show(r.report.lines.join('\n'));
+        if (!r.restarting) { toast('Pre-flight failed. Not restarted.', 'error'); return; }
+        toast('Restarting…', 'info');
+        for (let i = 0; i < 30; i++) { await new Promise((ok) => setTimeout(ok, 2000)); try { await jget('/api/version'); location.reload(); return; } catch (_) { /* still down */ } }
+        show(out.textContent + '\n\nRustProxy has not come back after a minute. If the admin UI address or port changed, open it at the new address.');
+      }
+    } catch (x) { if (x.message !== 'unauthenticated') toast(x.message, 'error'); } finally { setBusy(b, false); }
+  }));
+}
 function pSiem() {
   const s = D.siem, st = s.stats || {}, dis = s.from_config ? 'disabled' : '';
   const cats = ['denied', 'admin', 'cert', 'system', 'access'];
   const status = st.active ? pill(st.last_error ? 'warn' : 'ok', 'Active') : pill('off', 'Not active');
-  return `${noteBanner(s.from_config ? "Set via config.toml's [siem] section, which always takes precedence. Edit it there instead." : '')}
+  return `${noteBanner(s.from_config ? "Set in config.toml's [siem] section, which takes precedence. Move it here from System > Server to edit it on this page." : '')}
   <form id="siem-form" class="card settings" novalidate>
     <h2>Syslog forwarding ${status}</h2>
     <p class="lead">${st.active ? `${esc(st.sent)} sent · ${esc(st.dropped)} dropped · ${esc(st.errors)} errors` : 'Events are not being forwarded.'}${st.last_error ? ` Last error: ${esc(st.last_error)}` : ''}</p>

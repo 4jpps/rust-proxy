@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+- **Every setting in the admin UI.** System > Server shows everything in
+  `config.toml` (network, admin UI, certificates, the identity forward
+  token) and lets the primary admin change it. Changes are checked before
+  saving, comments in the file are kept, and the previous file is saved
+  as `config.toml.bak`. **Restart RustProxy** applies them after a
+  passing pre-flight, and **Run pre-flight** and **Back up database now**
+  replace the command-line steps. A setting that `config.toml` overrides
+  on another page (admin allowed addresses, expose admin port, ACME
+  contact email, SIEM) can be moved back to that page in one click.
+  Packaging makes `/etc/rust-proxy` writable by the service, and the unit
+  restarts on exit code 75.
+
 - **Security: a port rule description or host domain could inject
   firewall rules.** Both were written into the nftables ruleset as
   comments, and a line break in the text turned the rest of it into live
