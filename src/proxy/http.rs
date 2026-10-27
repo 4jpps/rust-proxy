@@ -596,17 +596,75 @@ pub async fn serve_static_response<B>(
         _ => return static_not_found_response(),
     };
 
-    match tokio::fs::read(&file_path).await {
-        Ok(contents) => Response::builder()
-            .status(hyper::StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, content_type_for(&file_path))
-            .body(
-                http_body_util::Full::new(Bytes::from(contents))
-                    .map_err(|e: std::convert::Infallible| match e {})
-                    .boxed(),
-            )
-            .expect("static file response is always valid"),
-        Err(_) => static_not_found_response(),
+    // Streamed from disk in 64 KiB reads rather than loaded whole: many
+    // concurrent requests for a large file would otherwise each hold a
+    // full copy in memory.
+    let file = match tokio::fs::File::open(&file_path).await {
+        Ok(f) => f,
+        Err(_) => return static_not_found_response(),
+    };
+    let len = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(_) => return static_not_found_response(),
+    };
+    Response::builder()
+        .status(hyper::StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, content_type_for(&file_path))
+        .header(hyper::header::CONTENT_LENGTH, len)
+        .body(FileBody::new(file).boxed())
+        .expect("static file response is always valid")
+}
+
+/// A response body that reads a file as it's sent. A read error ends the
+/// body early; with Content-Length set the client sees it as truncated.
+struct FileBody {
+    file: tokio::fs::File,
+    buf: bytes::BytesMut,
+    done: bool,
+}
+
+const FILE_CHUNK: usize = 64 * 1024;
+
+impl FileBody {
+    fn new(file: tokio::fs::File) -> Self {
+        Self {
+            file,
+            buf: bytes::BytesMut::with_capacity(FILE_CHUNK),
+            done: false,
+        }
+    }
+}
+
+impl hyper::body::Body for FileBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        if this.buf.capacity() < FILE_CHUNK {
+            this.buf.reserve(FILE_CHUNK);
+        }
+        match tokio_util::io::poll_read_buf(std::pin::Pin::new(&mut this.file), cx, &mut this.buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => {
+                this.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Ok(_)) => Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                this.buf.split().freeze(),
+            )))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
     }
 }
 
@@ -1848,6 +1906,18 @@ mod tests {
         let req = Request::builder().uri("/nope.html").body(()).unwrap();
         let resp = serve_static_response(&req, root.path()).await;
         assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_streams_a_large_file_intact() {
+        let root = static_root_fixture();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(root.path().join("big.bin"), &data).unwrap();
+        let req = Request::builder().uri("/big.bin").body(()).unwrap();
+        let resp = serve_static_response(&req, root.path()).await;
+        assert_eq!(resp.headers()[hyper::header::CONTENT_LENGTH], "300000");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), data.as_slice());
     }
 
     #[tokio::test]

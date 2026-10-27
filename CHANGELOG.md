@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+- **Security: a port rule description or host domain could inject
+  firewall rules.** Both were written into the nftables ruleset as
+  comments, and a line break in the text turned the rest of it into live
+  rules. Anyone who could edit hosts or port rules (Admin or Operator)
+  could open ports or reach tables outside RustProxy's own. Comment text
+  is now flattened to one printable line, domains must use hostname
+  characters, and descriptions must be a single line.
+
+- **Health check.** `GET /healthz` on the admin port reports database,
+  firewall, certificate expiry, disk space, file descriptors and hosting,
+  with `200` or `503`. See Deployment.
+
+- **`rust-proxy check` before an upgrade.** Runs the new binary against
+  the live config and a snapshot of the database, and validates the
+  firewall ruleset with `nft -c`, without changing anything.
+
+- **Firewall preview.** `GET /api/firewall/preview` shows what the next
+  apply would change; `POST` previews a change before you make it and
+  warns if it would lock you out of the admin port.
+
+- **Protection against connection floods.** A client can hold at most
+  `max_connections_per_ip` connections (default 256, per /64 for IPv6).
+  A TLS handshake must finish within 10 seconds, HTTP/1 request headers
+  within 30, and idle HTTP/2 connections are pinged and dropped if they
+  stop answering. Before this, a client could open connections and send
+  nothing, holding them open indefinitely.
+
+- **Per-site rate limit.** New `rate_limit_per_minute` host setting
+  ("Requests per minute, per visitor" in the UI) answers `429` with
+  `Retry-After` over the limit. Off by default.
+
+- **TCP and UDP port rules survive "too many open files".** A TCP
+  passthrough listener used to stop for good on an accept error until its
+  rule changed; it now waits briefly and carries on. UDP sessions are
+  capped per client and overall, and a session from an address that
+  never gets a reply expires after 2 minutes.
+
+- **Static sites stream files from disk** instead of loading each whole
+  file into memory per request.
+
 - **Mobile passes: get past IP allow lists from your phone.** An IP allow
   list can now accept "mobile pass logins" from a login list. The new
   RustProxy Mobile Pass app signs in with one of those logins, and while
