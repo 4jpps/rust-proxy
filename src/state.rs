@@ -126,6 +126,8 @@ struct Inner {
     /// Outcome of the main table's last nftables sync, plus the exact
     /// ruleset text it applied (for `/healthz` and the firewall preview).
     firewall_status: ArcSwap<FirewallStatus>,
+    /// Per-client concurrent connection cap shared by every proxy listener.
+    conn_limiter: Arc<crate::proxy::limits::ConnLimiter>,
     /// Pools and allocations are validated against each other, so they
     /// share one write lock.
     hosting_write_lock: Mutex<()>,
@@ -154,7 +156,10 @@ impl AppState {
         initial_acme_contact_email: Option<String>,
         initial_expose_admin_port: Option<bool>,
     ) -> Self {
+        let conn_limiter =
+            crate::proxy::limits::ConnLimiter::new(cfg.network.max_connections_per_ip);
         Self(Arc::new(Inner {
+            conn_limiter,
             network: cfg.network,
             admin: cfg.admin,
             acme: cfg.acme,
@@ -238,6 +243,10 @@ impl AppState {
 
     pub fn set_hosting_status(&self, status: HostingStatus) {
         self.0.hosting_status.store(Arc::new(status));
+    }
+
+    pub fn conn_limiter(&self) -> &Arc<crate::proxy::limits::ConnLimiter> {
+        &self.0.conn_limiter
     }
 
     pub fn firewall_status(&self) -> Arc<FirewallStatus> {
@@ -500,6 +509,7 @@ mod tests {
                 bind_ranges: vec!["10.0.0.0/29".parse().unwrap()],
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
+                max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),

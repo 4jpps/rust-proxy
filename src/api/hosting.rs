@@ -670,6 +670,7 @@ mod tests {
                 bind_ranges: vec!["204.52.221.224/27".parse().unwrap()],
                 dedicated_ips: dedicated,
                 dhcp_interfaces: vec![],
+                max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),

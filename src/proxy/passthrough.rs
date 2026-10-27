@@ -21,12 +21,27 @@ use tokio::net::TcpListener;
 pub async fn run_tcp_passthrough(
     bind_addr: SocketAddr,
     upstream: SocketAddr,
+    limiter: Arc<super::limits::ConnLimiter>,
 ) -> std::io::Result<()> {
     let listener = crate::netbind::bind_tcp_listener(bind_addr)?;
     tracing::info!(%bind_addr, %upstream, "tcp passthrough listening");
     loop {
-        let (mut inbound, peer) = listener.accept().await?;
+        // An accept error (EMFILE under fd pressure) must not end the
+        // listener: nothing restarts it until its rule changes.
+        let (mut inbound, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(%bind_addr, error = %err, "tcp passthrough accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Some(slot) = limiter.try_acquire(peer.ip()) else {
+            tracing::debug!(%peer, "tcp passthrough: per-client connection limit reached");
+            continue;
+        };
         tokio::spawn(async move {
+            let _slot = slot;
             match super::connect::connect_upstream(upstream).await {
                 Ok(mut outbound) => {
                     if let Err(err) =
@@ -45,6 +60,10 @@ pub async fn run_tcp_passthrough(
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_BUF_SIZE: usize = 64 * 1024;
+/// Each session owns an upstream socket (a file descriptor), so the table
+/// is capped; datagrams from new clients beyond it are dropped until
+/// idle sessions are reaped.
+const MAX_UDP_SESSIONS: usize = 4096;
 
 /// UDP has no connection to accept, so this keeps a small NAT-like session
 /// table keyed by client address: the first datagram from a new client
@@ -63,15 +82,36 @@ pub async fn run_udp_passthrough(
     let mut buf = vec![0u8; UDP_BUF_SIZE];
 
     loop {
-        let (len, client_addr) = socket.recv_from(&mut buf).await?;
+        let (len, client_addr) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::debug!(%bind_addr, error = %err, "udp passthrough recv failed");
+                continue;
+            }
+        };
 
         let upstream_socket = {
             let mut guard = sessions.lock().await;
             if let Some(existing) = guard.get(&client_addr) {
                 existing.clone()
             } else {
-                let new_socket = Arc::new(UdpSocket::bind(("0.0.0.0", 0)).await?);
-                new_socket.connect(upstream).await?;
+                if guard.len() >= MAX_UDP_SESSIONS {
+                    tracing::debug!(%client_addr, "udp passthrough: session table full, datagram dropped");
+                    continue;
+                }
+                // A failed bind/connect (fd pressure) drops this datagram
+                // rather than ending the listener.
+                let new_socket = match UdpSocket::bind(("0.0.0.0", 0)).await {
+                    Ok(s) => Arc::new(s),
+                    Err(err) => {
+                        tracing::warn!(%client_addr, error = %err, "udp passthrough: upstream socket failed");
+                        continue;
+                    }
+                };
+                if let Err(err) = new_socket.connect(upstream).await {
+                    tracing::warn!(%client_addr, %upstream, error = %err, "udp passthrough: upstream connect failed");
+                    continue;
+                }
                 guard.insert(client_addr, new_socket.clone());
                 spawn_udp_return_path(
                     new_socket.clone(),
@@ -139,7 +179,11 @@ mod tests {
         let passthrough_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind_addr = passthrough_listener.local_addr().unwrap();
         drop(passthrough_listener); // release the port for run_tcp_passthrough to rebind
-        tokio::spawn(run_tcp_passthrough(bind_addr, upstream_addr));
+        tokio::spawn(run_tcp_passthrough(
+            bind_addr,
+            upstream_addr,
+            super::super::limits::ConnLimiter::new(0),
+        ));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = tokio::net::TcpStream::connect(bind_addr).await.unwrap();

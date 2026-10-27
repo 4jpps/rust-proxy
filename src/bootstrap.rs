@@ -228,6 +228,7 @@ mod tests {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
+                max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
             },
             admin: crate::config::AdminConfig {
                 bind_ip_v4: Some(Ipv4Addr::UNSPECIFIED),

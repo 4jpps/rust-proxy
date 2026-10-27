@@ -300,6 +300,18 @@ pub struct NetworkConfig {
     /// accept`. rust-proxy does not serve DHCP itself.
     #[serde(default)]
     pub dhcp_interfaces: Vec<String>,
+    /// Most connections one client may hold open at once across every
+    /// proxy listener (HTTPS, port 80, TCP passthrough); IPv6 clients are
+    /// counted per /64. A browser uses well under ten per site, so the
+    /// default only stops floods. 0 turns the cap off.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+}
+
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
+
+fn default_max_connections_per_ip() -> usize {
+    DEFAULT_MAX_CONNECTIONS_PER_IP
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

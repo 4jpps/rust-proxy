@@ -76,6 +76,11 @@ pub async fn report(state: &AppState) -> HealthReport {
         certificates(state),
         disk(&state.admin().db_path),
         file_descriptors(),
+        check(
+            "clients",
+            true,
+            format!("{} with open connections", state.conn_limiter().clients()),
+        ),
     ];
     let hosting = state.hosting_status();
     if hosting.last_sync_at.is_some() && !hosting.inert {
