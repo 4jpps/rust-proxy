@@ -91,6 +91,7 @@ fn reconcile(
             key.1,
             key.2,
             state.conn_limiter().clone(),
+            state.network().max_connections_per_ip,
         )
     });
 }
@@ -557,6 +558,19 @@ async fn route_https_request(
         router::match_host(&state.hosts(), bind_ip, bind_port, name)
             .and_then(|h| h.hsts_header_value())
     });
+    // Per-site rate limit, before anything else (login page, ACLs,
+    // upstream) spends work on the request.
+    if let Some(wait) = lookup_name.as_deref().and_then(|name| {
+        let hosts = state.hosts();
+        let host = router::match_host(&hosts, bind_ip, bind_port, name)?;
+        state
+            .rate_limiter()
+            .check(host.id, peer_ip, host.rate_limit_per_minute)
+            .err()
+    }) {
+        tracing::debug!(%peer_ip, host = lookup_name.as_deref().unwrap_or("-"), "rate limited");
+        return Ok(too_many_requests(wait));
+    }
     let mut result = route_https_request_inner(
         state,
         bind_ip,
@@ -1155,6 +1169,7 @@ fn spawn_passthrough_listener(
     port: u16,
     protocol: Protocol,
     limiter: Arc<limits::ConnLimiter>,
+    max_per_client: usize,
 ) -> JoinHandle<()> {
     let target = port_rules
         .iter()
@@ -1179,7 +1194,9 @@ fn spawn_passthrough_listener(
         };
         let result = match protocol {
             Protocol::Tcp => passthrough::run_tcp_passthrough(bind_addr, upstream, limiter).await,
-            Protocol::Udp => passthrough::run_udp_passthrough(bind_addr, upstream, limiter).await,
+            Protocol::Udp => {
+                passthrough::run_udp_passthrough(bind_addr, upstream, max_per_client).await
+            }
         };
         if let Err(err) = result {
             tracing::error!(%bind_addr, error = %err, "passthrough listener exited");
@@ -1394,6 +1411,24 @@ fn forbidden_page(domain: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
                 .boxed(),
         )
         .expect("static forbidden page response is always valid")
+}
+
+/// 429 for a client over a site's `rate_limit_per_minute`, with how many
+/// whole seconds to wait.
+fn too_many_requests(wait: std::time::Duration) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+    Response::builder()
+        .status(hyper::StatusCode::TOO_MANY_REQUESTS)
+        .header(hyper::header::RETRY_AFTER, secs.to_string())
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(
+            http_body_util::Full::new(Bytes::from_static(
+                b"Too many requests. Please slow down and try again shortly.\n",
+            ))
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed(),
+        )
+        .expect("static 429 response is always valid")
 }
 
 fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {

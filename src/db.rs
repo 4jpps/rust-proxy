@@ -3887,6 +3887,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_round_trips_through_the_hosts_table() {
+        let pool = memory_pool().await;
+        let mut host = sample_host();
+        host.rate_limit_per_minute = 600;
+        save_hosts(&pool, &[host, sample_host()]).await.unwrap();
+        let mut limits: Vec<u32> = load_hosts(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.rate_limit_per_minute)
+            .collect();
+        limits.sort();
+        assert_eq!(limits, [0, 600]);
+    }
+
+    #[tokio::test]
     async fn hsts_flags_round_trip_through_the_hosts_table() {
         let pool = memory_pool().await;
         let mut host = sample_host();

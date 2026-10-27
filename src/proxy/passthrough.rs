@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -62,16 +62,21 @@ pub async fn run_tcp_passthrough(
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_BUF_SIZE: usize = 64 * 1024;
 /// Each session owns an upstream socket (a file descriptor), so the table
-/// is capped overall; each session also holds a slot from the shared
-/// per-client limiter, so one client (or /64) varying its source port
-/// can't take the whole table from everyone else.
+/// is capped overall; each session also holds a slot from this listener's
+/// own per-client limiter, so one client (or /64) varying its source port
+/// can't take the whole table from everyone else. UDP sources can be
+/// forged, so this limiter is never the one shared with TCP/HTTPS: a
+/// spoofed flood can't use up a real visitor's web allowance.
 const MAX_UDP_SESSIONS: usize = 4096;
 
 struct UdpSession {
     upstream: Arc<UdpSocket>,
-    /// When the client last sent anything, as ms since `epoch` -- a
-    /// session stays alive while either side is talking.
+    /// When the client last sent anything, as ms since `epoch`.
     last_client_ms: AtomicU64,
+    /// Set once the upstream has answered. Only then does client traffic
+    /// alone keep the session open -- forged sources never get a reply
+    /// path, so their sessions expire on the plain idle timeout.
+    upstream_replied: AtomicBool,
     epoch: Instant,
     _slot: super::limits::ConnGuard,
 }
@@ -99,10 +104,11 @@ type UdpSessions = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSession>>>>;
 pub async fn run_udp_passthrough(
     bind_addr: SocketAddr,
     upstream: SocketAddr,
-    limiter: Arc<super::limits::ConnLimiter>,
+    max_sessions_per_client: usize,
 ) -> std::io::Result<()> {
     let socket = Arc::new(crate::netbind::bind_udp_socket(bind_addr)?);
     tracing::info!(%bind_addr, %upstream, "udp passthrough listening");
+    let limiter = super::limits::ConnLimiter::new(max_sessions_per_client);
 
     let sessions: UdpSessions = Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; UDP_BUF_SIZE];
@@ -145,6 +151,7 @@ pub async fn run_udp_passthrough(
                 let session = Arc::new(UdpSession {
                     upstream: new_socket,
                     last_client_ms: AtomicU64::new(0),
+                    upstream_replied: AtomicBool::new(false),
                     epoch: Instant::now(),
                     _slot: slot,
                 });
@@ -180,6 +187,7 @@ fn spawn_udp_return_path(
                     .await;
             match recv {
                 Ok(Ok(len)) => {
+                    session.upstream_replied.store(true, Ordering::Relaxed);
                     if let Err(err) = client_facing_socket.send_to(&buf[..len], client_addr).await {
                         tracing::debug!(%client_addr, error = %err, "udp passthrough: send to client failed");
                         break;
@@ -189,8 +197,14 @@ fn spawn_udp_return_path(
                     tracing::debug!(%client_addr, error = %err, "udp passthrough: upstream recv failed");
                     break;
                 }
-                // Upstream quiet: keep the session while the client still talks.
-                Err(_timeout) if session.client_idle() < UDP_SESSION_IDLE_TIMEOUT => continue,
+                // Upstream quiet: keep an answered session while the client
+                // still talks.
+                Err(_timeout)
+                    if session.upstream_replied.load(Ordering::Relaxed)
+                        && session.client_idle() < UDP_SESSION_IDLE_TIMEOUT =>
+                {
+                    continue;
+                }
                 Err(_timeout) => break,
             }
         }
@@ -246,11 +260,7 @@ mod tests {
         let bind_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind_addr = bind_socket.local_addr().unwrap();
         drop(bind_socket);
-        tokio::spawn(run_udp_passthrough(
-            bind_addr,
-            upstream_addr,
-            super::super::limits::ConnLimiter::new(0),
-        ));
+        tokio::spawn(run_udp_passthrough(bind_addr, upstream_addr, 0));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

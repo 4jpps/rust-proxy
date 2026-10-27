@@ -128,6 +128,7 @@ struct Inner {
     firewall_status: ArcSwap<FirewallStatus>,
     /// Per-client concurrent connection cap shared by every proxy listener.
     conn_limiter: Arc<crate::proxy::limits::ConnLimiter>,
+    rate_limiter: crate::proxy::limits::RateLimiter,
     /// Pools and allocations are validated against each other, so they
     /// share one write lock.
     hosting_write_lock: Mutex<()>,
@@ -160,6 +161,7 @@ impl AppState {
             crate::proxy::limits::ConnLimiter::new(cfg.network.max_connections_per_ip);
         Self(Arc::new(Inner {
             conn_limiter,
+            rate_limiter: Default::default(),
             network: cfg.network,
             admin: cfg.admin,
             acme: cfg.acme,
@@ -247,6 +249,10 @@ impl AppState {
 
     pub fn conn_limiter(&self) -> &Arc<crate::proxy::limits::ConnLimiter> {
         &self.0.conn_limiter
+    }
+
+    pub fn rate_limiter(&self) -> &crate::proxy::limits::RateLimiter {
+        &self.0.rate_limiter
     }
 
     pub fn firewall_status(&self) -> Arc<FirewallStatus> {
