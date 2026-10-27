@@ -36,7 +36,7 @@ short script against the [API](api.md).
 | Client certificates (hand-written nginx config) | A [client-certificate ACL](access-control.md#client-certificate), with issuing, revocation and an organization lock in System, Client certificates |
 | Advanced tab (custom nginx config) | No equivalent. Closest are `path_rewrite` and `rewrite_samesite_none_cookies` |
 | Custom Locations (different upstream per path) | `locations` (see [Configuration](configuration.md#custom-locations)) |
-| 404 Hosts | **Hosts, Add 404 host** in the UI, or `fixed_response` in the API (see [Configuration](configuration.md#fixed-response-hosts)) |
+| 404 Hosts | **Hosts, Add 404 host** (or the **Maintenance / 404** site type) in the UI, or `fixed_response` in the API (see [Configuration](configuration.md#fixed-response-hosts)) |
 | Settings, Default Site | **System, Default site**: not found, congratulations page, no response, redirect or custom HTML (see [Configuration](configuration.md#default-site)). TLS connections for names with no certificate are refused before this applies |
 | HSTS Enabled, HSTS Sub-domains | `hsts`, `hsts_subdomains` (see [Configuration](configuration.md#hsts)). No `preload` flag |
 | Users and roles | Users tab with `admin`, `operator` and `viewer` roles (see [Users and roles](users-and-roles.md)). NPM's finer per-section permissions have no equivalent |

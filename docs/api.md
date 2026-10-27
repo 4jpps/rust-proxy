@@ -109,6 +109,7 @@ curl -X POST https://proxy.example.com/api/hosts \
 | GET | `/api/certs` | `{domain, not_after, days_remaining}` per issued or uploaded certificate |
 | POST | `/api/certs` | `{"domain","fullchain_pem","private_key_pem"}`: upload your own |
 | DELETE | `/api/certs/:domain` | |
+| POST | `/api/certs/renew` | `{"domain"}`: renews an Auto-SSL certificate now and answers when it is issued or has failed. Only for an enabled host with ACME on, or a tracked standalone DNS-01 certificate (400 otherwise); 409 while a renewal of the same domain is already running |
 | GET | `/api/dns01-certs` | Tracked standalone certificates |
 | POST | `/api/dns01-certs` | `{"domain","dns_credential_id","organization","organizational_unit"}`. Issues synchronously (up to a minute) and persists only on success |
 | DELETE | `/api/dns01-certs/:id` | Stops renewal tracking. The issued certificate keeps working |

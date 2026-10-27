@@ -34,6 +34,21 @@ or take it off the wire entirely with
 
 ![The Firewall settings tab with the admin port exposure toggle.](screenshots/firewall-settings.png)
 
+The same tab shows the firewall's status: when it was last updated,
+whether that worked, and any changes waiting for the next update. If an
+update fails, the last rules that worked stay in place and Overview lists
+it under "Needs attention".
+
+## Checking a change before saving
+
+Saving a site, adding or deleting a port rule, or changing the admin
+port settings first asks RustProxy what the firewall would look like
+afterwards (`POST /api/firewall/preview`). If anything would change,
+you see the added (green) and removed (red) lines before you confirm. If
+the change would stop your own address reaching the admin page, a red
+warning says so and the button becomes **Save anyway**. A change that
+leaves the firewall as it is saves straight away.
+
 ## Port rules (TCP/UDP passthrough)
 
 A port rule opens a port or a range and, if you give it a

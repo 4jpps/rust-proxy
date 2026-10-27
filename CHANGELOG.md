@@ -1,7 +1,30 @@
 # Changelog
 
-## [Unreleased]
+## [0.6.0] - 2026-10-27
 
+- **Firewall changes are shown before they are saved.** Saving a site,
+  adding or deleting a port rule, or changing the admin port settings now
+  previews the firewall first: the lines that would be added and removed,
+  and a clear warning (with **Save anyway**) if the change would lock you
+  out of the admin page. A save that leaves the firewall unchanged goes
+  straight through. Firewall settings and Overview show whether the last
+  firewall update worked.
+- **Site types.** Add site starts with a choice of **Web app**,
+  **Redirect**, **Static files** or **Maintenance / 404**, and the form
+  shows only that type's fields. Switching type keeps what you typed.
+  Maintenance starts with a ready-made 503 page.
+- **Plainer labels and help.** "Send traffic to (upstream)", "Server
+  address", "Auto-SSL (ACME)", "Who can visit", "Block malicious requests",
+  "What blocked visitors see" and so on. Each section has a ⓘ link and each
+  page a **Guide** button to the matching RustProxy wiki page.
+- **Copy a site** from its row, and **sort sites by certificate expiry**.
+- **Renew now** on the Certificates page for Auto-SSL certificates
+  (`POST /api/certs/renew`), plus a **Managed by** column (Auto-SSL or
+  Uploaded). The list is sorted soonest-to-expire first.
+- **Plain-language errors.** Common failures (firewall update, Auto-SSL DNS
+  or web check, an unreachable server, a lost connection to RustProxy)
+  start with what went wrong and what to check, then the technical detail.
+- **Phones:** the top bar no longer makes pages wider than the screen.
 - **Mobile passes can open port rules too.** An IP allow list that accepts
   mobile passes has a new option, **Also open port rules and hosted
   ports** (off by default). With it on, every port rule and hosted VM port

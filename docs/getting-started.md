@@ -77,13 +77,23 @@ zone.
 
 ## 4. Add your first host
 
-On the Hosts tab, under "Add a host":
+On Sites, Hosts, click **Add site**:
 
-1. **Domain:** `app.example.com`.
-2. **Upstream:** `127.0.0.1:8000`, the internal service as `host:port`.
-3. Leave "Issue/renew a certificate automatically" checked.
-4. Pick the challenge type (`auto` is a good default) and, for dns-01, the credential from step 3.
-5. Click "Add host".
+1. **Site type:** leave **Web app** selected. The other types are
+   **Redirect**, **Static files** and **Maintenance / 404**, and each shows
+   only the fields it needs.
+2. **Domain:** `app.example.com`.
+3. **Send traffic to (upstream):** `127.0.0.1:8000`, the internal service as `host:port`.
+4. Under **HTTPS certificate**, leave **Auto-SSL (ACME)** checked and pick how
+   to prove you own the domain (**Automatic** is a good default). For the DNS
+   check, choose the credential from step 3.
+5. Click **Add site**. If the firewall changes, RustProxy shows you the
+   change first (see [Firewall](firewall.md#checking-a-change-before-saving));
+   confirm it to save.
+
+Each section has a ⓘ link, and each page a **Guide** button, that opens the
+matching page of the RustProxy wiki. **Copy** on a site's row starts a new
+site with the same settings.
 
 The certificate is requested in the background and renewed
 automatically. The same thing through the API, with a token (see
