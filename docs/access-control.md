@@ -55,12 +55,14 @@ How it works:
 
 What a pass is, exactly:
 
-- **Only the current IP.** The app checks in every few minutes and the
-  moment the phone changes networks. Each check-in *replaces* that
-  phone's IP, so the network it just left is no longer let in.
-- **Short.** A pass lasts 10 minutes from its last check-in. A phone that
+- **Only the current IP.** The app checks in about every 30 seconds and
+  the moment the phone changes networks. Each check-in *replaces* that
+  phone's IP, so the network it just left is no longer let in, including
+  when the public IP changes without the phone noticing (carrier NAT).
+- **Short.** A pass lasts 90 seconds from its last check-in. A phone that
   goes offline, or whose app is switched off without reaching the proxy,
-  drops out on its own.
+  drops out within that time. Use app 0.2.0 or later; 0.1.0 checked in
+  only every 4 minutes.
 - **Switched off means off.** Turning the app's switch off signs the
   phone out and ends its pass immediately.
 - **Nothing remembered.** Passes are held in memory only. No list of past

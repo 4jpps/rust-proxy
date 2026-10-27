@@ -54,6 +54,14 @@
 - **Static sites stream files from disk** instead of loading each whole
   file into memory per request.
 
+- **Mobile passes end within 90 seconds, not 10 minutes.** Each check-in
+  now lasts 90 seconds and the app (0.2.0) checks in about every 30
+  seconds, so a phone that goes offline, is closed, or whose public IP
+  changes underneath it is dropped almost at once. Switching the app off
+  still ends the pass immediately, and a new IP still replaces the old
+  one on the spot. Update the app to 0.2.0 first: 0.1.0 checks in only
+  every 4 minutes and its pass would lapse between check-ins.
+
 - **Mobile passes: get past IP allow lists from your phone.** An IP allow
   list can now accept "mobile pass logins" from a login list. The new
   RustProxy Mobile Pass app signs in with one of those logins, and while
