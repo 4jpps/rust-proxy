@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.1] - 2026-10-27
+
+- **Security: TLS library update.** rustls 0.23.46 fixes four advisories
+  (RUSTSEC-2026-0346 to 0349): secrets visible in debug output, data sent
+  to the wrong server after an Encrypted Client Hello rejection, up to
+  1 GiB allocated while decompressing a certificate before authentication,
+  and an unauthenticated ServerHello weakening later key exchanges.
+  rustls-webpki and webpki-roots are updated so distrusted intermediate and
+  root certificates are refused (RUSTSEC-2026-0381, 0382).
+- **Security: XML parsing for the Namecheap and Route53 DNS providers.**
+  quick-xml 0.42 removes a quadratic-time and an unbounded-memory problem
+  with hostile XML (RUSTSEC-2026-0194, 0195). A reply cut off part way
+  through no longer hangs the parser, and characters such as `&` in a
+  provider's error message are kept.
+
 ## [0.6.0] - 2026-10-27
 
 - **Firewall changes are shown before they are saved.** Saving a site,
