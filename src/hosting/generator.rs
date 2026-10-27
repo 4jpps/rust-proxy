@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::model::{Allocation, ForwardMode, PortSpec};
 use crate::config::Protocol;
+use crate::nftables::generator::PASS_CT_MARK;
 
 pub const TABLE: &str = "rust_proxy_hosting";
 
@@ -131,6 +132,10 @@ pub fn generate_ruleset_full(
         );
     }
 
+    // Forward-chain lines that keep each pass-admitted connection alive only
+    // while the rule that admitted it still would (see `PASS_CT_MARK`).
+    let mut revalidate: Vec<String> = Vec::new();
+
     let _ = writeln!(out, "    chain prerouting {{");
     let _ = writeln!(
         out,
@@ -156,8 +161,9 @@ pub fn generate_ruleset_full(
                     // Each source clause gets its own DNAT rule: the lists'
                     // own networks, then each accepted Login list's live
                     // mobile passes.
-                    let sources: Vec<String> = if acls.is_empty() {
-                        vec![String::new()]
+                    // (match, pass set name if the match is a pass set)
+                    let sources: Vec<(String, Option<String>)> = if acls.is_empty() {
+                        vec![(String::new(), None)]
                     } else {
                         let mut nets: Vec<Ipv4Net> = acls
                             .iter()
@@ -174,14 +180,11 @@ pub fn generate_ruleset_full(
                         let mut sources = Vec::new();
                         if !nets.is_empty() {
                             let items: Vec<String> = nets.iter().map(Ipv4Net::to_string).collect();
-                            sources.push(format!("ip saddr {{ {} }} ", items.join(", ")));
+                            sources.push((format!("ip saddr {{ {} }} ", items.join(", ")), None));
                         }
                         for login in logins {
-                            sources.push(format!(
-                                "ip saddr @{} ct mark set {} ",
-                                crate::nftables::generator::pass_set_name(login, false),
-                                crate::nftables::generator::PASS_CT_MARK
-                            ));
+                            let set = crate::nftables::generator::pass_set_name(login, false);
+                            sources.push((format!("ip saddr @{set} "), Some(set)));
                         }
                         if sources.is_empty() {
                             continue;
@@ -216,11 +219,29 @@ pub fn generate_ruleset_full(
                                 Some(vp) => format!("{vm}:{vp}"),
                                 None => vm.to_string(),
                             };
-                            for source in &sources {
+                            for (source, pass_set) in &sources {
+                                // The mark goes after every match, so only a
+                                // connection this rule really admits gets it.
+                                let mark = if pass_set.is_some() {
+                                    format!("ct mark set {PASS_CT_MARK} ")
+                                } else {
+                                    String::new()
+                                };
                                 let _ = writeln!(
                                     out,
-                                    "        ip daddr {public} {source}{name} dport {set} dnat to {to}"
+                                    "        ip daddr {public} {source}{name} dport {set} {mark}dnat to {to}"
                                 );
+                                if let Some(pass_set) = pass_set {
+                                    // After DNAT the packet is addressed to the
+                                    // VM, on the translated port if there is one.
+                                    let vm_ports = match vm_port {
+                                        Some(vp) => vp.to_string(),
+                                        None => set.clone(),
+                                    };
+                                    revalidate.push(format!(
+                                        "ct direction original ct mark {PASS_CT_MARK} ip daddr {vm} ip saddr @{pass_set} {name} dport {vm_ports} accept"
+                                    ));
+                                }
                             }
                         }
                     }
@@ -275,13 +296,6 @@ pub fn generate_ruleset_full(
         out,
         "        type filter hook forward priority -10; policy accept;"
     );
-    // A forwarded connection a mobile pass let in ends with the pass (see
-    // `nftables::generator::PASS_CT_MARK`).
-    if !active.is_empty() {
-        for rule in crate::nftables::generator::pass_revocation_rules(&pass_logins, "ip") {
-            let _ = writeln!(out, "        {rule}");
-        }
-    }
     if !active.is_empty() {
         let vms: Vec<Ipv4Addr> = active.iter().filter_map(|a| a.vm_ip).collect();
         if !blocks.global.is_empty() && !vms.is_empty() {
@@ -296,6 +310,13 @@ pub fn generate_ruleset_full(
             out,
             "        ip saddr {} ip daddr {{ {PRIVATE_NETS} }} ct state new drop",
             ip_set(&vms)
+        );
+        for line in &revalidate {
+            let _ = writeln!(out, "        {line}");
+        }
+        let _ = writeln!(
+            out,
+            "        ct direction original ct mark {PASS_CT_MARK} drop"
         );
     }
     let _ = writeln!(out, "    }}");
@@ -714,14 +735,14 @@ mod tests {
         assert!(out.contains("ip daddr 44.30.51.254 ip saddr { 172.16.0.0/16 } tcp dport { 22 } dnat to 100.64.244.254\n"), "{out}");
         assert!(
             out.contains(&format!(
-                "ip daddr 44.30.51.254 ip saddr @{set} ct mark set {} tcp dport {{ 22 }} dnat to 100.64.244.254\n",
+                "ip daddr 44.30.51.254 ip saddr @{set} tcp dport {{ 22 }} ct mark set {} dnat to 100.64.244.254\n",
                 crate::nftables::generator::PASS_CT_MARK
             )),
             "{out}"
         );
         assert!(
             out.contains(&format!(
-                "ct direction original ct mark {} ip saddr != @{set} drop",
+                "ct direction original ct mark {0} ip daddr 100.64.244.254 ip saddr @{set} tcp dport {{ 22 }} accept\n        ct direction original ct mark {0} drop\n",
                 crate::nftables::generator::PASS_CT_MARK
             )),
             "{out}"
@@ -731,7 +752,7 @@ mod tests {
         assert_eq!(out.matches("dnat to").count(), 1, "{out}");
         assert!(
             out.contains(&format!(
-                "ip saddr @{set} ct mark set {} tcp dport {{ 22 }} dnat",
+                "ip saddr @{set} tcp dport {{ 22 }} ct mark set {} dnat",
                 crate::nftables::generator::PASS_CT_MARK
             )),
             "{out}"

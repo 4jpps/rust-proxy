@@ -51,38 +51,55 @@ pub fn pass_set_name(login_list: Uuid, v6: bool) -> String {
     format!("mp{}_{}", if v6 { 6 } else { 4 }, login_list.simple())
 }
 
-/// Conntrack mark on a connection a mobile pass let in. The accept that
-/// admits it through a pass set sets the mark; a marked connection whose
-/// source is no longer in any pass set is dropped before the
-/// established-connection accept, so signing out, a new IP or expiry ends
-/// open sessions too, not just new connections. Shared with the hosting table.
+/// Conntrack mark on a connection a mobile pass let in, set by the rule
+/// that admitted it through a pass set. Established packets of a marked
+/// connection are re-checked against that same rule (its port, address and
+/// pass sets) before the generic established-connection accept, and dropped
+/// if it no longer matches, so signing out, a new IP or expiry ends open
+/// sessions too. Shared with the hosting table, whose forward chain does the
+/// same for DNAT'd connections. Nothing else on the proxy uses ct marks.
 pub const PASS_CT_MARK: &str = "0x6d706173";
 
-/// The rules that end pass-admitted connections once their pass is gone,
-/// for the sets of `logins` in `table_family` ("inet" also covers IPv6).
-/// With no pass sets left, every pass-admitted connection is dropped.
-pub fn pass_revocation_rules(logins: &[Uuid], table_family: &str) -> Vec<String> {
-    if logins.is_empty() {
-        return vec![format!("ct direction original ct mark {PASS_CT_MARK} drop")];
+/// Re-admits each pass-admitted connection only while the port rule that let
+/// it in still would (one line per rule, bind address and accepted Login
+/// list), then drops every other marked connection: one whose pass ended,
+/// or whose rule or option is gone.
+fn write_pass_revalidation(out: &mut String, port_rules: &[PortRule], blocks: &NftBlocks) {
+    for rule in port_rules.iter().filter(|r| r.enabled) {
+        let logins = pass_logins(blocks, rule);
+        if logins.is_empty() {
+            continue;
+        }
+        let (proto, port_expr) = proto_and_ports(rule);
+        for bind_ip in port_rule_bind_ips(rule) {
+            let daddr = daddr_clause(bind_ip);
+            let keyword = if bind_ip.is_ipv4() { "ip" } else { "ip6" };
+            for login in logins {
+                let _ = writeln!(
+                    out,
+                    "        ct direction original ct mark {PASS_CT_MARK} {proto} dport {port_expr} {daddr}{keyword} saddr @{} accept",
+                    pass_set_name(*login, bind_ip.is_ipv6())
+                );
+            }
+        }
     }
-    let not_in = |v6: bool| -> String {
-        let keyword = if v6 { "ip6" } else { "ip" };
-        logins
-            .iter()
-            .map(|l| format!("{keyword} saddr != @{} ", pass_set_name(*l, v6)))
-            .collect()
+    let _ = writeln!(
+        out,
+        "        ct direction original ct mark {PASS_CT_MARK} drop"
+    );
+}
+
+fn proto_and_ports(rule: &PortRule) -> (&'static str, String) {
+    let proto = match rule.protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
     };
-    let mut rules = vec![format!(
-        "ct direction original ct mark {PASS_CT_MARK} {}drop",
-        not_in(false)
-    )];
-    if table_family == "inet" {
-        rules.push(format!(
-            "ct direction original ct mark {PASS_CT_MARK} {}drop",
-            not_in(true)
-        ));
-    }
-    rules
+    let port_expr = if rule.is_range() {
+        format!("{}-{}", rule.port_start, rule.port_end)
+    } else {
+        rule.port_start.to_string()
+    };
+    (proto, port_expr)
 }
 
 /// Every Login list some port rule takes passes from, sorted: the sets the
@@ -162,9 +179,7 @@ pub fn generate_ruleset(
     let _ = writeln!(out);
     let _ = writeln!(out, "        iif \"lo\" accept");
     write_block_rules(&mut out, port_rules, blocks);
-    for rule in pass_revocation_rules(&pass_set_logins(blocks), "inet") {
-        let _ = writeln!(out, "        {rule}");
-    }
+    write_pass_revalidation(&mut out, port_rules, blocks);
     let _ = writeln!(out, "        ct state established,related accept");
     let _ = writeln!(
         out,
@@ -494,15 +509,7 @@ fn write_port_rule(
     if bind_ips.is_empty() {
         return;
     }
-    let proto = match rule.protocol {
-        Protocol::Tcp => "tcp",
-        Protocol::Udp => "udp",
-    };
-    let port_expr = if rule.is_range() {
-        format!("{}-{}", rule.port_start, rule.port_end)
-    } else {
-        rule.port_start.to_string()
-    };
+    let (proto, port_expr) = proto_and_ports(rule);
     if !rule.description.is_empty() {
         let _ = writeln!(
             out,
@@ -1243,11 +1250,24 @@ mod tests {
         assert!(!out.contains("ip6 daddr 2001:db8::3 accept"), "{out}");
         // An open connection is cut once its source leaves the pass set, and
         // that check comes before established connections are accepted.
-        let cut4 = format!("ct direction original ct mark {PASS_CT_MARK} ip saddr != @{s4} drop");
-        let cut6 = format!("ct direction original ct mark {PASS_CT_MARK} ip6 saddr != @{s6} drop");
+        // An open connection is re-checked against the rule that let it in
+        // (same port, address and pass set), and anything else marked is
+        // dropped, all before established connections are accepted.
+        let keep4 = format!(
+            "ct direction original ct mark {PASS_CT_MARK} tcp dport 22 ip daddr 10.0.0.3 ip saddr @{s4} accept"
+        );
+        let keep6 = format!(
+            "ct direction original ct mark {PASS_CT_MARK} tcp dport 22 ip6 daddr 2001:db8::3 ip6 saddr @{s6} accept"
+        );
+        let cut = format!("ct direction original ct mark {PASS_CT_MARK} drop");
         let established = out.find("ct state established,related accept").unwrap();
-        assert!(out.find(&cut4).is_some_and(|i| i < established), "{out}");
-        assert!(out.find(&cut6).is_some_and(|i| i < established), "{out}");
+        let (k4, k6, c) = (out.find(&keep4), out.find(&keep6), out.find(&cut));
+        assert!(k4.is_some_and(|i| i < established), "{out}");
+        assert!(k6.is_some_and(|i| i < established), "{out}");
+        assert!(
+            c.is_some_and(|i| i < established && i > k4.unwrap() && i > k6.unwrap()),
+            "{out}"
+        );
         // Without the option nothing about passes appears.
         let plain = generate_ruleset(
             &[],
