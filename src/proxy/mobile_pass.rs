@@ -3,7 +3,7 @@
 //! An IP-allow list can name a Login list ("Mobile pass logins"). A phone app signs in at
 //! `POST /.rust-proxy/mobile-pass` on any host this proxy serves, with a username and password
 //! from that Login list. Its current source IP then counts as inside every IP-allow list linked to
-//! that Login list, for `PASS_SECS`. The app checks in again before the pass runs out and whenever
+//! that Login list, for `PASS_SECS` (90 s). The app checks in again before the pass runs out and whenever
 //! the phone changes networks, so the pass follows the phone. `DELETE` on the same path ends it.
 //!
 //! Only a phone's current IP counts: each check-in replaces the IP of that login + device, and
@@ -31,10 +31,12 @@ use crate::state::AppState;
 
 /// Where the phone app checks in.
 pub const PATH: &str = "/.rust-proxy/mobile-pass";
-/// How long one check-in keeps a phone's IP inside the linked lists. Short, so an IP the phone
-/// has left (or a phone that went offline) drops out on its own; the app checks in every few
-/// minutes while it is switched on.
-pub const PASS_SECS: i64 = 10 * 60;
+/// How long one check-in keeps a phone's IP inside the linked lists: a short lease, so a phone
+/// that goes offline, is switched off without reaching the proxy, or whose public IP changes
+/// underneath it drops out within this time. The app (0.2.0 and later) reads `expires_in` and
+/// checks in three times per lease, so every 30 s at this length. App 0.1.0 checked in every
+/// 4 minutes and would see its pass lapse between check-ins: update the app before this.
+pub const PASS_SECS: i64 = 90;
 /// Failed sign-ins allowed per source IP in `FAIL_WINDOW` before it is refused outright.
 const MAX_FAILS: u32 = 10;
 const FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
