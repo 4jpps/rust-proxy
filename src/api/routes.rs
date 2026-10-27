@@ -2033,6 +2033,11 @@ fn validate_port_rule_request(state: &AppState, req: &PortRuleRequest) -> Result
             "port_start must be <= port_end".into(),
         ));
     }
+    if req.description.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "description must be a single line of text".into(),
+        ));
+    }
     crate::config::validate_dual_bind(
         &state.network().bind_ranges,
         req.bind_ip_v4,

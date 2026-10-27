@@ -1326,6 +1326,18 @@ pub(crate) fn validate_domain(domain: &str) -> Result<(), ConfigError> {
             "hosts entry has an empty domain".into(),
         ));
     }
+    // Hostname characters only (IDNs go in as punycode). Anything else --
+    // spaces, line breaks, quotes -- is never a real domain, and the domain
+    // is written into the firewall ruleset and logs.
+    if let Some(bad) = domain.chars().find(|c| c.is_control()).or_else(|| {
+        trimmed
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*')))
+    }) {
+        return Err(ConfigError::Validation(format!(
+            "invalid domain {domain:?} -- {bad:?} is not allowed in a domain name"
+        )));
+    }
     match trimmed.strip_prefix("*.") {
         Some(rest) if rest.is_empty() || rest.contains('*') => {
             Err(ConfigError::Validation(format!(
@@ -1431,6 +1443,29 @@ fn validate_port(port: u16, ctx: &str) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn domain_validation_allows_hostnames_and_rejects_everything_else() {
+        for ok in [
+            "jpps.us",
+            "*.jpps.us",
+            "xn--bcher-kva.example",
+            "_dmarc.jpps.us",
+            " pad.jpps.us ",
+        ] {
+            assert!(validate_domain(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "a.com\n}",
+            "a com",
+            "a.com;",
+            "a\"b.com",
+            "a.com\r",
+            "bücher.de",
+        ] {
+            assert!(validate_domain(bad).is_err(), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     fn base_toml() -> String {

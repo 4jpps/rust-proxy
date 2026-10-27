@@ -70,6 +70,7 @@ libc = "0.2"
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
+proptest = "1"
 
 [package.metadata.deb]
 maintainer = "Jeff Parrish PC Services LLC <https://www.jpps.us>"

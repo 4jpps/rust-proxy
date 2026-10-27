@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 88a98ae0b80abfd4c3873642e93495a1c8ffa580bd3f8f329175091ae3f0edf5 # shrinks to hosts = [ProxyHost { id: 72322ae1-7b4b-4e58-8c46-58532c04369f, domain: "\n", bind_ip_v4: Some(10.2.1.1), bind_ip_v6: None, bind_port: 1, upstream: "127.0.0.1:8000", upstream_https: false, upstream_tls_verify: true, upstream_preserve_host: true, websockets: false, force_https: false, acme_enabled: true, acme_challenge_type: Auto, acl_ids: [], pass_client_cert_header: false, dns_credential_id: None, redirect: None, path_rewrite: None, static_root: None, rewrite_samesite_none_cookies: false, deny_fallback: None, locations: [], block_exploits: false, fixed_response: None, hsts: false, hsts_subdomains: false, enabled: true }], rules = [], blocks = NftBlocks { global: [], rule: {} }
+cc 668ff2907100251623fd8f45623e203ce48d24236cbdbab7bf1d12065bb4ee91 # shrinks to hosts = [], rules = [PortRule { id: 22253263-d4dd-44eb-a682-5c3203deee59, bind_ip_v4: Some(10.1.1.1), bind_ip_v6: None, port_start: 1, port_end: 1, protocol: Tcp, description: "\n0", passthrough_target: None, acl_ids: [], enabled: true }], blocks = NftBlocks { global: [], rule: {} }
