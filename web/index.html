@@ -1726,6 +1726,7 @@ function serverValue(f, el) {
     case 'list': return lines(el.value);
     case 'int': return el.value.trim() === '' ? null : Number(el.value);
     case 'opt_bool': return el.value === '' ? null : el.value === 'true';
+    case 'opt_text': return el.value.trim() || null;
     default: return el.value.trim();
   }
 }

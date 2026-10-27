@@ -397,6 +397,33 @@ async fn admin_ui() -> Response {
 /// with; tokens created before roles existed are `Admin`. Treat an
 /// admin token like a password: anyone holding one can reconfigure the
 /// proxy and the firewall behind it.
+/// CSRF guard for credentials a browser attaches on its own (the session
+/// cookie, a client certificate): a request that changes something must
+/// come from the admin UI's own origin. The cookie's SameSite=Lax doesn't
+/// cover this alone -- every subdomain of the same registrable domain
+/// counts as "same site", and a body-less POST (restart, generate token)
+/// needs no CORS preflight. Browsers send `Sec-Fetch-Site`; older ones send
+/// `Origin`, compared with `Host`. A request with neither is not from a
+/// browser page and has no ambient credentials to abuse. API tokens are
+/// never sent automatically, so they skip this.
+fn same_origin_write(req: &Request) -> bool {
+    use axum::http::Method;
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return true;
+    }
+    let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+    if let Some(site) = header("sec-fetch-site") {
+        return matches!(site, "same-origin" | "none");
+    }
+    match (header("origin"), header("host")) {
+        (Some(origin), Some(host)) => origin
+            .split_once("://")
+            .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host)),
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 async fn require_admin(
     State(state): State<AppState>,
     cookies: Cookies,
@@ -492,6 +519,14 @@ async fn require_admin(
     let Some(principal) = principal else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+
+    if principal.via != "token" && !same_origin_write(&req) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "cross-site request refused" })),
+        )
+            .into_response();
+    }
 
     if !principal.role.allows(req.method(), req.uri().path()) {
         let mut resp = (
@@ -2881,6 +2916,62 @@ async fn validate_dns_credential_choice(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writes_from_other_origins_are_refused() {
+        let req = |method: &str, headers: &[(&str, &str)]| {
+            let mut b = Request::builder().method(method).uri("/api/server/restart");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            b.body(axum::body::Body::empty()).unwrap()
+        };
+        // The admin UI itself.
+        assert!(same_origin_write(&req(
+            "POST",
+            &[("sec-fetch-site", "same-origin")]
+        )));
+        assert!(same_origin_write(&req(
+            "POST",
+            &[
+                ("origin", "https://proxy.example.com"),
+                ("host", "proxy.example.com")
+            ]
+        )));
+        assert!(same_origin_write(&req(
+            "POST",
+            &[
+                ("origin", "http://10.0.0.1:8084"),
+                ("host", "10.0.0.1:8084")
+            ]
+        )));
+        // A sibling subdomain is "same-site" but not same-origin.
+        assert!(!same_origin_write(&req(
+            "POST",
+            &[("sec-fetch-site", "same-site")]
+        )));
+        assert!(!same_origin_write(&req(
+            "POST",
+            &[("sec-fetch-site", "cross-site")]
+        )));
+        assert!(!same_origin_write(&req(
+            "POST",
+            &[
+                ("origin", "https://evil.example.com"),
+                ("host", "proxy.example.com")
+            ]
+        )));
+        assert!(!same_origin_write(&req(
+            "POST",
+            &[("origin", "null"), ("host", "proxy.example.com")]
+        )));
+        // Reads, and non-browser clients, are unaffected.
+        assert!(same_origin_write(&req(
+            "GET",
+            &[("sec-fetch-site", "cross-site")]
+        )));
+        assert!(same_origin_write(&req("POST", &[])));
+    }
+
     use super::*;
     use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig};
     use http_body_util::BodyExt;
