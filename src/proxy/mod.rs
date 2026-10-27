@@ -92,6 +92,7 @@ fn reconcile(
             key.2,
             state.conn_limiter().clone(),
             state.network().max_connections_per_ip,
+            std::time::Duration::from_secs(state.network().udp_idle_timeout_seconds.max(1)),
         )
     });
 }
@@ -189,6 +190,7 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
             }
             let Some(slot) = state.conn_limiter().try_acquire(peer_ip) else {
                 tracing::debug!(%peer_ip, "connection dropped: per-client connection limit");
+                limits::count(&limits::CONNECTIONS_REFUSED);
                 continue;
             };
             let config_with_client_auth = config_with_client_auth.clone();
@@ -222,6 +224,7 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                     }
                     Err(_) => {
                         tracing::debug!(%peer_ip, "tls clienthello timed out");
+                        limits::count(&limits::TLS_HANDSHAKE_TIMEOUTS);
                         return;
                     }
                 };
@@ -243,6 +246,7 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                         }
                         Err(_) => {
                             tracing::debug!(%peer_ip, "tls handshake timed out");
+                            limits::count(&limits::TLS_HANDSHAKE_TIMEOUTS);
                             return;
                         }
                     };
@@ -565,10 +569,16 @@ async fn route_https_request(
         let host = router::match_host(&hosts, bind_ip, bind_port, name)?;
         state
             .rate_limiter()
-            .check(host.id, peer_ip, host.rate_limit_per_minute)
+            .check(
+                host.id,
+                peer_ip,
+                host.rate_limit_per_minute,
+                host.rate_limit_burst,
+            )
             .err()
     }) {
         tracing::debug!(%peer_ip, host = lookup_name.as_deref().unwrap_or("-"), "rate limited");
+        limits::count(&limits::RATE_LIMITED);
         return Ok(too_many_requests(wait));
     }
     let mut result = route_https_request_inner(
@@ -1117,6 +1127,7 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
             }
             let Some(slot) = state.conn_limiter().try_acquire(peer_ip) else {
                 tracing::debug!(%peer_ip, "connection dropped: per-client connection limit");
+                limits::count(&limits::CONNECTIONS_REFUSED);
                 continue;
             };
             let io = TokioIo::new(stream);
@@ -1170,6 +1181,7 @@ fn spawn_passthrough_listener(
     protocol: Protocol,
     limiter: Arc<limits::ConnLimiter>,
     max_per_client: usize,
+    udp_idle: std::time::Duration,
 ) -> JoinHandle<()> {
     let target = port_rules
         .iter()
@@ -1195,7 +1207,8 @@ fn spawn_passthrough_listener(
         let result = match protocol {
             Protocol::Tcp => passthrough::run_tcp_passthrough(bind_addr, upstream, limiter).await,
             Protocol::Udp => {
-                passthrough::run_udp_passthrough(bind_addr, upstream, max_per_client).await
+                passthrough::run_udp_passthrough(bind_addr, upstream, max_per_client, udp_idle)
+                    .await
             }
         };
         if let Err(err) = result {
@@ -1444,6 +1457,15 @@ fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn too_many_requests_says_when_to_retry() {
+        let resp = too_many_requests(std::time::Duration::from_millis(1200));
+        assert_eq!(resp.status(), hyper::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()[hyper::header::RETRY_AFTER], "2");
+        let short = too_many_requests(std::time::Duration::from_millis(10));
+        assert_eq!(short.headers()[hyper::header::RETRY_AFTER], "1");
+    }
+
     use super::*;
     use crate::config::{
         AcmeConfig, AdminConfig, Config, DnsProviderKind, NetworkConfig, PortRule, Protocol,
@@ -1672,6 +1694,7 @@ mod tests {
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
+                udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
@@ -1806,6 +1829,7 @@ mod tests {
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2292,6 +2316,7 @@ mod tests {
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2356,6 +2381,7 @@ mod tests {
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2389,6 +2415,7 @@ mod tests {
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: true,
             enabled: true,
         }
@@ -2824,6 +2851,7 @@ mod tests {
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }

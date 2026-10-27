@@ -981,7 +981,8 @@ function hostFormHTML(h) {
     ${acls.length ? `<div class="pick" role="group" aria-label="Access lists">${acls.map((a) => chk({ name: 'acl_ids', value: a.id, label: `${a.name} (${aclKindLabel(a.kind)})`, checked: sel_.has(a.id) })).join('')}</div>
       <p class="help" style="margin-top:var(--s-2)">Select none for open access. IP-allow lists gate by source address; a Login list also requires signing in. Multiple lists combine as a union.</p>`
       : '<p class="help">No access lists exist yet. Create one under Network, Access lists.</p>'}
-    <div class="fgrid">${fld({ name: 'rate_limit_per_minute', label: 'Requests per minute, per visitor', type: 'number', value: h.rate_limit_per_minute || '', placeholder: 'no limit', attrs: 'min="0" max="1000000"', help: 'Visitors over this get "Too many requests" and a time to retry. Short bursts are allowed. A web page often makes 20 to 100 requests, so start around 600. Blank or 0 means no limit.' })}</div>
+    <div class="fgrid">${fld({ name: 'rate_limit_per_minute', label: 'Requests per minute, per visitor', type: 'number', value: h.rate_limit_per_minute || '', placeholder: 'no limit', attrs: 'min="0" max="1000000"', help: 'Visitors over this get "Too many requests" and a time to retry. Short bursts are allowed. A web page often makes 20 to 100 requests, so start around 600. Blank or 0 means no limit.' })}
+      ${fld({ name: 'rate_limit_burst', label: 'Burst allowance', type: 'number', value: h.rate_limit_burst || '', placeholder: 'automatic', attrs: 'min="0" max="1000000"', help: 'How many requests a visitor can make back to back before the per-minute rate applies. Raise it for login or two-factor pages. Blank uses a sixth of the per-minute limit, at least 10.' })}</div>
   </fieldset>
   <details class="adv"${advOpen ? ' open' : ''}><summary>Advanced</summary><div>
     <fieldset><legend>Redirect (overrides Upstream)</legend>
@@ -1053,6 +1054,7 @@ function collectHost(form) {
     block_exploits: on('block_exploits'),
     hsts: on('hsts'), hsts_subdomains: on('hsts') && on('hsts_subdomains'),
     rate_limit_per_minute: Math.max(0, Math.floor(Number(fd.get('rate_limit_per_minute')) || 0)),
+    rate_limit_burst: Math.max(0, Math.floor(Number(fd.get('rate_limit_burst')) || 0)),
     fixed_response: String(fd.get('fr_status') || '').trim() ? { status: Number(fd.get('fr_status')), body: fd.get('fr_body') || '', html: on('fr_html') } : null,
     enabled: on('enabled'),
   };

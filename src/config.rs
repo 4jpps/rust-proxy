@@ -306,6 +306,17 @@ pub struct NetworkConfig {
     /// default only stops floods. 0 turns the cap off.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
+    /// How long a UDP port-rule session may sit silent before it is closed
+    /// (default 120 s). Raise it for protocols with long quiet spells, such
+    /// as SIP or WireGuard with a long keepalive.
+    #[serde(default = "default_udp_idle_timeout_seconds")]
+    pub udp_idle_timeout_seconds: u64,
+}
+
+pub const DEFAULT_UDP_IDLE_TIMEOUT_SECONDS: u64 = 120;
+
+fn default_udp_idle_timeout_seconds() -> u64 {
+    DEFAULT_UDP_IDLE_TIMEOUT_SECONDS
 }
 
 pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
@@ -735,10 +746,15 @@ pub struct ProxyHost {
     pub hsts_subdomains: bool,
     /// Most requests one client (address, or /64 for IPv6) may make to
     /// this site per minute; over it they get 429 Too Many Requests with
-    /// Retry-After. Bursts of up to a sixth of the limit (at least 10) are
-    /// allowed. 0 (the default) means no limit.
+    /// Retry-After. 0 (the default) means no limit.
     #[serde(default)]
     pub rate_limit_per_minute: u32,
+    /// How many requests a client may make back to back before the
+    /// per-minute rate applies (the token bucket's size). 0 uses a sixth of
+    /// the per-minute limit, at least 10. Raise it for login or 2FA pages
+    /// that fire a quick run of requests.
+    #[serde(default)]
+    pub rate_limit_burst: u32,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -1733,6 +1749,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1773,6 +1790,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1812,6 +1830,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1848,6 +1867,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1888,6 +1908,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1928,6 +1949,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -2031,6 +2053,7 @@ gateway = "172.16.63.1"
                 hsts: false,
                 hsts_subdomains: false,
                 rate_limit_per_minute: 0,
+                rate_limit_burst: 0,
                 pass_client_cert_header: false,
                 enabled: true,
             });
@@ -2072,6 +2095,7 @@ gateway = "172.16.63.1"
                 hsts: false,
                 hsts_subdomains: false,
                 rate_limit_per_minute: 0,
+                rate_limit_burst: 0,
                 pass_client_cert_header: false,
                 enabled: true,
             });
@@ -2109,6 +2133,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -2157,6 +2182,7 @@ gateway = "172.16.63.1"
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         });

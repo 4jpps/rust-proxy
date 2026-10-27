@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,21 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// goes unanswered for `H2_KEEPALIVE_TIMEOUT`.
 pub const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 pub const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Totals since start, for `/metrics` and `/api/limits`.
+pub static CONNECTIONS_REFUSED: AtomicU64 = AtomicU64::new(0);
+pub static TLS_HANDSHAKE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+pub static RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
+
+/// Bumps one of the totals above.
+pub fn count(counter: &AtomicU64) {
+    counter.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// Reads one of the totals above.
+pub fn total(counter: &AtomicU64) -> u64 {
+    counter.load(AtomicOrdering::Relaxed)
+}
 
 /// Concurrent-connection counter keyed by client (address, or /64 for
 /// IPv6). `limit == 0` turns the cap off.
@@ -69,6 +84,19 @@ impl ConnLimiter {
         counts.get(&client_key(ip)).copied().unwrap_or(0)
     }
 
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The `n` clients holding the most connections, busiest first.
+    pub fn top(&self, n: usize) -> Vec<(IpAddr, usize)> {
+        let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all: Vec<(IpAddr, usize)> = counts.iter().map(|(k, v)| (*k, *v)).collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        all.truncate(n);
+        all
+    }
+
     /// Distinct clients currently holding at least one connection.
     pub fn clients(&self) -> usize {
         self.counts.lock().unwrap_or_else(|e| e.into_inner()).len()
@@ -92,8 +120,9 @@ impl Drop for ConnGuard {
 }
 
 /// Per-site request rate limit (`ProxyHost::rate_limit_per_minute`): a
-/// token bucket per (site, client), refilled at the per-minute rate, with
-/// room for a burst of a sixth of a minute's allowance (at least 10).
+/// token bucket per (site, client), refilled at the per-minute rate. Its
+/// size is the site's `rate_limit_burst`, or by default a sixth of a
+/// minute's allowance (at least 10).
 #[derive(Debug, Default)]
 pub struct RateLimiter {
     buckets: Mutex<HashMap<(Uuid, IpAddr), Bucket>>,
@@ -111,15 +140,25 @@ const BUCKET_IDLE: Duration = Duration::from_secs(600);
 /// How often (in checks) idle buckets are swept.
 const SWEEP_EVERY: usize = 4096;
 
-fn burst(per_minute: u32) -> f64 {
-    (per_minute as f64 / 6.0).max(10.0)
+fn burst(per_minute: u32, configured: u32) -> f64 {
+    if configured > 0 {
+        configured as f64
+    } else {
+        (per_minute as f64 / 6.0).max(10.0)
+    }
 }
 
 impl RateLimiter {
     /// `Ok` to let the request through, or `Err(wait)` with how long until
     /// the client has a token again (for `Retry-After`).
-    pub fn check(&self, site: Uuid, ip: IpAddr, per_minute: u32) -> Result<(), Duration> {
-        self.check_at(site, ip, per_minute, Instant::now())
+    pub fn check(
+        &self,
+        site: Uuid,
+        ip: IpAddr,
+        per_minute: u32,
+        burst_size: u32,
+    ) -> Result<(), Duration> {
+        self.check_at(site, ip, per_minute, burst_size, Instant::now())
     }
 
     fn check_at(
@@ -127,13 +166,14 @@ impl RateLimiter {
         site: Uuid,
         ip: IpAddr,
         per_minute: u32,
+        burst_size: u32,
         now: Instant,
     ) -> Result<(), Duration> {
         if per_minute == 0 {
             return Ok(());
         }
         let rate = per_minute as f64 / 60.0; // tokens per second
-        let cap = burst(per_minute);
+        let cap = burst(per_minute, burst_size);
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         if self.checks.fetch_add(1, AtomicOrdering::Relaxed) % SWEEP_EVERY == SWEEP_EVERY - 1 {
             buckets.retain(|_, b| now.saturating_duration_since(b.last) < BUCKET_IDLE);
@@ -185,6 +225,7 @@ mod tests {
         let _g2 = l.try_acquire(a).unwrap();
         assert!(l.try_acquire(a).is_none());
         assert!(l.try_acquire(b).is_some(), "other clients are unaffected");
+        assert_eq!(l.top(5), vec![(a, 2)], "b's guard was dropped right away");
         drop(g1);
         assert!(l.try_acquire(a).is_some());
     }
@@ -254,34 +295,57 @@ mod tests {
         let t0 = Instant::now();
         // 120/min: burst 20, then 2 per second.
         for _ in 0..20 {
-            assert!(r.check_at(site(), ip, 120, t0).is_ok());
+            assert!(r.check_at(site(), ip, 120, 0, t0).is_ok());
         }
-        let wait = r.check_at(site(), ip, 120, t0).unwrap_err();
+        let wait = r.check_at(site(), ip, 120, 0, t0).unwrap_err();
         assert!(
             wait > Duration::from_millis(400) && wait <= Duration::from_millis(500),
             "{wait:?}"
         );
         assert!(
-            r.check_at(site(), ip, 120, t0 + Duration::from_millis(500))
+            r.check_at(site(), ip, 120, 0, t0 + Duration::from_millis(500))
                 .is_ok()
         );
         assert!(
-            r.check_at(site(), ip, 120, t0 + Duration::from_millis(500))
+            r.check_at(site(), ip, 120, 0, t0 + Duration::from_millis(500))
                 .is_err()
         );
         // Other sites and other clients have their own buckets.
-        assert!(r.check_at(Uuid::from_u128(2), ip, 120, t0).is_ok());
+        assert!(r.check_at(Uuid::from_u128(2), ip, 120, 0, t0).is_ok());
         assert!(
-            r.check_at(site(), "192.0.2.2".parse().unwrap(), 120, t0)
+            r.check_at(site(), "192.0.2.2".parse().unwrap(), 120, 0, t0)
                 .is_ok()
         );
         // Same /64 shares a bucket.
         for _ in 0..10 {
-            r.check_at(site(), "2001:db8::1".parse().unwrap(), 30, t0)
+            r.check_at(site(), "2001:db8::1".parse().unwrap(), 30, 0, t0)
                 .unwrap();
         }
         assert!(
-            r.check_at(site(), "2001:db8::2".parse().unwrap(), 30, t0)
+            r.check_at(site(), "2001:db8::2".parse().unwrap(), 30, 0, t0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_configured_burst_lets_a_login_flow_through() {
+        let r = RateLimiter::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let t0 = Instant::now();
+        // 60/min alone allows 10 back to back; burst 25 allows 25.
+        for i in 0..25 {
+            assert!(
+                r.check_at(site(), ip, 60, 25, t0 + Duration::from_millis(i * 80))
+                    .is_ok(),
+                "{i}"
+            );
+        }
+        assert!(
+            r.check_at(site(), ip, 60, 25, t0 + Duration::from_secs(2))
+                .is_ok()
+        );
+        assert!(
+            r.check_at(site(), ip, 60, 25, t0 + Duration::from_secs(2))
                 .is_err()
         );
     }
@@ -292,8 +356,8 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..(SWEEP_EVERY as u32 - 1) {
             let ip = IpAddr::from(std::net::Ipv4Addr::from(i));
-            r.check_at(site(), ip, 60, t0).unwrap();
-            assert!(r.check_at(site(), ip, 0, t0).is_ok());
+            r.check_at(site(), ip, 60, 0, t0).unwrap();
+            assert!(r.check_at(site(), ip, 0, 0, t0).is_ok());
         }
         assert_eq!(r.tracked(), SWEEP_EVERY - 1);
         // The next check comes long after: every idle bucket goes.
@@ -301,6 +365,7 @@ mod tests {
             site(),
             "203.0.113.9".parse().unwrap(),
             60,
+            0,
             t0 + BUCKET_IDLE * 2,
         )
         .unwrap();
@@ -319,12 +384,12 @@ mod tests {
             let mut allowed = 0u32;
             for g in gaps {
                 t += Duration::from_millis(g);
-                if r.check_at(site(), ip, per_minute, t).is_ok() {
+                if r.check_at(site(), ip, per_minute, 0, t).is_ok() {
                     allowed += 1;
                 }
             }
             let window = (t - t0).as_secs_f64();
-            let ceiling = burst(per_minute) + window * per_minute as f64 / 60.0;
+            let ceiling = burst(per_minute, 0) + window * per_minute as f64 / 60.0;
             prop_assert!(allowed as f64 <= ceiling + 1e-6, "allowed {} > {}", allowed, ceiling);
         }
     }

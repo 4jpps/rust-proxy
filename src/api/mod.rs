@@ -10,6 +10,7 @@ pub mod default_site;
 pub mod health;
 pub mod hosting;
 pub mod license;
+pub mod metrics;
 pub mod routes;
 pub mod trustbridge;
 

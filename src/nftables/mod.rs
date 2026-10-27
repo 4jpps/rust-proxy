@@ -123,6 +123,7 @@ pub struct Overrides {
     pub hosts: Option<Vec<crate::config::ProxyHost>>,
     pub port_rules: Option<Vec<crate::config::PortRule>>,
     pub admin_allowed_ips: Option<Vec<ipnet::IpNet>>,
+    pub expose_admin_port: Option<bool>,
 }
 
 /// The full ruleset `sync_once` would apply right now, from live state.
@@ -190,7 +191,9 @@ pub async fn build_ruleset_with(state: &AppState, overrides: &Overrides) -> anyh
         &hosts,
         &port_rules,
         &admin,
-        state.expose_admin_port(),
+        overrides
+            .expose_admin_port
+            .unwrap_or_else(|| state.expose_admin_port()),
         &rule_allow_ips,
         &state.network().dedicated_ips,
         &state.network().dhcp_interfaces,

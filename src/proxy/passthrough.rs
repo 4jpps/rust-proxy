@@ -39,6 +39,7 @@ pub async fn run_tcp_passthrough(
         };
         let Some(slot) = limiter.try_acquire(peer.ip()) else {
             tracing::debug!(%peer, "tcp passthrough: per-client connection limit reached");
+            super::limits::count(&super::limits::CONNECTIONS_REFUSED);
             continue;
         };
         tokio::spawn(async move {
@@ -59,7 +60,6 @@ pub async fn run_tcp_passthrough(
     }
 }
 
-const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_BUF_SIZE: usize = 64 * 1024;
 /// Each session owns an upstream socket (a file descriptor), so the table
 /// is capped overall; each session also holds a slot from this listener's
@@ -100,11 +100,12 @@ type UdpSessions = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSession>>>>;
 /// spawns a dedicated upstream socket + a task relaying upstream ->
 /// client, and every subsequent datagram from that client just gets
 /// forwarded through the existing session. Sessions idle in both
-/// directions for `UDP_SESSION_IDLE_TIMEOUT` are reaped.
+/// directions for `idle_timeout` are reaped.
 pub async fn run_udp_passthrough(
     bind_addr: SocketAddr,
     upstream: SocketAddr,
     max_sessions_per_client: usize,
+    idle_timeout: Duration,
 ) -> std::io::Result<()> {
     let socket = Arc::new(crate::netbind::bind_udp_socket(bind_addr)?);
     tracing::info!(%bind_addr, %upstream, "udp passthrough listening");
@@ -161,6 +162,7 @@ pub async fn run_udp_passthrough(
                     socket.clone(),
                     client_addr,
                     sessions.clone(),
+                    idle_timeout,
                 );
                 session
             }
@@ -178,13 +180,12 @@ fn spawn_udp_return_path(
     client_facing_socket: Arc<UdpSocket>,
     client_addr: SocketAddr,
     sessions: UdpSessions,
+    idle_timeout: Duration,
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_BUF_SIZE];
         loop {
-            let recv =
-                tokio::time::timeout(UDP_SESSION_IDLE_TIMEOUT, session.upstream.recv(&mut buf))
-                    .await;
+            let recv = tokio::time::timeout(idle_timeout, session.upstream.recv(&mut buf)).await;
             match recv {
                 Ok(Ok(len)) => {
                     session.upstream_replied.store(true, Ordering::Relaxed);
@@ -201,7 +202,7 @@ fn spawn_udp_return_path(
                 // still talks.
                 Err(_timeout)
                     if session.upstream_replied.load(Ordering::Relaxed)
-                        && session.client_idle() < UDP_SESSION_IDLE_TIMEOUT =>
+                        && session.client_idle() < idle_timeout =>
                 {
                     continue;
                 }
@@ -247,6 +248,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_passthrough_closes_connections_over_the_per_client_cap() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = upstream_listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let passthrough_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = passthrough_listener.local_addr().unwrap();
+        drop(passthrough_listener);
+        let limiter = super::super::limits::ConnLimiter::new(2);
+        tokio::spawn(run_tcp_passthrough(
+            bind_addr,
+            upstream_addr,
+            limiter.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let refused_before =
+            super::super::limits::total(&super::super::limits::CONNECTIONS_REFUSED);
+        let _a = tokio::net::TcpStream::connect(bind_addr).await.unwrap();
+        let _b = tokio::net::TcpStream::connect(bind_addr).await.unwrap();
+        let mut c = tokio::net::TcpStream::connect(bind_addr).await.unwrap();
+        // The third is accepted by the kernel, then closed by the proxy.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), c.read(&mut buf))
+            .await
+            .expect("over-cap connection should be closed promptly")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        assert_eq!(limiter.top(1)[0].1, 2);
+        assert!(
+            super::super::limits::total(&super::super::limits::CONNECTIONS_REFUSED)
+                > refused_before
+        );
+    }
+
+    #[tokio::test]
     async fn udp_passthrough_relays_a_datagram_round_trip() {
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_socket.local_addr().unwrap();
@@ -260,7 +301,12 @@ mod tests {
         let bind_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind_addr = bind_socket.local_addr().unwrap();
         drop(bind_socket);
-        tokio::spawn(run_udp_passthrough(bind_addr, upstream_addr, 0));
+        tokio::spawn(run_udp_passthrough(
+            bind_addr,
+            upstream_addr,
+            0,
+            Duration::from_secs(120),
+        ));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

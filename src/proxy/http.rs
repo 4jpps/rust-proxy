@@ -607,18 +607,108 @@ pub async fn serve_static_response<B>(
         Ok(m) => m.len(),
         Err(_) => return static_not_found_response(),
     };
-    Response::builder()
-        .status(hyper::StatusCode::OK)
+    let range = req
+        .headers()
+        .get(hyper::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| parse_byte_range(v, len));
+    let builder = Response::builder()
         .header(hyper::header::CONTENT_TYPE, content_type_for(&file_path))
-        .header(hyper::header::CONTENT_LENGTH, len)
-        .body(FileBody::new(file).boxed())
-        .expect("static file response is always valid")
+        .header(hyper::header::ACCEPT_RANGES, "bytes");
+    match range {
+        Some(ByteRange::Unsatisfiable) => builder
+            .status(hyper::StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(hyper::header::CONTENT_RANGE, format!("bytes */{len}"))
+            .body(
+                http_body_util::Empty::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed(),
+            )
+            .expect("static 416 response is always valid"),
+        Some(ByteRange::Satisfiable(start, end)) => {
+            let mut file = file;
+            if tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(start))
+                .await
+                .is_err()
+            {
+                return static_not_found_response();
+            }
+            builder
+                .status(hyper::StatusCode::PARTIAL_CONTENT)
+                .header(
+                    hyper::header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{len}"),
+                )
+                .header(hyper::header::CONTENT_LENGTH, end - start + 1)
+                .body(FileBody::new(file, end - start + 1).boxed())
+                .expect("static 206 response is always valid")
+        }
+        // No Range header, or one this server doesn't do (several ranges,
+        // another unit, malformed): the whole file, as RFC 9110 allows.
+        Some(ByteRange::Ignored) | None => builder
+            .status(hyper::StatusCode::OK)
+            .header(hyper::header::CONTENT_LENGTH, len)
+            .body(FileBody::new(file, len).boxed())
+            .expect("static file response is always valid"),
+    }
 }
 
-/// A response body that reads a file as it's sent. A read error ends the
-/// body early; with Content-Length set the client sees it as truncated.
+#[derive(Debug, PartialEq, Eq)]
+enum ByteRange {
+    /// Inclusive first and last byte.
+    Satisfiable(u64, u64),
+    Unsatisfiable,
+    Ignored,
+}
+
+/// One `bytes=` range (RFC 9110 §14.1.2): `a-b`, `a-` or the suffix `-n`.
+/// Multiple ranges and anything malformed are `Ignored`, so the caller
+/// sends the whole file.
+fn parse_byte_range(header: &str, len: u64) -> ByteRange {
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return ByteRange::Ignored;
+    };
+    if spec.contains(',') {
+        return ByteRange::Ignored;
+    }
+    let Some((a, b)) = spec.trim().split_once('-') else {
+        return ByteRange::Ignored;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    let parse = |s: &str| -> Option<u64> {
+        (!s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    match (parse(a), parse(b), a.is_empty()) {
+        // Suffix: the last n bytes.
+        (None, Some(n), true) => {
+            if n == 0 || len == 0 {
+                ByteRange::Unsatisfiable
+            } else {
+                ByteRange::Satisfiable(len.saturating_sub(n), len - 1)
+            }
+        }
+        (Some(start), end, false) if b.is_empty() || end.is_some() => {
+            if start >= len {
+                return ByteRange::Unsatisfiable;
+            }
+            let end = end.map_or(len - 1, |e| e.min(len - 1));
+            if end < start {
+                ByteRange::Ignored
+            } else {
+                ByteRange::Satisfiable(start, end)
+            }
+        }
+        _ => ByteRange::Ignored,
+    }
+}
+
+/// A response body that reads up to `limit` bytes of a file as it's sent.
+/// A read error ends the body early; with Content-Length set the client
+/// sees it as truncated.
 struct FileBody {
-    file: tokio::fs::File,
+    file: tokio::io::Take<tokio::fs::File>,
     buf: bytes::BytesMut,
     done: bool,
 }
@@ -626,9 +716,9 @@ struct FileBody {
 const FILE_CHUNK: usize = 64 * 1024;
 
 impl FileBody {
-    fn new(file: tokio::fs::File) -> Self {
+    fn new(file: tokio::fs::File, limit: u64) -> Self {
         Self {
-            file,
+            file: tokio::io::AsyncReadExt::take(file, limit),
             buf: bytes::BytesMut::with_capacity(FILE_CHUNK),
             done: false,
         }
@@ -919,6 +1009,7 @@ mod tests {
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
+                udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
@@ -1906,6 +1997,87 @@ mod tests {
         let req = Request::builder().uri("/nope.html").body(()).unwrap();
         let resp = serve_static_response(&req, root.path()).await;
         assert_eq!(resp.status(), hyper::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_static_response_serves_byte_ranges() {
+        let root = static_root_fixture();
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(root.path().join("r.bin"), &data).unwrap();
+        let get = |range: Option<&str>| {
+            let mut b = Request::builder().uri("/r.bin");
+            if let Some(r) = range {
+                b = b.header(hyper::header::RANGE, r);
+            }
+            b.body(()).unwrap()
+        };
+        for (range, status, want, content_range) in [
+            ("bytes=10-19", 206, &data[10..20], Some("bytes 10-19/1000")),
+            ("bytes=990-", 206, &data[990..], Some("bytes 990-999/1000")),
+            ("bytes=-5", 206, &data[995..], Some("bytes 995-999/1000")),
+            (
+                "bytes=995-5000",
+                206,
+                &data[995..],
+                Some("bytes 995-999/1000"),
+            ),
+            ("bytes=1000-", 416, &data[..0], Some("bytes */1000")),
+            ("bytes=0-1,5-6", 200, &data[..], None),
+            ("items=0-1", 200, &data[..], None),
+            ("bytes=9-3", 200, &data[..], None),
+        ] {
+            let resp = serve_static_response(&get(Some(range)), root.path()).await;
+            assert_eq!(resp.status().as_u16(), status, "{range}");
+            assert_eq!(
+                resp.headers()
+                    .get(hyper::header::CONTENT_RANGE)
+                    .map(|v| v.to_str().unwrap()),
+                content_range,
+                "{range}"
+            );
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), want, "{range}");
+        }
+        let plain = serve_static_response(&get(None), root.path()).await;
+        assert_eq!(plain.headers()[hyper::header::ACCEPT_RANGES], "bytes");
+    }
+
+    #[test]
+    fn byte_range_parser_never_returns_an_out_of_bounds_range() {
+        for len in [0u64, 1, 7, 1000] {
+            for h in [
+                "bytes=0-0",
+                "bytes=-1",
+                "bytes=-0",
+                "bytes=5-",
+                "bytes=0-99999",
+                "bytes= 3 - 4 ",
+                "bytes=-",
+                "bytes=a-b",
+                "bytes=18446744073709551615-",
+            ] {
+                if let ByteRange::Satisfiable(a, b) = parse_byte_range(h, len) {
+                    assert!(a <= b && b < len, "{h} len {len}: {a}-{b}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn file_body_ends_early_when_the_file_is_shorter_than_promised() {
+        let root = static_root_fixture();
+        let path = root.path().join("shrinks.bin");
+        std::fs::write(&path, vec![7u8; 100]).unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        // The file shrinks after Content-Length (100) was decided.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(10)
+            .unwrap();
+        let body = FileBody::new(file, 100).collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 10);
     }
 
     #[tokio::test]

@@ -145,23 +145,47 @@ fn certificates(state: &AppState) -> Check {
     )
 }
 
-/// Free space on the filesystem holding the database (logs default there too).
-fn disk(db_path: &Path) -> Check {
-    let dir = db_path
+/// Directory holding the database (logs default there too).
+pub(crate) fn db_dir(db_path: &Path) -> &Path {
+    db_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
-        return check("disk", false, "bad path");
-    };
+        .unwrap_or(Path::new("."))
+}
+
+/// (free bytes available to the daemon, total bytes) on `dir`'s filesystem.
+pub(crate) fn disk_space(dir: &Path) -> Option<(f64, f64)> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly
     // sized, writable statvfs struct.
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return check("disk", false, "statvfs failed");
+        return None;
     }
     let total = st.f_blocks as f64 * st.f_frsize as f64;
     let free = st.f_bavail as f64 * st.f_frsize as f64;
+    Some((free, total))
+}
+
+/// (open descriptors, soft limit if known).
+pub(crate) fn fd_usage() -> (usize, Option<u64>) {
+    let open = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0);
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable rlimit struct.
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0;
+    (open, (ok && lim.rlim_cur > 0).then_some(lim.rlim_cur))
+}
+
+/// Free space on the filesystem holding the database.
+fn disk(db_path: &Path) -> Check {
+    let Some((free, total)) = disk_space(db_dir(db_path)) else {
+        return check("disk", false, "statvfs failed");
+    };
     let pct = if total > 0.0 {
         free / total * 100.0
     } else {
@@ -185,23 +209,14 @@ fn file_descriptors() -> Check {
             format!("cannot open a file: {e}"),
         );
     }
-    let open = std::fs::read_dir("/proc/self/fd")
-        .map(|d| d.count())
-        .unwrap_or(0);
-    let mut lim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `lim` is a valid, writable rlimit struct.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 || lim.rlim_cur == 0 {
-        return check("file_descriptors", true, format!("{open} open"));
+    match fd_usage() {
+        (open, Some(limit)) => check(
+            "file_descriptors",
+            (open as f64 / limit as f64 * 100.0) < FD_FAIL_PERCENT,
+            format!("{open} of {limit} open"),
+        ),
+        (open, None) => check("file_descriptors", true, format!("{open} open")),
     }
-    let pct = open as f64 / lim.rlim_cur as f64 * 100.0;
-    check(
-        "file_descriptors",
-        pct < FD_FAIL_PERCENT,
-        format!("{open} of {} open", lim.rlim_cur),
-    )
 }
 
 #[derive(Debug, Serialize)]
@@ -264,13 +279,10 @@ async fn preview(state: &AppState, peer: SocketAddr, overrides: Overrides) -> Re
         .admin_allowed_ips
         .clone()
         .unwrap_or_else(|| state.admin_allowed_ips());
-    let globally_blocked = state
-        .block_index()
-        .global_nets()
-        .iter()
-        .any(|n| n.contains(&ip));
-    let reachable =
-        (allowed.is_empty() || allowed.iter().any(|n| n.contains(&ip))) && !globally_blocked;
+    let expose = overrides
+        .expose_admin_port
+        .unwrap_or_else(|| state.expose_admin_port());
+    let reachable = admin_reachable(ip, &allowed, expose, state.block_index().global_nets());
 
     Json(FirewallPreview {
         changed: added + removed > 0,
@@ -283,6 +295,25 @@ async fn preview(state: &AppState, peer: SocketAddr, overrides: Overrides) -> Re
         your_ip: ip.to_string(),
     })
     .into_response()
+}
+
+/// Whether the generated ruleset lets `ip` reach the admin port, in the
+/// order its rules apply: loopback is accepted first; then global block
+/// lists drop; then the admin rule exists only when the port is exposed,
+/// limited to the allow list when one is set.
+fn admin_reachable(
+    ip: std::net::IpAddr,
+    allowed: &[ipnet::IpNet],
+    expose: bool,
+    global_blocks: &[ipnet::IpNet],
+) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    if global_blocks.iter().any(|n| n.contains(&ip)) || !expose {
+        return false;
+    }
+    allowed.is_empty() || allowed.iter().any(|n| n.contains(&ip))
 }
 
 /// Keeps changed lines plus `ctx` lines either side; each skipped run of
@@ -345,6 +376,38 @@ mod tests {
     fn disk_and_fds_report_on_a_real_system() {
         assert!(disk(Path::new("/tmp/x.db")).detail.contains("free"));
         assert!(file_descriptors().ok);
+    }
+
+    #[test]
+    fn admin_reachability_follows_the_ruleset_order() {
+        let me: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let net = |s: &str| -> ipnet::IpNet { s.parse().unwrap() };
+        // Open, or allow-listed: reachable.
+        assert!(admin_reachable(me, &[], true, &[]));
+        assert!(admin_reachable(me, &[net("203.0.113.0/24")], true, &[]));
+        // A what-if allow list without me locks me out.
+        assert!(!admin_reachable(me, &[net("10.9.9.9/32")], true, &[]));
+        // Not exposed: only loopback gets in.
+        assert!(!admin_reachable(me, &[], false, &[]));
+        assert!(admin_reachable(
+            "127.0.0.1".parse().unwrap(),
+            &[],
+            false,
+            &[]
+        ));
+        // A global block wins over the allow list, never over loopback.
+        assert!(!admin_reachable(
+            me,
+            &[net("203.0.113.0/24")],
+            true,
+            &[net("203.0.113.0/28")]
+        ));
+        assert!(admin_reachable(
+            "::1".parse().unwrap(),
+            &[],
+            true,
+            &[net("::/0")]
+        ));
     }
 
     #[test]

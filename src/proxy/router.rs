@@ -158,6 +158,7 @@ mod tests {
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled,
         }

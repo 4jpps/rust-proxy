@@ -222,6 +222,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await;
+    let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN rate_limit_burst INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
     // copied above) and `access_allow_ips`/`access_login_username`/
     // `access_login_password_hash` (superseded by the acl_lists/
@@ -2173,7 +2176,7 @@ pub async fn set_siem_settings(
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, rate_limit_per_minute, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, rate_limit_per_minute, rate_limit_burst, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -2258,6 +2261,9 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                 rate_limit_per_minute: row
                     .get::<i64, _>("rate_limit_per_minute")
                     .clamp(0, u32::MAX as i64) as u32,
+                rate_limit_burst: row
+                    .get::<i64, _>("rate_limit_burst")
+                    .clamp(0, u32::MAX as i64) as u32,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -2296,8 +2302,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, rate_limit_per_minute, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, rate_limit_per_minute, rate_limit_burst, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -2329,6 +2335,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.hsts as i64)
         .bind(h.hsts_subdomains as i64)
         .bind(h.rate_limit_per_minute as i64)
+        .bind(h.rate_limit_burst as i64)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -2566,6 +2573,7 @@ mod tests {
             hsts: false,
             hsts_subdomains: false,
             rate_limit_per_minute: 0,
+            rate_limit_burst: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -3891,6 +3899,7 @@ mod tests {
         let pool = memory_pool().await;
         let mut host = sample_host();
         host.rate_limit_per_minute = 600;
+        host.rate_limit_burst = 40;
         save_hosts(&pool, &[host, sample_host()]).await.unwrap();
         let mut limits: Vec<u32> = load_hosts(&pool)
             .await
@@ -3900,6 +3909,14 @@ mod tests {
             .collect();
         limits.sort();
         assert_eq!(limits, [0, 600]);
+        let bursts: Vec<u32> = load_hosts(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.rate_limit_burst)
+            .filter(|b| *b > 0)
+            .collect();
+        assert_eq!(bursts, [40]);
     }
 
     #[tokio::test]
