@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -61,24 +62,49 @@ pub async fn run_tcp_passthrough(
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_BUF_SIZE: usize = 64 * 1024;
 /// Each session owns an upstream socket (a file descriptor), so the table
-/// is capped; datagrams from new clients beyond it are dropped until
-/// idle sessions are reaped.
+/// is capped overall; each session also holds a slot from the shared
+/// per-client limiter, so one client (or /64) varying its source port
+/// can't take the whole table from everyone else.
 const MAX_UDP_SESSIONS: usize = 4096;
+
+struct UdpSession {
+    upstream: Arc<UdpSocket>,
+    /// When the client last sent anything, as ms since `epoch` -- a
+    /// session stays alive while either side is talking.
+    last_client_ms: AtomicU64,
+    epoch: Instant,
+    _slot: super::limits::ConnGuard,
+}
+
+impl UdpSession {
+    fn touch(&self) {
+        self.last_client_ms
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn client_idle(&self) -> Duration {
+        let last = Duration::from_millis(self.last_client_ms.load(Ordering::Relaxed));
+        self.epoch.elapsed().saturating_sub(last)
+    }
+}
+
+type UdpSessions = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSession>>>>;
 
 /// UDP has no connection to accept, so this keeps a small NAT-like session
 /// table keyed by client address: the first datagram from a new client
 /// spawns a dedicated upstream socket + a task relaying upstream ->
 /// client, and every subsequent datagram from that client just gets
-/// forwarded through the existing session. Idle sessions are reaped.
+/// forwarded through the existing session. Sessions idle in both
+/// directions for `UDP_SESSION_IDLE_TIMEOUT` are reaped.
 pub async fn run_udp_passthrough(
     bind_addr: SocketAddr,
     upstream: SocketAddr,
+    limiter: Arc<super::limits::ConnLimiter>,
 ) -> std::io::Result<()> {
     let socket = Arc::new(crate::netbind::bind_udp_socket(bind_addr)?);
     tracing::info!(%bind_addr, %upstream, "udp passthrough listening");
 
-    let sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: UdpSessions = Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; UDP_BUF_SIZE];
 
     loop {
@@ -90,7 +116,7 @@ pub async fn run_udp_passthrough(
             }
         };
 
-        let upstream_socket = {
+        let session = {
             let mut guard = sessions.lock().await;
             if let Some(existing) = guard.get(&client_addr) {
                 existing.clone()
@@ -99,6 +125,10 @@ pub async fn run_udp_passthrough(
                     tracing::debug!(%client_addr, "udp passthrough: session table full, datagram dropped");
                     continue;
                 }
+                let Some(slot) = limiter.try_acquire(client_addr.ip()) else {
+                    tracing::debug!(%client_addr, "udp passthrough: per-client limit reached, datagram dropped");
+                    continue;
+                };
                 // A failed bind/connect (fd pressure) drops this datagram
                 // rather than ending the listener.
                 let new_socket = match UdpSocket::bind(("0.0.0.0", 0)).await {
@@ -112,34 +142,41 @@ pub async fn run_udp_passthrough(
                     tracing::warn!(%client_addr, %upstream, error = %err, "udp passthrough: upstream connect failed");
                     continue;
                 }
-                guard.insert(client_addr, new_socket.clone());
+                let session = Arc::new(UdpSession {
+                    upstream: new_socket,
+                    last_client_ms: AtomicU64::new(0),
+                    epoch: Instant::now(),
+                    _slot: slot,
+                });
+                guard.insert(client_addr, session.clone());
                 spawn_udp_return_path(
-                    new_socket.clone(),
+                    session.clone(),
                     socket.clone(),
                     client_addr,
                     sessions.clone(),
                 );
-                new_socket
+                session
             }
         };
 
-        if let Err(err) = upstream_socket.send(&buf[..len]).await {
+        session.touch();
+        if let Err(err) = session.upstream.send(&buf[..len]).await {
             tracing::debug!(%client_addr, %upstream, error = %err, "udp passthrough: send to upstream failed");
         }
     }
 }
 
 fn spawn_udp_return_path(
-    upstream_socket: Arc<UdpSocket>,
+    session: Arc<UdpSession>,
     client_facing_socket: Arc<UdpSocket>,
     client_addr: SocketAddr,
-    sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>,
+    sessions: UdpSessions,
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_BUF_SIZE];
         loop {
             let recv =
-                tokio::time::timeout(UDP_SESSION_IDLE_TIMEOUT, upstream_socket.recv(&mut buf))
+                tokio::time::timeout(UDP_SESSION_IDLE_TIMEOUT, session.upstream.recv(&mut buf))
                     .await;
             match recv {
                 Ok(Ok(len)) => {
@@ -152,6 +189,8 @@ fn spawn_udp_return_path(
                     tracing::debug!(%client_addr, error = %err, "udp passthrough: upstream recv failed");
                     break;
                 }
+                // Upstream quiet: keep the session while the client still talks.
+                Err(_timeout) if session.client_idle() < UDP_SESSION_IDLE_TIMEOUT => continue,
                 Err(_timeout) => break,
             }
         }
@@ -207,7 +246,11 @@ mod tests {
         let bind_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind_addr = bind_socket.local_addr().unwrap();
         drop(bind_socket);
-        tokio::spawn(run_udp_passthrough(bind_addr, upstream_addr));
+        tokio::spawn(run_udp_passthrough(
+            bind_addr,
+            upstream_addr,
+            super::super::limits::ConnLimiter::new(0),
+        ));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

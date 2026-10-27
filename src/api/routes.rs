@@ -1086,6 +1086,9 @@ struct HostRequest {
     /// See `config::ProxyHost::hsts_subdomains`'s doc comment.
     #[serde(default)]
     hsts_subdomains: bool,
+    /// See `config::ProxyHost::rate_limit_per_minute`'s doc comment.
+    #[serde(default)]
+    rate_limit_per_minute: u32,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -1899,6 +1902,7 @@ async fn create_host(
         fixed_response: body.fixed_response,
         hsts: body.hsts,
         hsts_subdomains: body.hsts_subdomains,
+        rate_limit_per_minute: body.rate_limit_per_minute,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &host).await?;
@@ -1945,6 +1949,7 @@ async fn update_host(
         fixed_response: body.fixed_response,
         hsts: body.hsts,
         hsts_subdomains: body.hsts_subdomains,
+        rate_limit_per_minute: body.rate_limit_per_minute,
         enabled: body.enabled,
     };
     validate_dns_credential_choice(&state, &updated).await?;

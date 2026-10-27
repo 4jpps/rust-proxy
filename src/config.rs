@@ -733,6 +733,12 @@ pub struct ProxyHost {
     /// Subdomains"). Only valid together with `hsts`.
     #[serde(default)]
     pub hsts_subdomains: bool,
+    /// Most requests one client (address, or /64 for IPv6) may make to
+    /// this site per minute; over it they get 429 Too Many Requests with
+    /// Retry-After. Bursts of up to a sixth of the limit (at least 10) are
+    /// allowed. 0 (the default) means no limit.
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -1726,6 +1732,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1765,6 +1772,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1803,6 +1811,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1838,6 +1847,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1877,6 +1887,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -1916,6 +1927,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -2018,6 +2030,7 @@ gateway = "172.16.63.1"
                 fixed_response: None,
                 hsts: false,
                 hsts_subdomains: false,
+                rate_limit_per_minute: 0,
                 pass_client_cert_header: false,
                 enabled: true,
             });
@@ -2058,6 +2071,7 @@ gateway = "172.16.63.1"
                 fixed_response: None,
                 hsts: false,
                 hsts_subdomains: false,
+                rate_limit_per_minute: 0,
                 pass_client_cert_header: false,
                 enabled: true,
             });
@@ -2094,6 +2108,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });
@@ -2141,6 +2156,7 @@ gateway = "172.16.63.1"
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         });

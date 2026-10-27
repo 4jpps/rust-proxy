@@ -217,6 +217,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE hosts ADD COLUMN hsts_subdomains INTEGER NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
+    let _ = sqlx::query(
+        "ALTER TABLE hosts ADD COLUMN rate_limit_per_minute INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
     // Dead-column cleanup: `bind_ip` (superseded by bind_ip_v4/bind_ip_v6,
     // copied above) and `access_allow_ips`/`access_login_username`/
     // `access_login_password_hash` (superseded by the acl_lists/
@@ -2168,7 +2173,7 @@ pub async fn set_siem_settings(
 pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, acme_challenge_type, \
-         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, enabled FROM hosts",
+         acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, rate_limit_per_minute, enabled FROM hosts",
     )
     .fetch_all(pool)
     .await?;
@@ -2250,6 +2255,9 @@ pub async fn load_hosts(pool: &SqlitePool) -> Result<Vec<ProxyHost>, sqlx::Error
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 hsts: row.get::<i64, _>("hsts") != 0,
                 hsts_subdomains: row.get::<i64, _>("hsts_subdomains") != 0,
+                rate_limit_per_minute: row
+                    .get::<i64, _>("rate_limit_per_minute")
+                    .clamp(0, u32::MAX as i64) as u32,
                 enabled: row.get::<i64, _>("enabled") != 0,
             })
         })
@@ -2288,8 +2296,8 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         };
         sqlx::query(
             "INSERT INTO hosts (id, domain, bind_ip_v4, bind_ip_v6, bind_port, upstream, upstream_https, upstream_tls_verify, upstream_preserve_host, websockets, force_https, acme_enabled, \
-             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             acme_challenge_type, acl_ids, redirect_target, redirect_preserve_path, redirect_status, dns_credential_id, path_rewrite_pattern, path_rewrite_replacement, static_root, rewrite_samesite_none_cookies, pass_client_cert_header, deny_fallback, locations, block_exploits, fixed_response, hsts, hsts_subdomains, rate_limit_per_minute, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(h.id.to_string())
         .bind(&h.domain)
@@ -2320,6 +2328,7 @@ pub async fn save_hosts(pool: &SqlitePool, hosts: &[ProxyHost]) -> Result<(), sq
         .bind(h.fixed_response.as_ref().and_then(|d| serde_json::to_string(d).ok()))
         .bind(h.hsts as i64)
         .bind(h.hsts_subdomains as i64)
+        .bind(h.rate_limit_per_minute as i64)
         .bind(h.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -2556,6 +2565,7 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         }

@@ -1179,7 +1179,7 @@ fn spawn_passthrough_listener(
         };
         let result = match protocol {
             Protocol::Tcp => passthrough::run_tcp_passthrough(bind_addr, upstream, limiter).await,
-            Protocol::Udp => passthrough::run_udp_passthrough(bind_addr, upstream).await,
+            Protocol::Udp => passthrough::run_udp_passthrough(bind_addr, upstream, limiter).await,
         };
         if let Err(err) = result {
             tracing::error!(%bind_addr, error = %err, "passthrough listener exited");
@@ -1770,6 +1770,7 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2255,6 +2256,7 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2318,6 +2320,7 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
@@ -2350,6 +2353,7 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: true,
             enabled: true,
         }
@@ -2784,6 +2788,7 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         }

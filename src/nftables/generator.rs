@@ -498,6 +498,7 @@ mod tests {
             fixed_response: None,
             hsts: false,
             hsts_subdomains: false,
+            rate_limit_per_minute: 0,
             pass_client_cert_header: false,
             enabled: true,
         }
