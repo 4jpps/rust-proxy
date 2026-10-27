@@ -223,7 +223,9 @@ async fn run_nft(args: &[&str], ruleset: &str) -> anyhow::Result<()> {
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!("the `nft` binary was not found on PATH -- install the nftables package")
+                anyhow::anyhow!(
+                    "the `nft` binary was not found on PATH -- install the nftables package"
+                )
             } else {
                 anyhow::anyhow!("couldn't run `nft`: {e}")
             }
@@ -253,11 +255,31 @@ pub struct DiffLine {
     pub text: String,
 }
 
+/// Above this many old×new line pairs the LCS table is skipped and the
+/// diff is reported as "everything replaced" (still linear, still correct
+/// about whether anything changed). Real rulesets are a few hundred lines.
+const MAX_DIFF_CELLS: usize = 4_000_000;
+
 /// Line diff (longest common subsequence). Rulesets are a few hundred
-/// lines, so the quadratic table is small.
+/// lines, so the quadratic table is small; anything far bigger (e.g. a
+/// huge what-if body) falls back to a linear whole-replacement diff.
 pub fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
+    let line = |op, text: &str| DiffLine {
+        op,
+        text: text.to_string(),
+    };
+    if a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
+        if a == b {
+            return a.iter().map(|t| line(' ', t)).collect();
+        }
+        return a
+            .iter()
+            .map(|t| line('-', t))
+            .chain(b.iter().map(|t| line('+', t)))
+            .collect();
+    }
     let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
         for j in (0..b.len()).rev() {
@@ -268,10 +290,6 @@ pub fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
             };
         }
     }
-    let line = |op, text: &str| DiffLine {
-        op,
-        text: text.to_string(),
-    };
     let (mut i, mut j, mut out) = (0, 0, Vec::new());
     while i < a.len() && j < b.len() {
         if a[i] == b[j] {
@@ -312,6 +330,15 @@ mod tests {
     fn added_and_removed_lines_are_marked() {
         let d = diff_lines("a\nb\nc", "a\nc\nd");
         assert_eq!(ops(&d), " a|-b| c|+d");
+    }
+
+    #[test]
+    fn oversized_inputs_skip_the_quadratic_table() {
+        let old: String = (0..3000).map(|i| format!("a{i}\n")).collect();
+        let new: String = (0..3000).map(|i| format!("b{i}\n")).collect();
+        let d = diff_lines(&old, &new);
+        assert_eq!(d.len(), 6000);
+        assert!(diff_lines(&old, &old).iter().all(|l| l.op == ' '));
     }
 
     #[test]

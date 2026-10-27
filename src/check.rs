@@ -12,9 +12,16 @@ pub async fn run(mut cfg: Config, print_ruleset: bool) -> anyhow::Result<()> {
     );
 
     let live = cfg.admin.db_path.clone();
-    let snapshot = std::env::temp_dir().join(format!("rust-proxy-check-{}.db", std::process::id()));
+    // The snapshot holds password hashes, API tokens and DNS credentials:
+    // it goes in a fresh 0700 directory with an unguessable name (create
+    // fails if it already exists), removed whole on every exit path.
+    let dir = private_dir()?;
+    let snapshot = dir.join("snapshot.db");
     if live.exists() {
-        crate::db::snapshot_unmigrated(&live, &snapshot).await?;
+        if let Err(err) = crate::db::snapshot_unmigrated(&live, &snapshot).await {
+            std::fs::remove_dir_all(&dir).ok();
+            return Err(err.into());
+        }
         cfg.admin.db_path = snapshot.clone();
         println!("database: snapshot of {} taken", live.display());
     } else {
@@ -25,11 +32,19 @@ pub async fn run(mut cfg: Config, print_ruleset: bool) -> anyhow::Result<()> {
         );
     }
     let result = run_on_snapshot(cfg, print_ruleset).await;
-    std::fs::remove_file(&snapshot).ok();
+    std::fs::remove_dir_all(&dir).ok();
     if result.is_ok() {
         println!("check passed");
     }
     result
+}
+
+fn private_dir() -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let name = format!("rust-proxy-check-{:016x}", rand::random::<u64>());
+    let dir = std::env::temp_dir().join(name);
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
 }
 
 async fn run_on_snapshot(cfg: Config, print_ruleset: bool) -> anyhow::Result<()> {
