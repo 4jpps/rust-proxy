@@ -8,7 +8,11 @@
 pub mod generator;
 
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -20,6 +24,21 @@ use crate::state::AppState;
 /// `run_sync_loop` is what makes updates feel real-time; this is just a
 /// correctness backstop.
 const FALLBACK_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Outcome of the most recent sync of the main table. `ok` stays false
+/// until the first apply succeeds, so a daemon whose firewall has never
+/// been enforced reports unhealthy rather than "fine".
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FirewallStatus {
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub last_applied_at: Option<DateTime<Utc>>,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// The exact text last handed to `nft -f -` successfully -- what the
+    /// preview diffs against. Not serialized into health responses.
+    #[serde(skip)]
+    pub applied_ruleset: Option<Arc<String>>,
+}
 
 /// Checks that `nft` is actually present and invocable before the sync
 /// loop starts silently retrying (and re-failing) forever. Called once
@@ -74,8 +93,54 @@ pub async fn run_sync_loop(state: AppState) -> anyhow::Result<()> {
 }
 
 async fn sync_once(state: &AppState) -> anyhow::Result<()> {
-    let hosts = state.hosts();
-    let port_rules = state.port_rules();
+    let ruleset = build_ruleset(state).await?;
+    let result = apply(&ruleset).await;
+    let prev = state.firewall_status();
+    let now = Utc::now();
+    state.set_firewall_status(match &result {
+        Ok(()) => FirewallStatus {
+            last_attempt_at: Some(now),
+            last_applied_at: Some(now),
+            ok: true,
+            error: None,
+            applied_ruleset: Some(Arc::new(ruleset)),
+        },
+        Err(err) => FirewallStatus {
+            last_attempt_at: Some(now),
+            last_applied_at: prev.last_applied_at,
+            ok: false,
+            error: Some(err.to_string()),
+            applied_ruleset: prev.applied_ruleset.clone(),
+        },
+    });
+    result
+}
+
+/// What-if inputs for the firewall preview: any field that is set
+/// replaces the live value when generating, nothing is saved or applied.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct Overrides {
+    pub hosts: Option<Vec<crate::config::ProxyHost>>,
+    pub port_rules: Option<Vec<crate::config::PortRule>>,
+    pub admin_allowed_ips: Option<Vec<ipnet::IpNet>>,
+}
+
+/// The full ruleset `sync_once` would apply right now, from live state.
+/// Read-only: used by the sync itself and by the firewall preview.
+pub async fn build_ruleset(state: &AppState) -> anyhow::Result<String> {
+    build_ruleset_with(state, &Overrides::default()).await
+}
+
+/// `build_ruleset`, with any of `overrides` swapped in for live state.
+pub async fn build_ruleset_with(state: &AppState, overrides: &Overrides) -> anyhow::Result<String> {
+    let hosts = match &overrides.hosts {
+        Some(h) => Arc::new(h.clone()),
+        None => state.hosts(),
+    };
+    let port_rules = match &overrides.port_rules {
+        Some(r) => Arc::new(r.clone()),
+        None => state.port_rules(),
+    };
 
     // Hosts are handled entirely at the application layer (see
     // proxy::mod::handle_https_request's IP-over-login combination) --
@@ -117,7 +182,10 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
     }
 
     let mut admin = state.admin().clone();
-    admin.allowed_ips = state.admin_allowed_ips();
+    admin.allowed_ips = overrides
+        .admin_allowed_ips
+        .clone()
+        .unwrap_or_else(|| state.admin_allowed_ips());
     let ruleset = generator::generate_ruleset(
         &hosts,
         &port_rules,
@@ -128,19 +196,38 @@ async fn sync_once(state: &AppState) -> anyhow::Result<()> {
         &state.network().dhcp_interfaces,
         &blocks,
     );
-    apply(&ruleset).await
+    Ok(ruleset)
+}
+
+/// Asks `nft` to parse and validate a ruleset without loading it
+/// (`nft -c`). Used by `rust-proxy check` before a restart.
+pub async fn check(ruleset: &str) -> anyhow::Result<()> {
+    run_nft(&["-c", "-f", "-"], ruleset).await
 }
 
 /// Applies a ruleset by piping it into `nft -f -`. Requires `CAP_NET_ADMIN`
 /// (see the systemd unit) -- not exercised in unit tests, since that needs
 /// a real Linux netfilter stack.
 async fn apply(ruleset: &str) -> anyhow::Result<()> {
+    run_nft(&["-f", "-"], ruleset).await?;
+    tracing::info!("nftables ruleset applied");
+    Ok(())
+}
+
+async fn run_nft(args: &[&str], ruleset: &str) -> anyhow::Result<()> {
     let mut child = Command::new("nft")
-        .args(["-f", "-"])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("the `nft` binary was not found on PATH -- install the nftables package")
+            } else {
+                anyhow::anyhow!("couldn't run `nft`: {e}")
+            }
+        })?;
 
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(ruleset.as_bytes()).await?;
@@ -149,11 +236,87 @@ async fn apply(ruleset: &str) -> anyhow::Result<()> {
     let output = child.wait_with_output().await?;
     if !output.status.success() {
         anyhow::bail!(
-            "nft -f - exited with {}: {}",
+            "nft {} exited with {}: {}",
+            args.join(" "),
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    tracing::info!("nftables ruleset applied");
     Ok(())
+}
+
+/// One line of a ruleset diff: `' '` unchanged, `'-'` only in the old
+/// text, `'+'` only in the new.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DiffLine {
+    pub op: char,
+    pub text: String,
+}
+
+/// Line diff (longest common subsequence). Rulesets are a few hundred
+/// lines, so the quadratic table is small.
+pub fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let line = |op, text: &str| DiffLine {
+        op,
+        text: text.to_string(),
+    };
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push(line(' ', a[i]));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push(line('-', a[i]));
+            i += 1;
+        } else {
+            out.push(line('+', b[j]));
+            j += 1;
+        }
+    }
+    out.extend(a[i..].iter().map(|t| line('-', t)));
+    out.extend(b[j..].iter().map(|t| line('+', t)));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ops(d: &[DiffLine]) -> String {
+        d.iter()
+            .map(|l| format!("{}{}", l.op, l.text))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    #[test]
+    fn identical_rulesets_have_no_changes() {
+        let d = diff_lines("a\nb\n", "a\nb\n");
+        assert!(d.iter().all(|l| l.op == ' '));
+    }
+
+    #[test]
+    fn added_and_removed_lines_are_marked() {
+        let d = diff_lines("a\nb\nc", "a\nc\nd");
+        assert_eq!(ops(&d), " a|-b| c|+d");
+    }
+
+    #[test]
+    fn diff_against_nothing_is_all_additions() {
+        let d = diff_lines("", "x\ny");
+        assert_eq!(ops(&d), "+x|+y");
+    }
 }

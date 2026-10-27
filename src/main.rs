@@ -2,6 +2,7 @@ mod acme;
 mod api;
 mod blocklist;
 mod bootstrap;
+mod check;
 mod config;
 mod db;
 mod hosting;
@@ -49,6 +50,17 @@ enum Command {
     /// also usable by hand before a risky manual change.
     #[command(name = "backup-and-compact")]
     BackupAndCompact { destination: PathBuf },
+    /// Pre-flight before a restart or upgrade: validates the config,
+    /// runs this binary's migrations on a snapshot of the live DB (the
+    /// live file is never written), loads hosts and certificates, builds
+    /// the firewall ruleset and has `nft -c` validate it without loading
+    /// it. Run the *new* binary against the live config before swapping
+    /// it in; exits non-zero if anything would fail.
+    Check {
+        /// Also print the generated nftables ruleset.
+        #[arg(long)]
+        print_ruleset: bool,
+    },
 }
 
 #[tokio::main]
@@ -80,6 +92,10 @@ async fn main() -> anyhow::Result<()> {
         db::vacuum(&pool).await?;
         println!("compacted {}", cfg.admin.db_path.display());
         return Ok(());
+    }
+
+    if let Some(Command::Check { print_ruleset }) = &args.command {
+        return check::run(cfg, *print_ruleset).await;
     }
 
     // Split into proxy.log/access.log/server.log -- see logging.rs's

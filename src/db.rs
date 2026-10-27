@@ -61,6 +61,21 @@ pub async fn backup_to(pool: &SqlitePool, destination: &Path) -> Result<(), sqlx
     Ok(())
 }
 
+/// `backup_to` for a database this binary hasn't migrated: opens `source`
+/// read-only with no migrations, so a newer binary can test its upgrade
+/// on the copy (`rust-proxy check`) without touching the live file.
+pub async fn snapshot_unmigrated(source: &Path, destination: &Path) -> Result<(), sqlx::Error> {
+    let options =
+        SqliteConnectOptions::from_str(&format!("sqlite://{}", source.display()))?.read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    backup_to(&pool, destination).await?;
+    pool.close().await;
+    Ok(())
+}
+
 /// Compacts the live DB in place -- unlike `backup_to`'s `VACUUM INTO`
 /// (which produces an already-compact *copy*, leaving the live file
 /// untouched), a plain `VACUUM` rewrites the live database file itself,

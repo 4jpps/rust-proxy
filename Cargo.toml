@@ -65,6 +65,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ipnet = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

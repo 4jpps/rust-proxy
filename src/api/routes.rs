@@ -162,6 +162,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/hosting/status", get(super::hosting::status))
         .route("/api/hosting/apply", post(super::hosting::apply))
+        .route(
+            "/api/firewall/preview",
+            get(super::health::firewall_preview_get).post(super::health::firewall_preview_post),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -173,6 +177,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/setup", post(setup))
         .route("/api/network/local-ips", get(list_local_ips))
         .route("/api/version", get(get_version))
+        .route("/healthz", get(super::health::healthz))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .merge(protected)

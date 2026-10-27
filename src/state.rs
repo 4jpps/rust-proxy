@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::config::{AcmeConfig, AdminConfig, Config, NetworkConfig, PortRule, ProxyHost};
 use crate::hosting::HostingStatus;
 use crate::hosting::model::{Allocation, HostingPool};
+use crate::nftables::FirewallStatus;
 
 /// One domain's live TLS material, ready for SNI dispatch.
 #[derive(Clone, Debug)]
@@ -122,6 +123,9 @@ struct Inner {
     hosting_pools: ArcSwap<Vec<HostingPool>>,
     hosting_allocations: ArcSwap<Vec<Allocation>>,
     hosting_status: ArcSwap<HostingStatus>,
+    /// Outcome of the main table's last nftables sync, plus the exact
+    /// ruleset text it applied (for `/healthz` and the firewall preview).
+    firewall_status: ArcSwap<FirewallStatus>,
     /// Pools and allocations are validated against each other, so they
     /// share one write lock.
     hosting_write_lock: Mutex<()>,
@@ -175,6 +179,7 @@ impl AppState {
             hosting_pools: ArcSwap::from_pointee(Vec::new()),
             hosting_allocations: ArcSwap::from_pointee(Vec::new()),
             hosting_status: ArcSwap::from_pointee(HostingStatus::default()),
+            firewall_status: ArcSwap::from_pointee(FirewallStatus::default()),
             hosting_write_lock: Mutex::new(()),
             mobile_pass_enabled: ArcSwap::from_pointee(false),
             mobile_passes: crate::proxy::mobile_pass::PassStore::default(),
@@ -233,6 +238,14 @@ impl AppState {
 
     pub fn set_hosting_status(&self, status: HostingStatus) {
         self.0.hosting_status.store(Arc::new(status));
+    }
+
+    pub fn firewall_status(&self) -> Arc<FirewallStatus> {
+        self.0.firewall_status.load_full()
+    }
+
+    pub fn set_firewall_status(&self, status: FirewallStatus) {
+        self.0.firewall_status.store(Arc::new(status));
     }
 
     pub fn network(&self) -> &NetworkConfig {
