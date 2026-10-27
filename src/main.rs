@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "rust-proxy", about = "Lightweight L7 reverse proxy daemon")]
 struct Args {
     /// Path to the TOML config file
-    #[arg(long, default_value = "/etc/rust-proxy/config.toml")]
+    #[arg(long, global = true, default_value = "/etc/rust-proxy/config.toml")]
     config: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
