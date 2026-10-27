@@ -163,6 +163,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/hosting/status", get(super::hosting::status))
         .route("/api/hosting/apply", post(super::hosting::apply))
         .route("/api/limits", get(super::metrics::get_limits))
+        .route(
+            "/api/server-settings",
+            get(super::server_settings::get).put(super::server_settings::save),
+        )
+        .route(
+            "/api/server-settings/move",
+            post(super::server_settings::move_setting),
+        )
+        .route(
+            "/api/server-settings/generate-token",
+            post(super::server_settings::generate_token),
+        )
+        .route(
+            "/api/server/preflight",
+            post(super::server_settings::preflight),
+        )
+        .route("/api/server/restart", post(super::server_settings::restart))
+        .route("/api/server/backup", post(super::server_settings::backup))
         .route("/metrics", get(super::metrics::metrics))
         .route(
             "/api/firewall/preview",
@@ -199,10 +217,21 @@ pub fn build_router(state: AppState) -> Router {
 /// `Request`'s, which only flow inward) so `access_log`, running
 /// outside it, can log who without an extra lookup of its own.
 #[derive(Clone)]
-struct Principal {
-    username: String,
-    role: Role,
-    via: &'static str,
+pub(crate) struct Principal {
+    pub(crate) username: String,
+    pub(crate) role: Role,
+    pub(crate) via: &'static str,
+}
+
+impl Principal {
+    /// The owner account (from the setup wizard or config.toml), signed in
+    /// with its password -- never an API token or another admin.
+    pub(crate) fn is_primary(&self, state: &AppState) -> bool {
+        self.via == "session"
+            && state
+                .admin_identity()
+                .is_some_and(|i| i.username == self.username)
+    }
 }
 
 /// Every admin API request, logged to `access.log` (see `logging.rs`)
@@ -2334,10 +2363,7 @@ async fn get_me(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> Json<MeResponse> {
-    let primary = principal.via == "session"
-        && state
-            .admin_identity()
-            .is_some_and(|i| i.username == principal.username);
+    let primary = principal.is_primary(&state);
     Json(MeResponse {
         username: principal.username,
         role: principal.role,

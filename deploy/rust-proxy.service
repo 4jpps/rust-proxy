@@ -5,6 +5,9 @@ After=network.target
 [Service]
 ExecStart=/usr/bin/rust-proxy --config /etc/rust-proxy/config.toml
 Restart=on-failure
+# The admin UI's Restart button (System > Server) exits with 75 after the
+# pre-flight passes; this always brings the daemon straight back.
+RestartForceExitStatus=75
 # No explicit limit here meant this ran under systemd's own default
 # (commonly 1024 on Debian) -- confirmed as the real cause of a
 # production incident: a connection spike exhausted that limit, and

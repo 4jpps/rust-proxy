@@ -21,14 +21,21 @@ configure)
 
     mkdir -p "$CONFIG_DIR"
     # Group rust-proxy, not root -- the daemon runs as user rust-proxy
-    # (group rust-proxy) and needs to traverse this directory to open
-    # config.toml at all.
+    # (group rust-proxy). Group-writable so the admin UI's System > Server
+    # page can save config.toml: it writes a temp file here and renames it
+    # over config.toml, keeping config.toml.bak (also why the directory,
+    # not just the file, must be writable).
     chown root:rust-proxy "$CONFIG_DIR"
-    chmod 750 "$CONFIG_DIR"
+    chmod 770 "$CONFIG_DIR"
     mkdir -p "$STATE_DIR"
     chown rust-proxy:rust-proxy "$STATE_DIR"
 
     if [ -f "$CONFIG_FILE" ]; then
+        # Contents untouched; ownership and mode brought in line so the
+        # Server settings page can save it (upgrades from older versions
+        # installed it root-owned, 640).
+        chown root:rust-proxy "$CONFIG_FILE"
+        chmod 660 "$CONFIG_FILE"
         echo "rust-proxy: existing configuration in $CONFIG_FILE left untouched."
     else
         # config.toml.example's [admin]/[acme] sections are safe,
@@ -38,7 +45,7 @@ configure)
         # wizard, reachable from the network out of the box (not just
         # loopback -- nftables keeps SSH/80/443 open unconditionally,
         # and the admin port open until admin.allowed_ips is set).
-        install -m 640 -o root -g rust-proxy /usr/share/doc/rust-proxy/config.toml.example "$CONFIG_FILE"
+        install -m 660 -o root -g rust-proxy /usr/share/doc/rust-proxy/config.toml.example "$CONFIG_FILE"
         echo "rust-proxy: wrote a default $CONFIG_FILE (admin UI on http://<this-host-ip>:8084/)."
         echo "rust-proxy: visit it once to finish setup -- it walks you through creating an admin account."
     fi

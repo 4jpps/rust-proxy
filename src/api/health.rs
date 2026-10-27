@@ -301,7 +301,7 @@ async fn preview(state: &AppState, peer: SocketAddr, overrides: Overrides) -> Re
 /// order its rules apply: loopback is accepted first; then global block
 /// lists drop; then the admin rule exists only when the port is exposed,
 /// limited to the allow list when one is set.
-fn admin_reachable(
+pub(crate) fn admin_reachable(
     ip: std::net::IpAddr,
     allowed: &[ipnet::IpNet],
     expose: bool,

@@ -129,6 +129,10 @@ struct Inner {
     /// Per-client concurrent connection cap shared by every proxy listener.
     conn_limiter: Arc<crate::proxy::limits::ConnLimiter>,
     rate_limiter: crate::proxy::limits::RateLimiter,
+    /// The config.toml this process started from: its path and the text it
+    /// was loaded from, so the Server settings page can tell whether the
+    /// file has changed since (a restart is then needed to apply it).
+    config_file: std::sync::OnceLock<(std::path::PathBuf, String)>,
     /// Pools and allocations are validated against each other, so they
     /// share one write lock.
     hosting_write_lock: Mutex<()>,
@@ -162,6 +166,7 @@ impl AppState {
         Self(Arc::new(Inner {
             conn_limiter,
             rate_limiter: Default::default(),
+            config_file: std::sync::OnceLock::new(),
             network: cfg.network,
             admin: cfg.admin,
             acme: cfg.acme,
@@ -249,6 +254,16 @@ impl AppState {
 
     pub fn conn_limiter(&self) -> &Arc<crate::proxy::limits::ConnLimiter> {
         &self.0.conn_limiter
+    }
+
+    /// Records the config file this process was started from (once, at boot).
+    pub fn set_config_file(&self, path: std::path::PathBuf, loaded_text: String) {
+        let _ = self.0.config_file.set((path, loaded_text));
+    }
+
+    /// The config file's path and the text loaded at startup, if recorded.
+    pub fn config_file(&self) -> Option<&(std::path::PathBuf, String)> {
+        self.0.config_file.get()
     }
 
     pub fn rate_limiter(&self) -> &crate::proxy::limits::RateLimiter {
@@ -405,6 +420,16 @@ impl AppState {
             return self.0.admin.allowed_ips.clone();
         }
         (**self.0.admin_allowed_ips_db.load()).clone()
+    }
+
+    /// The Firewall settings page's own allow list, ignoring config.toml.
+    pub fn admin_allowed_ips_db(&self) -> Vec<ipnet::IpNet> {
+        (**self.0.admin_allowed_ips_db.load()).clone()
+    }
+
+    /// The Firewall settings page's own "expose admin port", ignoring config.toml.
+    pub fn expose_admin_port_db(&self) -> bool {
+        **self.0.expose_admin_port_db.load()
     }
 
     pub fn set_admin_allowed_ips(&self, ips: Vec<ipnet::IpNet>) {

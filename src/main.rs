@@ -126,6 +126,9 @@ async fn main() -> anyhow::Result<()> {
     // steps is independently named, reviewed, and unit-tested rather
     // than inlined here.
     let state = bootstrap::build_app_state(cfg).await?;
+    if let Ok(text) = std::fs::read_to_string(&args.config) {
+        state.set_config_file(args.config.clone(), text);
+    }
 
     // One clear, loud message right at boot if nftables isn't usable,
     // instead of that only surfacing buried in `nftables sync failed`
