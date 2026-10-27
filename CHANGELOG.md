@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-10-27
 
 - **Every setting in the admin UI.** System > Server shows everything in
   `config.toml` (network, admin UI, certificates, the identity forward
