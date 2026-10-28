@@ -99,7 +99,11 @@ package:amd64-deb:
           echo "172.16.60.141 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMhN9SFlktJjOM7IVr0gfTPTug9OCbfcqt983cHwn5Hh" >> ~/.ssh/known_hosts
         cp "${GITLAB_RELAY_SSH_KEY}" ~/.ssh/ci_relay_key
         chmod 600 ~/.ssh/ci_relay_key
-        ssh -o BatchMode=yes -i ~/.ssh/ci_relay_key -L 18080:127.0.0.1:80 -N -f ci-relay@172.16.60.141
+        # Close a tunnel an earlier job left open (-f tunnels outlive their
+        # job, and 25 had piled up on GL-Runner1). Safe: a runner runs one
+        # job at a time. The [c] keeps the pattern from matching itself.
+        pkill -u "$(id -un)" -f '[c]i-relay@172.16.60.141' || true
+        ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -i ~/.ssh/ci_relay_key -L 18080:127.0.0.1:80 -N -f ci-relay@172.16.60.141
         curl --fail --silent --show-error \
           --header "Host: gitlab.jpps.us" \
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
@@ -158,7 +162,11 @@ release:
         echo "172.16.60.141 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMhN9SFlktJjOM7IVr0gfTPTug9OCbfcqt983cHwn5Hh" >> ~/.ssh/known_hosts
       cp "${GITLAB_RELAY_SSH_KEY}" ~/.ssh/ci_relay_key
       chmod 600 ~/.ssh/ci_relay_key
-      ssh -o BatchMode=yes -i ~/.ssh/ci_relay_key -L 18080:127.0.0.1:80 -N -f ci-relay@172.16.60.141
+      # Close a tunnel an earlier job left open (-f tunnels outlive their
+      # job, and 25 had piled up on GL-Runner1). Safe: a runner runs one
+      # job at a time. The [c] keeps the pattern from matching itself.
+      pkill -u "$(id -un)" -f '[c]i-relay@172.16.60.141' || true
+      ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -i ~/.ssh/ci_relay_key -L 18080:127.0.0.1:80 -N -f ci-relay@172.16.60.141
       curl --fail --silent --show-error \
         --header "Host: gitlab.jpps.us" \
         --header "JOB-TOKEN: $CI_JOB_TOKEN" \
