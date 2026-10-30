@@ -185,6 +185,15 @@ pub fn generate_ruleset(
         out,
         "        icmp type {{ echo-request, destination-unreachable, time-exceeded }} accept"
     );
+    // IPv6 can't work without these: neighbour discovery (a dropped
+    // solicitation makes the host unreachable even on its own link) and
+    // packet-too-big (IPv6 routers never fragment). Neighbour
+    // solicitations aren't part of any tracked connection, so the
+    // established/related accept above doesn't cover them.
+    let _ = writeln!(
+        out,
+        "        icmpv6 type {{ echo-request, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-query }} accept"
+    );
     let _ = writeln!(out);
 
     // A dedicated address serves only what is explicitly bound to it.

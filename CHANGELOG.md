@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.2] - 2026-10-30
+
+- **IPv6 works on the proxy host.** The generated firewall dropped all
+  inbound ICMPv6, including neighbour discovery, so a host with an IPv6
+  address couldn't be reached even by its own router. It now accepts the
+  ICMPv6 that IPv6 needs: neighbour and router discovery, MLD queries,
+  echo requests, and the error messages, including packet-too-big (IPv6
+  routers never fragment). File: `src/nftables/generator.rs`.
+
 ## [0.6.1] - 2026-10-27
 
 - **Security: TLS library update.** rustls 0.23.46 fixes four advisories
