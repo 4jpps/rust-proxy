@@ -430,6 +430,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    // IPv6 prefix for a pool's VMs (0.6.3); additive, ignore "duplicate column".
+    let _ = sqlx::query("ALTER TABLE hosting_pools ADD COLUMN cidr6 TEXT")
+        .execute(pool)
+        .await;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS hosting_allocations (
@@ -2447,7 +2451,7 @@ pub async fn save_port_rules(pool: &SqlitePool, rules: &[PortRule]) -> Result<()
 }
 
 pub async fn load_hosting_pools(pool: &SqlitePool) -> Result<Vec<HostingPool>, sqlx::Error> {
-    let rows = sqlx::query("SELECT name, cidr, description, reserved, vm_cidr, gateway FROM hosting_pools ORDER BY name")
+    let rows = sqlx::query("SELECT name, cidr, description, reserved, vm_cidr, gateway, cidr6 FROM hosting_pools ORDER BY name")
         .fetch_all(pool)
         .await?;
     // A row that no longer parses is skipped rather than aborting startup;
@@ -2470,6 +2474,9 @@ pub async fn load_hosting_pools(pool: &SqlitePool) -> Result<Vec<HostingPool>, s
                     .and_then(|s| s.parse().ok()),
                 gateway: row
                     .get::<Option<String>, _>("gateway")
+                    .and_then(|s| s.parse().ok()),
+                cidr6: row
+                    .get::<Option<String>, _>("cidr6")
                     .and_then(|s| s.parse().ok()),
             })
         })
@@ -2531,13 +2538,14 @@ pub async fn save_hosting(
             .map(|ip| ip.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        sqlx::query("INSERT INTO hosting_pools (name, cidr, description, reserved, vm_cidr, gateway) VALUES (?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO hosting_pools (name, cidr, description, reserved, vm_cidr, gateway, cidr6) VALUES (?, ?, ?, ?, ?, ?, ?)")
             .bind(&p.name)
             .bind(p.cidr.to_string())
             .bind(&p.description)
             .bind(reserved)
             .bind(p.vm_cidr.map(|n| n.to_string()))
             .bind(p.gateway.map(|ip| ip.to_string()))
+            .bind(p.cidr6.map(|n| n.to_string()))
             .execute(&mut *tx)
             .await?;
     }
@@ -2785,6 +2793,7 @@ mod tests {
             reserved: vec!["204.52.221.225".parse().unwrap()],
             vm_cidr: Some("172.16.63.0/24".parse().unwrap()),
             gateway: Some("172.16.63.1".parse().unwrap()),
+            cidr6: None,
         };
         let alloc = Allocation {
             id: Uuid::new_v4(),

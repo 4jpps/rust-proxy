@@ -204,6 +204,7 @@ mod tests {
             reserved: vec![],
             vm_cidr: None,
             gateway: None,
+            cidr6: None,
         };
         assert!(seed_hosting_pools(&cfg).is_empty(), "no [hosting] section");
         cfg.hosting = Some(crate::config::HostingSeedConfig {
@@ -228,6 +229,7 @@ mod tests {
                 bind_ranges: vec![],
                 dedicated_ips: vec![],
                 dhcp_interfaces: vec![],
+                hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },

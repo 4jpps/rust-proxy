@@ -107,6 +107,8 @@ pub struct PoolRequest {
     vm_cidr: Option<Ipv4Net>,
     #[serde(default)]
     gateway: Option<Ipv4Addr>,
+    #[serde(default)]
+    cidr6: Option<ipnet::Ipv6Net>,
 }
 
 pub async fn list_pools(State(state): State<AppState>) -> Json<Vec<PoolView>> {
@@ -141,6 +143,7 @@ pub async fn create_pool(
         reserved: req.reserved,
         vm_cidr: req.vm_cidr,
         gateway: req.gateway,
+        cidr6: req.cidr6,
     };
     model::validate_pool(&pool, &pools, &state.network().dedicated_ips)?;
     pools.push(pool.clone());
@@ -172,6 +175,7 @@ pub async fn update_pool(
         reserved: req.reserved,
         vm_cidr: req.vm_cidr,
         gateway: req.gateway,
+        cidr6: req.cidr6,
     };
     let others: Vec<HostingPool> = pools
         .iter()
@@ -670,6 +674,7 @@ mod tests {
                 bind_ranges: vec!["204.52.221.224/27".parse().unwrap()],
                 dedicated_ips: dedicated,
                 dhcp_interfaces: vec![],
+                hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
             },

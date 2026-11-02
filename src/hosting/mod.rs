@@ -131,6 +131,10 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
         std::collections::HashMap::new();
     let mut pass_logins: std::collections::HashMap<Uuid, Vec<Uuid>> =
         std::collections::HashMap::new();
+    let mut v6 = generator::HostingV6 {
+        internal: state.network().hosting_v6_internal_nets.clone(),
+        ..Default::default()
+    };
     for acl_id in allocations
         .iter()
         .filter(|a| a.is_active())
@@ -142,15 +146,15 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
             if state.mobile_pass_enabled() && !resolved.firewall_mobile_login_lists.is_empty() {
                 pass_logins.insert(acl_id, resolved.firewall_mobile_login_lists.clone());
             }
-            let nets = resolved
-                .allow_ips
-                .into_iter()
-                .filter_map(|n| match n {
-                    ipnet::IpNet::V4(v4) => Some(v4),
-                    ipnet::IpNet::V6(_) => None,
-                })
-                .collect();
+            let (mut nets, mut nets6) = (Vec::new(), Vec::new());
+            for n in resolved.allow_ips {
+                match n {
+                    ipnet::IpNet::V4(v4) => nets.push(v4),
+                    ipnet::IpNet::V6(v6) => nets6.push(v6),
+                }
+            }
             acl_sources.insert(acl_id, nets);
+            v6.acl_sources.insert(acl_id, nets6);
         }
     }
     let index = state.block_index();
@@ -162,6 +166,15 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
             })
             .collect()
     };
+    let only_v6 = |nets: &[ipnet::IpNet]| -> Vec<ipnet::Ipv6Net> {
+        nets.iter()
+            .filter_map(|n| match n {
+                ipnet::IpNet::V6(v6) => Some(*v6),
+                ipnet::IpNet::V4(_) => None,
+            })
+            .collect()
+    };
+    v6.global_blocks = only_v6(index.global_nets());
     let mut blocks = generator::HostingBlocks {
         global: v4(index.global_nets()),
         passes: pass_logins,
@@ -173,9 +186,14 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
         .flat_map(|a| a.ports.iter().flat_map(|p| p.acl_ids.iter().copied()))
         .collect::<BTreeSet<Uuid>>()
     {
-        let nets = v4(&index.nets_for(&[acl_id]));
+        let all = index.nets_for(&[acl_id]);
+        let nets = v4(&all);
         if !nets.is_empty() {
             blocks.acl.insert(acl_id, nets);
+        }
+        let nets6 = only_v6(&all);
+        if !nets6.is_empty() {
+            v6.acl_blocks.insert(acl_id, nets6);
         }
     }
     // Recreating the table empties its pass sets; refill them under the
@@ -187,6 +205,8 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
     sets.hosting = crate::nftables::passes::declared(&ruleset);
     crate::nftables::passes::refill(state, &sets).await;
     drop(sets);
+    // IPv6 for pools with a cidr6 (an empty table when none have one).
+    apply_ruleset(&generator::generate_ruleset_v6(&allocations, &pools, &v6)).await?;
     EVER_APPLIED.store(true, Ordering::Relaxed);
     for ip in &remove {
         run_checked("ip", &["addr", "del", &format!("{ip}/32"), "dev", "lo"]).await?;

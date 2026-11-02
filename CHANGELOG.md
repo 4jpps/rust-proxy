@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.3] - 2026-11-02
+
+- **IPv6 for hosted VMs.** A hosting pool can now carry an IPv6 prefix
+  (`cidr6`, a /64 to /120 routed to this host and on-link on the VM
+  network, with the proxy as `::1`). Each VM gets a real IPv6 address with
+  no NAT: the prefix plus the last octet of its public IPv4 address, so
+  `.226` becomes `<prefix>::226`. A generated `ip6 rust_proxy_hosting6`
+  table applies the same policy as IPv4: only allocated ports reach the VM
+  (with the same remaps, ACL sources and block lists), everything else to
+  the prefix is dropped, and VMs cannot open connections to the proxy, to
+  unique-local or link-local space, to other hosting prefixes, or to the
+  ranges in the new `network.hosting_v6_internal_nets` setting. Mobile
+  passes stay IPv4-only, so a port reachable only through a pass is closed
+  over IPv6. Files: `src/hosting/model.rs`, `src/hosting/generator.rs`,
+  `src/hosting/mod.rs`, `src/api/hosting.rs`, `src/config.rs`, `src/db.rs`
+  (additive `cidr6` column).
+
 ## [0.6.2] - 2026-10-30
 
 - **IPv6 works on the proxy host.** The generated firewall dropped all

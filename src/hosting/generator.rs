@@ -6,12 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use uuid::Uuid;
 
-use super::model::{Allocation, ForwardMode, PortSpec};
+use super::model::{Allocation, ForwardMode, HostingPool, PortSpec, vm_ip6};
 use crate::config::Protocol;
 use crate::nftables::generator::PASS_CT_MARK;
 
@@ -321,6 +321,204 @@ pub fn generate_ruleset_full(
     }
     let _ = writeln!(out, "    }}");
 
+    let _ = writeln!(out, "}}");
+    out
+}
+
+pub const TABLE6: &str = "rust_proxy_hosting6";
+
+/// IPv6 inputs for [`generate_ruleset_v6`]: per `IpAllow` ACL its IPv6
+/// source networks, the global and per-ACL IPv6 block lists, and the
+/// operator's internal ranges (`network.hosting_v6_internal_nets`).
+#[derive(Debug, Default, Clone)]
+pub struct HostingV6 {
+    pub acl_sources: HashMap<Uuid, Vec<Ipv6Net>>,
+    pub global_blocks: Vec<Ipv6Net>,
+    pub acl_blocks: HashMap<Uuid, Vec<Ipv6Net>>,
+    pub internal: Vec<Ipv6Net>,
+}
+
+fn net6_set(nets: &[Ipv6Net]) -> String {
+    let items: Vec<String> = nets.iter().map(Ipv6Net::to_string).collect();
+    format!("{{ {} }}", items.join(", "))
+}
+
+/// Builds the `ip6 rust_proxy_hosting6` table for pools that have a `cidr6`.
+/// Hosted VMs get real IPv6 addresses (prefix + last IPv4 octet, see
+/// [`vm_ip6`]); there is no NAT, so this table is the whole policy:
+///
+/// - `prerouting`: DNAT only where a port is remapped (`vm_port`).
+/// - `forward`: replies to established traffic pass; inbound to a VM only on
+///   its allocated ports (same ACL sources, block lists and remaps as IPv4;
+///   everything for `ForwardMode::All`); anything else addressed to a hosting
+///   prefix is dropped. A VM may not open connections to the operator's
+///   internal ranges, unique-local, link-local or any hosting prefix.
+/// - `input`: VMs use the proxy as their router (ICMPv6, neighbour
+///   discovery) but may not open connections to the proxy itself.
+///
+/// Mobile passes are IPv4-only, so a port reachable only through a pass
+/// forwards nothing over IPv6 (fail closed).
+pub fn generate_ruleset_v6(
+    allocations: &[Allocation],
+    pools: &[HostingPool],
+    v6: &HostingV6,
+) -> String {
+    let prefixes: Vec<Ipv6Net> = pools.iter().filter_map(|p| p.cidr6).collect();
+    let mut active: Vec<(&Allocation, Ipv6Addr)> = allocations
+        .iter()
+        .filter(|a| a.is_active())
+        .filter_map(|a| {
+            let pool = pools.iter().find(|p| p.name == a.pool)?;
+            Some((a, vm_ip6(pool, a)?))
+        })
+        .collect();
+    active.sort_by_key(|(a, _)| a.public_ip);
+
+    let mut out = String::new();
+    let _ = writeln!(out, "add table ip6 {TABLE6}");
+    let _ = writeln!(out, "delete table ip6 {TABLE6}");
+    let _ = writeln!(out, "table ip6 {TABLE6} {{");
+
+    // (vm, "ip6 saddr {..} " or "", protocol name, public port set, remap)
+    let mut accepts: Vec<String> = Vec::new();
+    let mut dnats: Vec<String> = Vec::new();
+    let mut drops: Vec<String> = Vec::new();
+    for (a, vm) in &active {
+        match a.forward {
+            ForwardMode::All => accepts.push(format!("ip6 daddr {vm} accept")),
+            ForwardMode::Ports => {
+                let mut groups: BTreeMap<Vec<Uuid>, Vec<&PortSpec>> = BTreeMap::new();
+                for p in &a.ports {
+                    let mut key = p.acl_ids.clone();
+                    key.sort();
+                    key.dedup();
+                    groups.entry(key).or_default().push(p);
+                }
+                for (acls, specs) in &groups {
+                    let source = if acls.is_empty() {
+                        String::new()
+                    } else {
+                        let mut nets: Vec<Ipv6Net> = acls
+                            .iter()
+                            .flat_map(|id| v6.acl_sources.get(id).into_iter().flatten().copied())
+                            .collect();
+                        nets.sort();
+                        nets.dedup();
+                        if nets.is_empty() {
+                            continue; // restricted to lists with no IPv6 entries: closed
+                        }
+                        format!("ip6 saddr {} ", net6_set(&nets))
+                    };
+                    let mut blocked: Vec<Ipv6Net> = acls
+                        .iter()
+                        .flat_map(|id| v6.acl_blocks.get(id).into_iter().flatten().copied())
+                        .collect();
+                    blocked.sort();
+                    blocked.dedup();
+                    for (proto, name) in [(Protocol::Tcp, "tcp"), (Protocol::Udp, "udp")] {
+                        if let Some(set) = port_set(specs, proto)
+                            && !blocked.is_empty()
+                        {
+                            drops.push(format!(
+                                "ip6 daddr {vm} ip6 saddr {} {name} dport {set} drop",
+                                net6_set(&blocked)
+                            ));
+                        }
+                        let mut targets: BTreeMap<Option<u16>, Vec<&PortSpec>> = BTreeMap::new();
+                        for p in specs.iter().filter(|p| p.protocol == proto) {
+                            targets.entry(p.vm_port).or_default().push(p);
+                        }
+                        for (vm_port, group) in &targets {
+                            let Some(set) = port_set(group, proto) else {
+                                continue;
+                            };
+                            match vm_port {
+                                None => accepts.push(format!(
+                                    "ip6 daddr {vm} {source}{name} dport {set} accept"
+                                )),
+                                Some(vp) => {
+                                    dnats.push(format!(
+                                        "ip6 daddr {vm} {source}{name} dport {set} dnat to [{vm}]:{vp}"
+                                    ));
+                                    accepts.push(format!(
+                                        "ip6 daddr {vm} {source}{name} dport {vp} ct status dnat accept"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = writeln!(out, "    chain prerouting {{");
+    let _ = writeln!(
+        out,
+        "        type nat hook prerouting priority dstnat; policy accept;"
+    );
+    for line in &dnats {
+        let _ = writeln!(out, "        {line}");
+    }
+    let _ = writeln!(out, "    }}");
+
+    let _ = writeln!(out, "    chain input {{");
+    let _ = writeln!(
+        out,
+        "        type filter hook input priority -10; policy accept;"
+    );
+    if !prefixes.is_empty() {
+        let _ = writeln!(
+            out,
+            "        ip6 saddr {} meta l4proto != ipv6-icmp ct state new drop",
+            net6_set(&prefixes)
+        );
+    }
+    let _ = writeln!(out, "    }}");
+
+    let _ = writeln!(out, "    chain forward {{");
+    let _ = writeln!(
+        out,
+        "        type filter hook forward priority -10; policy accept;"
+    );
+    if !prefixes.is_empty() {
+        let pre = net6_set(&prefixes);
+        let _ = writeln!(
+            out,
+            "        ip6 daddr {pre} ct state established,related accept"
+        );
+        let _ = writeln!(
+            out,
+            "        ip6 saddr {pre} ct state established,related accept"
+        );
+        if !v6.global_blocks.is_empty() {
+            let _ = writeln!(
+                out,
+                "        ip6 saddr {} ip6 daddr {pre} drop",
+                net6_set(&v6.global_blocks)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "        ip6 daddr {pre} icmpv6 type {{ destination-unreachable, packet-too-big, time-exceeded, parameter-problem, echo-request }} accept"
+        );
+        for line in drops.iter().chain(accepts.iter()) {
+            let _ = writeln!(out, "        {line}");
+        }
+        let _ = writeln!(out, "        ip6 daddr {pre} drop");
+        let mut inside: Vec<Ipv6Net> = v6.internal.clone();
+        inside.extend(prefixes.iter().copied());
+        inside.push("fc00::/7".parse().expect("static net"));
+        inside.push("fe80::/10".parse().expect("static net"));
+        inside.sort();
+        inside.dedup();
+        let _ = writeln!(
+            out,
+            "        ip6 saddr {pre} ip6 daddr {} ct state new drop",
+            net6_set(&inside)
+        );
+    }
+    let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "}}");
     out
 }
@@ -755,6 +953,125 @@ mod tests {
                 "ip saddr @{set} tcp dport {{ 22 }} ct mark set {} dnat",
                 crate::nftables::generator::PASS_CT_MARK
             )),
+            "{out}"
+        );
+    }
+
+    fn pool6(cidr6: Option<&str>) -> HostingPool {
+        HostingPool {
+            name: "standard".into(),
+            cidr: "198.51.100.224/28".parse().unwrap(),
+            description: String::new(),
+            reserved: vec![],
+            vm_cidr: None,
+            gateway: None,
+            cidr6: cidr6.map(|c| c.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn vm_ip6_uses_the_last_ipv4_octet_as_written() {
+        let a = alloc(
+            "198.51.100.226",
+            Some("100.64.241.226"),
+            ForwardMode::All,
+            vec![],
+        );
+        let ip = vm_ip6(&pool6(Some("2001:db8:1:241::/64")), &a).unwrap();
+        assert_eq!(ip.to_string(), "2001:db8:1:241::226");
+        assert!(vm_ip6(&pool6(None), &a).is_none());
+    }
+
+    #[test]
+    fn v6_table_is_empty_without_a_cidr6() {
+        let a = alloc(
+            "198.51.100.226",
+            Some("100.64.241.226"),
+            ForwardMode::All,
+            vec![],
+        );
+        let out = generate_ruleset_v6(&[a], &[pool6(None)], &HostingV6::default());
+        assert!(out.starts_with(
+            "add table ip6 rust_proxy_hosting6\ndelete table ip6 rust_proxy_hosting6\n"
+        ));
+        assert!(!out.contains("ip6 daddr"), "{out}");
+        assert!(!out.contains("evil"), "names never reach nft");
+    }
+
+    #[test]
+    fn v6_ports_mode_allows_only_allocated_ports_and_remaps() {
+        let mut https = spec(Protocol::Tcp, 443, 443);
+        https.vm_port = Some(11443);
+        let a = alloc(
+            "198.51.100.226",
+            Some("100.64.241.226"),
+            ForwardMode::Ports,
+            vec![
+                spec(Protocol::Tcp, 22, 22),
+                https,
+                spec(Protocol::Udp, 3478, 3478),
+            ],
+        );
+        let v6 = HostingV6 {
+            internal: vec!["2001:db8:1::/48".parse().unwrap()],
+            ..Default::default()
+        };
+        let out = generate_ruleset_v6(&[a], &[pool6(Some("2001:db8:1:241::/64"))], &v6);
+        assert!(
+            out.contains("ip6 daddr 2001:db8:1:241::226 tcp dport { 22 } accept"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ip6 daddr 2001:db8:1:241::226 udp dport { 3478 } accept"),
+            "{out}"
+        );
+        assert!(
+            out.contains("tcp dport { 443 } dnat to [2001:db8:1:241::226]:11443"),
+            "{out}"
+        );
+        assert!(
+            out.contains("tcp dport 11443 ct status dnat accept"),
+            "{out}"
+        );
+        // Everything else to the prefix is dropped, after the accepts.
+        let drop_at = out
+            .find("ip6 daddr { 2001:db8:1:241::/64 } drop")
+            .expect(&out);
+        assert!(out.find("dport { 22 } accept").unwrap() < drop_at);
+        // VMs may not reach internal, unique-local or link-local space, nor the proxy.
+        assert!(out.contains("ip6 saddr { 2001:db8:1:241::/64 } ip6 daddr { 2001:db8:1::/48, 2001:db8:1:241::/64, fc00::/7, fe80::/10 } ct state new drop"), "{out}");
+        assert!(
+            out.contains(
+                "ip6 saddr { 2001:db8:1:241::/64 } meta l4proto != ipv6-icmp ct state new drop"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn v6_port_restricted_to_an_ipv4_only_list_stays_closed() {
+        let acl = Uuid::new_v4();
+        let mut ssh = spec(Protocol::Tcp, 22, 22);
+        ssh.acl_ids = vec![acl];
+        let a = alloc(
+            "198.51.100.226",
+            Some("100.64.241.226"),
+            ForwardMode::Ports,
+            vec![ssh],
+        );
+        let mut v6 = HostingV6::default();
+        v6.acl_sources.insert(acl, vec![]);
+        let out = generate_ruleset_v6(
+            std::slice::from_ref(&a),
+            &[pool6(Some("2001:db8:1:241::/64"))],
+            &v6,
+        );
+        assert!(!out.contains("dport { 22 } accept"), "{out}");
+        v6.acl_sources
+            .insert(acl, vec!["2001:db8:9::/48".parse().unwrap()]);
+        let out = generate_ruleset_v6(&[a], &[pool6(Some("2001:db8:1:241::/64"))], &v6);
+        assert!(
+            out.contains("ip6 saddr { 2001:db8:9::/48 } tcp dport { 22 } accept"),
             "{out}"
         );
     }

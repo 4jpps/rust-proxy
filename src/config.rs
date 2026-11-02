@@ -300,6 +300,11 @@ pub struct NetworkConfig {
     /// accept`. rust-proxy does not serve DHCP itself.
     #[serde(default)]
     pub dhcp_interfaces: Vec<String>,
+    /// IPv6 ranges hosted VMs must not open connections to (your own LAN
+    /// prefixes, other sites). Hosting pools with a `cidr6` always block
+    /// unique-local (fc00::/7), link-local and each other; list the rest here.
+    #[serde(default)]
+    pub hosting_v6_internal_nets: Vec<ipnet::Ipv6Net>,
     /// Most connections one client may hold open at once across every
     /// proxy listener (HTTPS, port 80, TCP passthrough); IPv6 clients are
     /// counted per /64. A browser uses well under ten per site, so the

@@ -3,10 +3,10 @@
 //! the same code.
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use chrono::{DateTime, Utc};
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -51,6 +51,25 @@ pub struct HostingPool {
     /// must be configured with. Informational for provisioning tools.
     #[serde(default)]
     pub gateway: Option<Ipv4Addr>,
+    /// IPv6 prefix routed to this host for the pool's VMs (usually a /64),
+    /// on-link on the VM network with the proxy as `::1`. Optional. A VM's
+    /// IPv6 address is not stored: it is this prefix plus the last octet of
+    /// its public IPv4 address (see [`vm_ip6`]), so 204.0.2.26 becomes
+    /// `<prefix>::26` -- the same number customers already know. No NAT.
+    #[serde(default)]
+    pub cidr6: Option<Ipv6Net>,
+}
+
+/// An allocation's IPv6 address: its pool's `cidr6` plus the last octet of
+/// the public IPv4 address (in hex the same digits read as decimal would not
+/// match, so the octet goes in as its decimal digits: .226 -> `::226`).
+/// `None` when the pool has no `cidr6`.
+pub fn vm_ip6(pool: &HostingPool, a: &Allocation) -> Option<Ipv6Addr> {
+    let net = pool.cidr6?;
+    let octet = a.public_ip.octets()[3];
+    // Decimal digits written as a hex group, e.g. 226 -> 0x226.
+    let group = u128::from_str_radix(&octet.to_string(), 16).ok()?;
+    Some(Ipv6Addr::from(u128::from(net.network()) | group))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +282,24 @@ pub fn validate_pool(
             "pool cidr contains network.dedicated_ips address {ip}, which hosting must never touch"
         ));
     }
+    if let Some(net6) = candidate.cidr6 {
+        if !(64..=120).contains(&net6.prefix_len()) {
+            return invalid("pool cidr6 must be between a /64 and a /120");
+        }
+        if net6 != net6.trunc() {
+            return invalid(format!(
+                "pool cidr6 has host bits set (did you mean {}?)",
+                net6.trunc()
+            ));
+        }
+        for other in others {
+            if let Some(o6) = other.cidr6
+                && (o6.contains(&net6.network()) || net6.contains(&o6.network()))
+            {
+                return conflict(format!("pool cidr6 overlaps pool '{}' ({o6})", other.name));
+            }
+        }
+    }
     for ip in &candidate.reserved {
         if !net.contains(ip) {
             return invalid(format!("reserved address {ip} is outside the pool"));
@@ -459,6 +496,7 @@ mod tests {
             reserved: vec![],
             vm_cidr: None,
             gateway: None,
+            cidr6: None,
         }
     }
 
