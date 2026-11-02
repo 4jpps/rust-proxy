@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.5] - 2026-11-02
+
+- **Provisioning includes IPv6.** For a pool with a `cidr6`, an
+  allocation's `provision` now has `ip6` (the VM's address with prefix
+  length), `gateway6` (the proxy, `::1` in the prefix), and `ipconfig0`
+  gains `,ip6=...,gw6=...`, so a cloud-init VM built from it comes up
+  dual-stack with no extra steps. File: `src/api/hosting.rs`.
+
 ## [0.6.4] - 2026-11-02
 
 - **IPv6 hosting hardening (review of 0.6.3, before any pool used it).**

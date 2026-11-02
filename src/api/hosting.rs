@@ -268,7 +268,15 @@ pub struct Provision {
     cidr: String,
     /// Suggested hostname (the allocation name, lowercased and sanitised).
     hostname: String,
-    /// Proxmox `ipconfig0` value for cloud-init.
+    /// The VM's IPv6 address with prefix length (`<cidr6>::<last octet>`),
+    /// when the pool has a `cidr6`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip6: Option<String>,
+    /// IPv6 default gateway: the proxy, `::1` in the pool's `cidr6`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway6: Option<std::net::Ipv6Addr>,
+    /// Proxmox `ipconfig0` value for cloud-init (includes `ip6=`/`gw6=` when
+    /// the pool has a `cidr6`).
     ipconfig0: String,
 }
 
@@ -290,9 +298,18 @@ fn provision_for(a: &Allocation, pool: Option<&HostingPool>) -> Option<Provision
     let pool = pool?;
     let (vm_ip, net) = (a.vm_ip?, pool.vm_cidr?);
     let cidr = format!("{vm_ip}/{}", net.prefix_len());
-    let ipconfig0 = match pool.gateway {
+    let mut ipconfig0 = match pool.gateway {
         Some(gw) => format!("ip={cidr},gw={gw}"),
         None => format!("ip={cidr}"),
+    };
+    let (ip6, gateway6) = match (model::vm_ip6(pool, a), pool.cidr6) {
+        (Some(ip), Some(net6)) => {
+            let gw6 = std::net::Ipv6Addr::from(u128::from(net6.network()) | 1);
+            let ip6 = format!("{ip}/{}", net6.prefix_len());
+            ipconfig0.push_str(&format!(",ip6={ip6},gw6={gw6}"));
+            (Some(ip6), Some(gw6))
+        }
+        _ => (None, None),
     };
     Some(Provision {
         public_ip: a.public_ip,
@@ -301,6 +318,8 @@ fn provision_for(a: &Allocation, pool: Option<&HostingPool>) -> Option<Provision
         netmask: net.netmask(),
         cidr,
         hostname: hostname_hint(&a.name),
+        ip6,
+        gateway6,
         ipconfig0,
     })
 }
@@ -1297,6 +1316,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provision_includes_ipv6_when_the_pool_has_a_cidr6() {
+        let (_, router, cookie) = setup(vec![]).await;
+        let pool = r#"{"name":"standard","cidr":"204.52.221.224/28","vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1","reserved":["204.52.221.225"],"cidr6":"2001:db8:1:241::/64"}"#;
+        let (s, _) = call(&router, &cookie, "POST", "/api/hosting/pools", pool).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let (s, a) = call(
+            &router,
+            &cookie,
+            "POST",
+            "/api/hosting/allocations",
+            r#"{"class":"standard","name":"v6 box"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{a}");
+        let p = &a["provision"];
+        assert_eq!(p["ip6"], "2001:db8:1:241::226/64");
+        assert_eq!(p["gateway6"], "2001:db8:1:241::1");
+        assert_eq!(
+            p["ipconfig0"],
+            "ip=172.16.63.226/24,gw=172.16.63.1,ip6=2001:db8:1:241::226/64,gw6=2001:db8:1:241::1"
+        );
+    }
+
+    #[tokio::test]
     async fn create_auto_assigns_vm_ip_and_returns_provision() {
         let (_, router, cookie) = setup(vec![]).await;
         call(&router, &cookie, "POST", "/api/hosting/pools", STANDARD).await;
@@ -1323,6 +1366,7 @@ mod tests {
         assert_eq!(p["cidr"], "172.16.63.226/24");
         assert_eq!(p["hostname"], "my-web-01");
         assert_eq!(p["ipconfig0"], "ip=172.16.63.226/24,gw=172.16.63.1");
+        assert!(p.get("ip6").is_none(), "no cidr6 on this pool: {p}");
 
         let (_, b) = call(
             &router,
