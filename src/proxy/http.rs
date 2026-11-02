@@ -1,8 +1,7 @@
 //! HTTP request forwarding to an upstream, including WebSocket upgrade
-//! passthrough. One upstream TCP connection per proxied request (no
-//! pooling yet -- see the module-level TODO in `mod.rs` if this becomes
-//! a bottleneck) so there's no shared connection state to reason about
-//! under concurrent hot-reloads.
+//! passthrough. Upstream connections are kept alive and reused through
+//! `super::pool` (per upstream address and TLS settings); upgrades always
+//! get a connection of their own.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -61,6 +60,9 @@ pub struct UpstreamOptions<'a> {
     /// `rewrite_samesite_none_to_lax`'s doc comment for the real
     /// production incident that led to building it.
     pub rewrite_samesite_none_cookies: bool,
+    /// Keep-alive pool to draw the upstream connection from and return it
+    /// to (`super::pool`). `None` opens a fresh connection per request.
+    pub pool: Option<&'a std::sync::Arc<super::pool::UpstreamPool>>,
 }
 
 pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
@@ -203,6 +205,41 @@ fn rewrite_samesite_none_to_lax(headers: &mut hyper::HeaderMap) {
     }
 }
 
+/// Opens a fresh connection to `upstream` (TLS when `opts.https`) and
+/// completes the HTTP/1.1 client handshake.
+async fn open_upstream(
+    upstream: SocketAddr,
+    opts: &UpstreamOptions<'_>,
+) -> Result<hyper::client::conn::http1::SendRequest<Incoming>, BoxError> {
+    let tcp = super::connect::connect_upstream(upstream).await?;
+    let io: TokioIo<Box<dyn UpstreamIo>> = if opts.https {
+        let host_only = opts
+            .upstream_host_port
+            .rsplit_once(':')
+            .map_or(opts.upstream_host_port, |(host, _)| host);
+        let server_name = rustls_pki_types::ServerName::try_from(host_only.to_string())?;
+        let config = if opts.tls_verify {
+            super::upstream_tls::verified_client_config()
+        } else {
+            super::upstream_tls::insecure_client_config()
+        };
+        let tls_stream = tokio_rustls::TlsConnector::from(config)
+            .connect(server_name, tcp)
+            .await?;
+        TokioIo::new(Box::new(tls_stream) as Box<dyn UpstreamIo>)
+    } else {
+        TokioIo::new(Box::new(tcp) as Box<dyn UpstreamIo>)
+    };
+    let (sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    super::pool::count(&super::pool::UPSTREAM_CONNECTS);
+    tokio::spawn(async move {
+        if let Err(err) = conn.with_upgrades().await {
+            tracing::debug!(error = %err, "upstream connection closed");
+        }
+    });
+    Ok(sender)
+}
+
 /// Forwards `req` to `upstream`, streaming the response body back
 /// unmodified. If `opts.websockets_enabled` and the request is a
 /// WebSocket upgrade, splices the client and upstream connections
@@ -333,33 +370,46 @@ pub async fn forward_http(
     let want_upgrade = opts.websockets_enabled && is_websocket_upgrade(&req);
     let client_upgrade = want_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let tcp = super::connect::connect_upstream(upstream).await?;
-    let io: TokioIo<Box<dyn UpstreamIo>> = if opts.https {
-        let host_only = opts
-            .upstream_host_port
-            .rsplit_once(':')
-            .map_or(opts.upstream_host_port, |(host, _)| host);
-        let server_name = rustls_pki_types::ServerName::try_from(host_only.to_string())?;
-        let config = if opts.tls_verify {
-            super::upstream_tls::verified_client_config()
-        } else {
-            super::upstream_tls::insecure_client_config()
-        };
-        let tls_stream = tokio_rustls::TlsConnector::from(config)
-            .connect(server_name, tcp)
-            .await?;
-        TokioIo::new(Box::new(tls_stream) as Box<dyn UpstreamIo>)
-    } else {
-        TokioIo::new(Box::new(tcp) as Box<dyn UpstreamIo>)
-    };
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::spawn(async move {
-        if let Err(err) = conn.with_upgrades().await {
-            tracing::debug!(error = %err, "upstream connection closed");
-        }
+    // Pooled only for ordinary requests: an upgraded connection becomes a
+    // raw byte pipe and can never carry another request.
+    let pool = opts.pool.filter(|p| p.enabled() && !want_upgrade);
+    let pool_key = pool.map(|_| super::pool::PoolKey {
+        addr: upstream,
+        https: opts.https,
+        tls_verify: opts.tls_verify,
+        upstream_host_port: opts.upstream_host_port.to_string(),
     });
-
-    let mut resp = sender.send_request(req).await?;
+    let mut pooled = match (pool, &pool_key) {
+        (Some(pool), Some(key)) => pool.take(key),
+        _ => None,
+    };
+    let (mut resp, sender) = loop {
+        if let Some(mut sender) = pooled.take() {
+            match sender.try_send_request(req).await {
+                Ok(resp) => {
+                    super::pool::count(&super::pool::UPSTREAM_REUSES);
+                    break (resp, sender);
+                }
+                Err(mut err) => match err.take_message() {
+                    // The upstream closed the idle connection before any of
+                    // the request was written: safe to send it again, once,
+                    // on a fresh connection.
+                    Some(unsent) => {
+                        super::pool::count(&super::pool::UPSTREAM_STALE_RETRIES);
+                        req = unsent;
+                        continue;
+                    }
+                    None => return Err(err.into_error().into()),
+                },
+            }
+        }
+        let mut sender = open_upstream(upstream, &opts).await?;
+        let resp = sender.send_request(req).await?;
+        break (resp, sender);
+    };
+    if let (Some(pool), Some(key)) = (pool, pool_key) {
+        pool.release_when_ready(key, sender);
+    }
 
     if opts.rewrite_samesite_none_cookies {
         rewrite_samesite_none_to_lax(resp.headers_mut());
@@ -891,6 +941,152 @@ mod tests {
         );
     }
 
+    /// Runs `n` sequential GETs through a proxy front (one client
+    /// connection) to `upstream_addr`, reading every body in full, and
+    /// returns the bodies. `pool` is what the front hands `forward_http`.
+    async fn sequential_gets(
+        upstream_addr: SocketAddr,
+        pool: Option<std::sync::Arc<super::super::pool::UpstreamPool>>,
+        n: usize,
+    ) -> Vec<String> {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let pool = pool.clone();
+                async move {
+                    let opts = UpstreamOptions {
+                        websockets_enabled: false,
+                        https: false,
+                        tls_verify: true,
+                        upstream_host_port: "unused:0",
+                        preserve_host: true,
+                        client_ip: "203.0.113.42".parse().unwrap(),
+                        rewrite_samesite_none_cookies: false,
+                        pool: pool.as_ref(),
+                    };
+                    forward_http(req, upstream_addr, opts)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut bodies = Vec::new();
+        for _ in 0..n {
+            sender.ready().await.unwrap();
+            let req = Request::builder()
+                .uri("/")
+                .header(hyper::header::HOST, "example.com")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let resp = sender.send_request(req).await.unwrap();
+            assert_eq!(resp.status(), 200);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            bodies.push(String::from_utf8(body.to_vec()).unwrap());
+            // Let the proxy's release task put the connection back.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        bodies
+    }
+
+    /// A keep-alive upstream that counts the TCP connections it accepts.
+    async fn counting_upstream() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let service = service_fn(|_req: Request<Incoming>| async move {
+                        let body: BoxBody<Bytes, hyper::Error> =
+                            http_body_util::Full::new(Bytes::from_static(b"hello"))
+                                .map_err(|e: std::convert::Infallible| match e {})
+                                .boxed();
+                        Ok::<_, std::convert::Infallible>(Response::new(body))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// The connection-count harness for upstream keep-alive: 20 requests
+    /// open 20 upstream connections without the pool and (about) one with it.
+    #[tokio::test]
+    async fn pooled_requests_reuse_one_upstream_connection() {
+        let (addr, accepted) = counting_upstream().await;
+        let bodies = sequential_gets(addr, None, 20).await;
+        assert!(bodies.iter().all(|b| b == "hello"));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 20);
+
+        let (addr, accepted) = counting_upstream().await;
+        let pool = std::sync::Arc::new(super::super::pool::UpstreamPool::new(30));
+        let bodies = sequential_gets(addr, Some(pool.clone()), 20).await;
+        assert!(bodies.iter().all(|b| b == "hello"));
+        let opened = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            opened <= 2,
+            "20 pooled requests opened {opened} upstream connections"
+        );
+        assert!(pool.idle_count() <= 1);
+
+        // Pooling off (keepalive 0) behaves like no pool at all.
+        let (addr, accepted) = counting_upstream().await;
+        let off = std::sync::Arc::new(super::super::pool::UpstreamPool::new(0));
+        sequential_gets(addr, Some(off), 5).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// An upstream that answers with keep-alive framing but then drops the
+    /// connection: every request must still succeed (a dead pooled
+    /// connection is skipped or its unsent request retried on a new one).
+    #[tokio::test]
+    async fn requests_survive_an_upstream_that_drops_idle_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut got = Vec::new();
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                    }
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                        .await;
+                    // No `Connection: close`: the proxy believes it may reuse it.
+                });
+            }
+        });
+        let pool = std::sync::Arc::new(super::super::pool::UpstreamPool::new(30));
+        let bodies = sequential_gets(addr, Some(pool), 10).await;
+        assert_eq!(bodies.len(), 10);
+        assert!(bodies.iter().all(|b| b == "hello"));
+    }
+
     #[tokio::test]
     async fn forward_http_rewrites_samesite_none_cookies_only_when_the_host_option_is_enabled() {
         async fn run(rewrite_enabled: bool) -> String {
@@ -933,6 +1129,7 @@ mod tests {
                         preserve_host: true,
                         client_ip: "203.0.113.42".parse().unwrap(),
                         rewrite_samesite_none_cookies: rewrite_enabled,
+                        pool: None,
                     };
                     forward_http(req, upstream_addr, opts)
                         .await
@@ -1013,6 +1210,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
@@ -1213,6 +1413,7 @@ mod tests {
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1287,6 +1488,7 @@ mod tests {
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1416,6 +1618,7 @@ mod tests {
                     preserve_host: false,
                     client_ip: "127.0.0.1".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1505,6 +1708,7 @@ mod tests {
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1625,6 +1829,7 @@ mod tests {
                     preserve_host: true,
                     client_ip: "203.0.113.42".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1696,6 +1901,7 @@ mod tests {
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1770,6 +1976,7 @@ mod tests {
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await
@@ -1873,6 +2080,7 @@ mod tests {
                     preserve_host: true,
                     client_ip: "127.0.0.1".parse().unwrap(),
                     rewrite_samesite_none_cookies: false,
+                    pool: None,
                 };
                 forward_http(req, upstream_addr, opts)
                     .await

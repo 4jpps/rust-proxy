@@ -126,6 +126,27 @@ pub const FIELDS: &[Field] = &[
         "How long a UDP port-rule session may sit silent before it is closed. Default 120.",
     ),
     f(
+        "network.upstream_keepalive_seconds",
+        Kind::Int,
+        "Network",
+        "Upstream keep-alive (seconds)",
+        "How long an idle connection to a site's backend is kept for the next request, saving a new connection each time. Keep it below your backends' own keep-alive timeout. 0 opens a new connection per request. Default 4.",
+    ),
+    f(
+        "network.trusted_proxies",
+        Kind::List,
+        "Network",
+        "Trusted proxies",
+        "Addresses or ranges of proxies in front of RustProxy (for example 127.0.0.1 for a Cloudflare tunnel on this machine), one per line. Only requests from these may name the real visitor in the client IP header. Leave empty if visitors connect directly.",
+    ),
+    f(
+        "network.client_ip_header",
+        Kind::Text,
+        "Network",
+        "Client IP header",
+        "Header a trusted proxy puts the visitor's address in. Default CF-Connecting-IP.",
+    ),
+    f(
         "admin.bind_ip_v4",
         Kind::OptText,
         "Admin UI",

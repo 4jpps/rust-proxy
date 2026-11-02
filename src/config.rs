@@ -316,6 +316,39 @@ pub struct NetworkConfig {
     /// as SIP or WireGuard with a long keepalive.
     #[serde(default = "default_udp_idle_timeout_seconds")]
     pub udp_idle_timeout_seconds: u64,
+    /// How long an idle upstream HTTP connection is kept for reuse
+    /// (default 4 s). Reuse saves a TCP (and TLS) handshake per request.
+    /// Keep it below the shortest keep-alive timeout of your backends
+    /// (Apache defaults to 5 s, nginx to 75 s); a connection a backend
+    /// closes first is retried safely, but costs a round trip. 0 turns
+    /// pooling off: one connection per request, as before 0.7.0.
+    #[serde(default = "default_upstream_keepalive_seconds")]
+    pub upstream_keepalive_seconds: u64,
+    /// Proxies in front of rust-proxy (a Cloudflare tunnel's `cloudflared`
+    /// on this box, a load balancer) whose `client_ip_header` is believed.
+    /// Without this, every request through such a proxy appears to come
+    /// from the proxy's own address, so IP allow/block lists, mobile
+    /// passes, rate limits and logs all judge the wrong client. The header
+    /// is only ever read when the connection itself comes from one of
+    /// these ranges; from anyone else it is ignored. Empty (the default)
+    /// trusts no one. Firewall-level rules still see the proxy's address.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpNet>,
+    /// The header a trusted proxy puts the real client address in
+    /// (default `CF-Connecting-IP`, as Cloudflare sends it). A single IP
+    /// address; anything else is ignored.
+    #[serde(default = "default_client_ip_header")]
+    pub client_ip_header: String,
+}
+
+fn default_client_ip_header() -> String {
+    DEFAULT_CLIENT_IP_HEADER.to_string()
+}
+
+pub const DEFAULT_CLIENT_IP_HEADER: &str = "cf-connecting-ip";
+
+fn default_upstream_keepalive_seconds() -> u64 {
+    crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS
 }
 
 pub const DEFAULT_UDP_IDLE_TIMEOUT_SECONDS: u64 = 120;

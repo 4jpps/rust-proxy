@@ -3081,6 +3081,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -3127,6 +3130,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -3178,6 +3184,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -3224,6 +3233,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -3360,6 +3372,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),
@@ -6082,6 +6097,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),

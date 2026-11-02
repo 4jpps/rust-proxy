@@ -128,6 +128,7 @@ struct Inner {
     firewall_status: ArcSwap<FirewallStatus>,
     /// Per-client concurrent connection cap shared by every proxy listener.
     conn_limiter: Arc<crate::proxy::limits::ConnLimiter>,
+    upstream_pool: Arc<crate::proxy::pool::UpstreamPool>,
     rate_limiter: crate::proxy::limits::RateLimiter,
     /// The config.toml this process started from: its path and the text it
     /// was loaded from, so the Server settings page can tell whether the
@@ -163,8 +164,12 @@ impl AppState {
     ) -> Self {
         let conn_limiter =
             crate::proxy::limits::ConnLimiter::new(cfg.network.max_connections_per_ip);
+        let upstream_pool = Arc::new(crate::proxy::pool::UpstreamPool::new(
+            cfg.network.upstream_keepalive_seconds,
+        ));
         Self(Arc::new(Inner {
             conn_limiter,
+            upstream_pool,
             rate_limiter: Default::default(),
             config_file: std::sync::OnceLock::new(),
             network: cfg.network,
@@ -254,6 +259,10 @@ impl AppState {
 
     pub fn conn_limiter(&self) -> &Arc<crate::proxy::limits::ConnLimiter> {
         &self.0.conn_limiter
+    }
+
+    pub fn upstream_pool(&self) -> &Arc<crate::proxy::pool::UpstreamPool> {
+        &self.0.upstream_pool
     }
 
     /// Records the config file this process was started from (once, at boot).
@@ -543,6 +552,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),

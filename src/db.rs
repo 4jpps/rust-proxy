@@ -1214,6 +1214,7 @@ pub async fn create_acl_list(
     kind: AclKind,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
+    let _acl_changed = AclChanged;
     sqlx::query("INSERT INTO acl_lists (id, name, kind, created_at) VALUES (?, ?, ?, ?)")
         .bind(id.to_string())
         .bind(name)
@@ -1229,6 +1230,7 @@ pub async fn add_acl_ip_entries(
     acl_list_id: Uuid,
     cidrs: &[String],
 ) -> Result<(), sqlx::Error> {
+    let _acl_changed = AclChanged;
     for cidr in cidrs {
         sqlx::query("INSERT INTO acl_ip_entries (id, acl_list_id, cidr) VALUES (?, ?, ?)")
             .bind(Uuid::new_v4().to_string())
@@ -1249,6 +1251,7 @@ pub async fn add_acl_credentials(
     acl_list_id: Uuid,
     credentials: &[(String, String)],
 ) -> Result<(), sqlx::Error> {
+    let _acl_changed = AclChanged;
     for (username, password_hash) in credentials {
         sqlx::query("INSERT INTO acl_credentials (id, acl_list_id, username, password_hash) VALUES (?, ?, ?, ?)")
             .bind(Uuid::new_v4().to_string())
@@ -1269,6 +1272,7 @@ pub async fn add_acl_client_cert_entries(
     acl_list_id: Uuid,
     subjects: &[(String, Option<String>)],
 ) -> Result<(), sqlx::Error> {
+    let _acl_changed = AclChanged;
     for (subject, description) in subjects {
         sqlx::query("INSERT INTO acl_client_cert_entries (id, acl_list_id, subject, description) VALUES (?, ?, ?, ?)")
             .bind(Uuid::new_v4().to_string())
@@ -1382,6 +1386,7 @@ pub async fn add_acl_ip_entry(
     cidr: &str,
     description: Option<&str>,
 ) -> Result<Uuid, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO acl_ip_entries (id, acl_list_id, cidr, description) VALUES (?, ?, ?, ?)",
@@ -1401,6 +1406,7 @@ pub async fn update_acl_ip_entry(
     cidr: &str,
     description: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("UPDATE acl_ip_entries SET cidr = ?, description = ? WHERE id = ?")
         .bind(cidr)
         .bind(description)
@@ -1411,6 +1417,7 @@ pub async fn update_acl_ip_entry(
 }
 
 pub async fn delete_acl_ip_entry(pool: &SqlitePool, entry_id: Uuid) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("DELETE FROM acl_ip_entries WHERE id = ?")
         .bind(entry_id.to_string())
         .execute(pool)
@@ -1444,6 +1451,7 @@ pub async fn add_acl_credential(
     password_hash: &str,
     description: Option<&str>,
 ) -> Result<Uuid, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO acl_credentials (id, acl_list_id, username, password_hash, description) VALUES (?, ?, ?, ?, ?)")
         .bind(id.to_string())
@@ -1467,6 +1475,7 @@ pub async fn update_acl_credential(
     password_hash: Option<&str>,
     description: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = match password_hash {
         Some(hash) => {
             sqlx::query("UPDATE acl_credentials SET username = ?, password_hash = ?, description = ? WHERE id = ?")
@@ -1493,6 +1502,7 @@ pub async fn delete_acl_credential(
     pool: &SqlitePool,
     credential_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("DELETE FROM acl_credentials WHERE id = ?")
         .bind(credential_id.to_string())
         .execute(pool)
@@ -1527,6 +1537,7 @@ pub async fn add_acl_client_cert_entry(
     subject: &str,
     description: Option<&str>,
 ) -> Result<Uuid, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO acl_client_cert_entries (id, acl_list_id, subject, description) VALUES (?, ?, ?, ?)")
         .bind(id.to_string())
@@ -1544,6 +1555,7 @@ pub async fn update_acl_client_cert_entry(
     subject: &str,
     description: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result =
         sqlx::query("UPDATE acl_client_cert_entries SET subject = ?, description = ? WHERE id = ?")
             .bind(subject)
@@ -1558,6 +1570,7 @@ pub async fn delete_acl_client_cert_entry(
     pool: &SqlitePool,
     entry_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("DELETE FROM acl_client_cert_entries WHERE id = ?")
         .bind(entry_id.to_string())
         .execute(pool)
@@ -1600,6 +1613,7 @@ pub async fn set_acl_mobile_login(
     id: Uuid,
     login_acl_id: Option<Uuid>,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("UPDATE acl_lists SET mobile_login_acl_id = ? WHERE id = ?")
         .bind(login_acl_id.map(|u| u.to_string()))
         .bind(id.to_string())
@@ -1615,6 +1629,7 @@ pub async fn set_acl_mobile_pass_firewall(
     id: Uuid,
     on: bool,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("UPDATE acl_lists SET mobile_pass_firewall = ? WHERE id = ?")
         .bind(i64::from(on))
         .bind(id.to_string())
@@ -1678,6 +1693,7 @@ pub async fn set_acl_global(
     id: Uuid,
     global: bool,
 ) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("UPDATE acl_lists SET global_block = ? WHERE id = ?")
         .bind(global as i64)
         .bind(id.to_string())
@@ -1818,6 +1834,7 @@ pub async fn acl_list_name_exists(pool: &SqlitePool, name: &str) -> Result<bool,
 /// `acl_ids` still contains it, the same guard already used for DNS
 /// credentials.
 pub async fn delete_acl_list(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let _acl_changed = AclChanged;
     let result = sqlx::query("DELETE FROM acl_lists WHERE id = ?")
         .bind(id.to_string())
         .execute(pool)
@@ -1870,6 +1887,66 @@ pub struct ResolvedAcls {
     /// The subset of `mobile_login_lists` whose IP-allow list also opens
     /// the firewall for passes (`AclList::mobile_pass_firewall`).
     pub firewall_mobile_login_lists: Vec<Uuid>,
+}
+
+/// Bumped after every ACL write (`AclChanged`'s drop, i.e. once the write
+/// has finished, committed or not), so `resolve_acl_ids_cached` never
+/// serves an answer older than the latest change made through this process.
+static ACL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Held for the duration of every function that writes an ACL table; its
+/// drop bumps `ACL_GENERATION` after the write, including on an error or
+/// cancelled future, so the cache errs towards refetching.
+struct AclChanged;
+
+impl Drop for AclChanged {
+    fn drop(&mut self) {
+        ACL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Backstop for writes this process never sees (someone editing the
+/// database file with another tool): a cached answer is never older than
+/// this. Changes made through rust-proxy itself apply on the next request.
+const ACL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+const ACL_CACHE_MAX_ENTRIES: usize = 4096;
+
+type AclCacheMap =
+    std::collections::HashMap<Vec<Uuid>, (u64, std::time::Instant, std::sync::Arc<ResolvedAcls>)>;
+
+fn acl_cache() -> &'static std::sync::Mutex<AclCacheMap> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<AclCacheMap>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `resolve_acl_ids` for the request path: the same answer, cached per
+/// list of ACL ids until any ACL changes (or `ACL_CACHE_TTL` passes), so a
+/// busy site no longer runs several queries on every request. An answer is
+/// only stored if no ACL write finished while it was being read, so a
+/// revocation can never be undone by a slow concurrent lookup.
+pub async fn resolve_acl_ids_cached(
+    pool: &SqlitePool,
+    acl_ids: &[Uuid],
+) -> Result<std::sync::Arc<ResolvedAcls>, sqlx::Error> {
+    let generation = ACL_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some((g, at, resolved)) = acl_cache().lock().unwrap().get(acl_ids)
+        && *g == generation
+        && at.elapsed() < ACL_CACHE_TTL
+    {
+        return Ok(resolved.clone());
+    }
+    let resolved = std::sync::Arc::new(resolve_acl_ids(pool, acl_ids).await?);
+    if ACL_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation {
+        let mut cache = acl_cache().lock().unwrap();
+        if cache.len() >= ACL_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            acl_ids.to_vec(),
+            (generation, std::time::Instant::now(), resolved.clone()),
+        );
+    }
+    Ok(resolved)
 }
 
 pub async fn resolve_acl_ids(
@@ -3648,6 +3725,30 @@ mod tests {
         assert_eq!(entries[0].description.as_deref(), Some("HQ"));
         assert_eq!(entries[1].id, id2);
         assert!(entries[1].description.is_none());
+    }
+
+    /// The request-path cache must never outlive an ACL change: a removed
+    /// IP entry stops admitting on the very next lookup, not after a TTL.
+    #[tokio::test]
+    async fn cached_acl_resolution_sees_a_revocation_immediately() {
+        let pool = memory_pool().await;
+        let acl_id = Uuid::new_v4();
+        create_acl_list(&pool, acl_id, "office", AclKind::IpAllow, Utc::now())
+            .await
+            .unwrap();
+        let entry = add_acl_ip_entry(&pool, acl_id, "198.51.100.0/24", None)
+            .await
+            .unwrap();
+        let ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let first = resolve_acl_ids_cached(&pool, &[acl_id]).await.unwrap();
+        assert!(first.allow_ips.iter().any(|n| n.contains(&ip)));
+
+        assert!(delete_acl_ip_entry(&pool, entry).await.unwrap());
+        let after = resolve_acl_ids_cached(&pool, &[acl_id]).await.unwrap();
+        assert!(
+            !after.allow_ips.iter().any(|n| n.contains(&ip)),
+            "a deleted allow entry must stop matching on the next lookup"
+        );
     }
 
     #[tokio::test]

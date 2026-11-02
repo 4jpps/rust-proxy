@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use std::sync::Mutex;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 
 #[cfg(test)]
 use tokio::net::TcpListener;
@@ -94,6 +94,10 @@ impl UdpSession {
     }
 }
 
+/// A plain (not async) mutex, never held across an `.await`: the only
+/// reader and the only inserter is the listener's own receive loop, and
+/// return-path tasks only ever remove, so a lookup per datagram is an
+/// uncontended lock and a new session's socket setup happens outside it.
 type UdpSessions = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSession>>>>;
 
 /// UDP has no connection to accept, so this keeps a small NAT-like session
@@ -124,12 +128,11 @@ pub async fn run_udp_passthrough(
             }
         };
 
-        let session = {
-            let mut guard = sessions.lock().await;
-            if let Some(existing) = guard.get(&client_addr) {
-                existing.clone()
-            } else {
-                if guard.len() >= MAX_UDP_SESSIONS {
+        let existing = sessions.lock().unwrap().get(&client_addr).cloned();
+        let session = match existing {
+            Some(existing) => existing,
+            None => {
+                if sessions.lock().unwrap().len() >= MAX_UDP_SESSIONS {
                     tracing::debug!(%client_addr, "udp passthrough: session table full, datagram dropped");
                     continue;
                 }
@@ -157,7 +160,12 @@ pub async fn run_udp_passthrough(
                     epoch: Instant::now(),
                     _slot: slot,
                 });
-                guard.insert(client_addr, session.clone());
+                // No race with the lookup above: this loop is the only
+                // inserter, so the address cannot have appeared meanwhile.
+                sessions
+                    .lock()
+                    .unwrap()
+                    .insert(client_addr, session.clone());
                 spawn_udp_return_path(
                     session.clone(),
                     socket.clone(),
@@ -210,7 +218,7 @@ fn spawn_udp_return_path(
                 Err(_timeout) => break,
             }
         }
-        sessions.lock().await.remove(&client_addr);
+        sessions.lock().unwrap().remove(&client_addr);
     });
 }
 

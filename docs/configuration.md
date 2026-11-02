@@ -95,6 +95,32 @@ passthrough listeners. IPv6 clients are counted per /64. A browser uses
 well under ten per site, so the default only stops floods. `0` turns the
 cap off. UDP port rules apply the same number per listener, separately.
 
+`upstream_keepalive_seconds` (default 4) is how long an idle connection
+to a site's backend is kept for the next request. Reusing it saves a TCP
+handshake (and a TLS handshake for HTTPS backends) on every request after
+the first. Keep it below the shortest keep-alive timeout among your
+backends (Apache's default is 5 s, nginx's 75 s). If a backend closes an
+idle connection first, the request is sent again on a new connection,
+but only if none of it had been sent. `0` turns reuse off: one
+connection per request, as before 0.7.0. WebSocket upgrades always get
+their own connection.
+
+`trusted_proxies` (default empty) lists proxies in front of RustProxy,
+for example `["127.0.0.1/32"]` when `cloudflared` runs on the same box.
+Requests from those addresses are judged by the IP in `client_ip_header`
+(default `CF-Connecting-IP`) instead of the proxy's own address, for IP
+allow and block lists, mobile passes, rate limits and logs. The header is
+ignored from every other address, so visitors cannot spoof it. Rules
+enforced in the firewall still see the proxy's address. If requests
+arrive from loopback and this is empty, RustProxy logs a warning once.
+
+```toml
+[network]
+upstream_keepalive_seconds = 4
+trusted_proxies = ["127.0.0.1/32"]
+client_ip_header = "CF-Connecting-IP"
+```
+
 ### `[siem]`
 
 See [Logging and SIEM](logging-and-siem.md).

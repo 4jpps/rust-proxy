@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.7.0] - 2026-11-02
+
+Review items RP-1, RP-3, RP-6, RP-7:
+
+- **Upstream keep-alive (RP-1).** Connections to a site's backend are now
+  reused instead of opening a new TCP (and TLS) connection for every
+  request. Pooled per backend address, TLS mode, verification setting and
+  upstream `host:port`, so nothing is shared across those; WebSocket
+  upgrades always get their own connection. A connection returns to the
+  pool only after its response body is fully read, and is dropped after
+  `network.upstream_keepalive_seconds` idle (default 4; `0` turns pooling
+  off). A pooled connection the backend already closed is retried once on
+  a new one, only when hyper reports none of the request was written.
+  Bounded at 16 idle per backend and 256 in total. New metrics:
+  `rustproxy_upstream_connects_total`, `_reuses_total`,
+  `_stale_retries_total` and the `rustproxy_upstream_idle_connections`
+  gauge. Measured by a new connection-count test: 20 sequential requests
+  open 20 backend connections without the pool and at most 2 with it.
+  Files: `src/proxy/pool.rs` (new), `src/proxy/http.rs`, `src/state.rs`,
+  `src/config.rs`, `src/api/metrics.rs`.
+- **ACL lookups cached (RP-3).** The per-request access-list queries are
+  now served from a cache that every ACL write invalidates as soon as it
+  finishes, so a revoked IP entry or login stops working on the very next
+  request. A 2 s limit covers changes made to the database by another
+  program. A lookup that overlaps a write is not cached. New test checks
+  that a deleted allow entry stops matching immediately. File: `src/db.rs`.
+- **Trusted proxies (RP-6).** New `network.trusted_proxies` and
+  `network.client_ip_header` (default `CF-Connecting-IP`): behind a
+  Cloudflare tunnel or load balancer, IP allow/block lists, mobile passes,
+  rate limits and logs now see the real visitor. The header is read only
+  from a listed proxy address and must be a single IP; from anyone else it
+  is ignored. Without any trusted proxy, requests from loopback log a
+  one-time warning. Both settings are on the Server settings page.
+- **UDP passthrough session table (RP-7).** A plain mutex replaces the
+  async one, and it is no longer held while a new session's upstream
+  socket is bound and connected. Lookups were already uncontended (one
+  receive loop per rule), so sharding would not help; this removes an
+  async lock from every datagram. Structural, not benchmarked.
+
 ## [0.6.6] - 2026-11-02
 
 Per-request overhead (review items RP-4, RP-2, RP-5; structural fixes, not

@@ -61,6 +61,11 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             (chrono::Utc::now() - at).num_seconds() as f64,
         );
     }
+    gauge(
+        "upstream_idle_connections",
+        "Idle upstream connections held for reuse.",
+        state.upstream_pool().idle_count() as f64,
+    );
     let (open, limit) = health::fd_usage();
     gauge("open_fds", "Open file descriptors.", open as f64);
     if let Some(limit) = limit {
@@ -99,6 +104,21 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             "rate_limited_total",
             "Requests answered 429 by a site's rate limit.",
             &RATE_LIMITED,
+        ),
+        (
+            "upstream_connects_total",
+            "New upstream connections opened.",
+            &crate::proxy::pool::UPSTREAM_CONNECTS,
+        ),
+        (
+            "upstream_reuses_total",
+            "Requests sent on a reused (keep-alive) upstream connection.",
+            &crate::proxy::pool::UPSTREAM_REUSES,
+        ),
+        (
+            "upstream_stale_retries_total",
+            "Reused upstream connections found closed; the request was resent on a new one.",
+            &crate::proxy::pool::UPSTREAM_STALE_RETRIES,
         ),
     ] {
         let _ = writeln!(out, "# HELP rustproxy_{name} {help}");

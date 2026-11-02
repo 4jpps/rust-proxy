@@ -18,6 +18,7 @@ pub mod limits;
 pub mod login;
 pub mod mobile_pass;
 pub mod passthrough;
+pub mod pool;
 pub mod revocation;
 pub mod router;
 pub mod tls;
@@ -424,7 +425,7 @@ async fn should_request_client_cert(
         return false;
     }
     let acl_ids = host.acl_ids.clone();
-    let resolved = match crate::db::resolve_acl_ids(state.db(), &acl_ids).await {
+    let resolved = match crate::db::resolve_acl_ids_cached(state.db(), &acl_ids).await {
         Ok(resolved) => resolved,
         Err(err) => {
             tracing::error!(%sni, error = %err, "failed to resolve host ACLs while deciding whether to solicit a client cert");
@@ -439,6 +440,39 @@ async fn should_request_client_cert(
     !already_ip_allowed
 }
 
+/// The address every per-request check should judge: the connection's own
+/// peer, unless that peer is one of `network.trusted_proxies`, in which case
+/// the single IP in its `client_ip_header`. Never reads the header from an
+/// untrusted peer, so a client cannot claim to be someone else.
+fn real_client_ip(
+    network: &crate::config::NetworkConfig,
+    peer_ip: IpAddr,
+    headers: &hyper::HeaderMap,
+) -> IpAddr {
+    if network.trusted_proxies.is_empty()
+        || !network.trusted_proxies.iter().any(|n| n.contains(&peer_ip))
+    {
+        if peer_ip.is_loopback() {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    %peer_ip,
+                    "requests are arriving from loopback (a local tunnel such as cloudflared?): \
+                     IP allow/block lists and rate limits see this address, not the real client. \
+                     Add it to network.trusted_proxies to use the tunnel's client-IP header."
+                );
+            }
+        }
+        return peer_ip;
+    }
+    headers
+        .get(network.client_ip_header.as_str())
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer_ip)
+}
+
 /// Thin wrapper that emits one SIEM `access` event per request (only when
 /// that category is selected -- otherwise this is a single atomic load).
 async fn handle_https_request(
@@ -450,6 +484,7 @@ async fn handle_https_request(
     client_cert_subject: Option<client_cert::ClientCertIdentity>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    let peer_ip = real_client_ip(state.network(), peer_ip, req.headers());
     if !crate::siem::wants(crate::siem::Category::Access) {
         return route_https_request(
             state,
@@ -717,9 +752,9 @@ async fn route_https_request_inner(
     client_cert::strip_identity_headers(req.headers_mut());
 
     let resolved_acls = if host.acl_ids.is_empty() {
-        crate::db::ResolvedAcls::default()
+        std::sync::Arc::new(crate::db::ResolvedAcls::default())
     } else {
-        match crate::db::resolve_acl_ids(state.db(), &host.acl_ids).await {
+        match crate::db::resolve_acl_ids_cached(state.db(), &host.acl_ids).await {
             Ok(resolved) => resolved,
             Err(err) => {
                 tracing::error!(domain = %host.domain, error = %err, "failed to resolve host ACLs");
@@ -902,6 +937,7 @@ async fn route_https_request_inner(
         preserve_host: host.upstream_preserve_host,
         client_ip: peer_ip,
         rewrite_samesite_none_cookies: host.rewrite_samesite_none_cookies,
+        pool: Some(state.upstream_pool()),
     };
     match http::forward_http(req, upstream, opts).await {
         Ok(resp) => Ok(resp),
@@ -1487,6 +1523,42 @@ fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn real_client_ip_only_believes_the_header_from_a_trusted_proxy() {
+        let mut network = crate::config::NetworkConfig {
+            bind_ranges: vec![],
+            dedicated_ips: vec![],
+            dhcp_interfaces: vec![],
+            hosting_v6_internal_nets: vec![],
+            max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
+            udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+            upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+            trusted_proxies: vec![],
+            client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
+        };
+        let tunnel: IpAddr = "127.0.0.1".parse().unwrap();
+        let stranger: IpAddr = "198.51.100.9".parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.5".parse().unwrap());
+
+        // Nobody trusted: the header is ignored.
+        assert_eq!(real_client_ip(&network, tunnel, &headers), tunnel);
+
+        network.trusted_proxies = vec!["127.0.0.1/32".parse().unwrap()];
+        assert_eq!(
+            real_client_ip(&network, tunnel, &headers),
+            "203.0.113.5".parse::<IpAddr>().unwrap()
+        );
+        // The same header from an untrusted peer is a spoof attempt.
+        assert_eq!(real_client_ip(&network, stranger, &headers), stranger);
+
+        // Garbage or a list is not a single address: keep the peer.
+        headers.insert("cf-connecting-ip", "203.0.113.5, 10.0.0.1".parse().unwrap());
+        assert_eq!(real_client_ip(&network, tunnel, &headers), tunnel);
+        headers.remove("cf-connecting-ip");
+        assert_eq!(real_client_ip(&network, tunnel, &headers), tunnel);
+    }
     #[test]
     fn rewrite_regex_is_compiled_once_and_bad_patterns_stay_off() {
         let a = cached_regex("^/old/(.*)$").expect("valid pattern");
@@ -1741,6 +1813,9 @@ mod tests {
                 hosting_v6_internal_nets: vec![],
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
+                upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
+                trusted_proxies: vec![],
+                client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
