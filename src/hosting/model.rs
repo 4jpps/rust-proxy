@@ -69,7 +69,10 @@ pub fn vm_ip6(pool: &HostingPool, a: &Allocation) -> Option<Ipv6Addr> {
     let octet = a.public_ip.octets()[3];
     // Decimal digits written as a hex group, e.g. 226 -> 0x226.
     let group = u128::from_str_radix(&octet.to_string(), 16).ok()?;
-    Some(Ipv6Addr::from(u128::from(net.network()) | group))
+    let ip = Ipv6Addr::from(u128::from(net.network()) | group);
+    // 0x255 needs 10 host bits; validate_pool allows /64-/112, but never hand
+    // out an address that would land outside the prefix.
+    net.contains(&ip).then_some(ip)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,8 +286,10 @@ pub fn validate_pool(
         ));
     }
     if let Some(net6) = candidate.cidr6 {
-        if !(64..=120).contains(&net6.prefix_len()) {
-            return invalid("pool cidr6 must be between a /64 and a /120");
+        // A VM's address is the prefix plus the last IPv4 octet's decimal
+        // digits as a hex group (up to 0x255, 10 bits): /112 keeps 16.
+        if !(64..=112).contains(&net6.prefix_len()) {
+            return invalid("pool cidr6 must be between a /64 and a /112");
         }
         if net6 != net6.trunc() {
             return invalid(format!(
@@ -884,5 +889,24 @@ mod tests {
         a.enabled = false;
         assert_eq!(a.state(), "disabled");
         assert!(!a.is_active());
+    }
+
+    #[test]
+    fn cidr6_must_leave_room_for_the_octet_and_not_overlap() {
+        let mut p = pool("standard", "198.51.100.224/28");
+        for (c, ok) in [
+            ("2001:db8:1:241::/64", true),
+            ("2001:db8:1:241::/112", true),
+            ("2001:db8:1:241::/113", false),
+            ("2001:db8:1:241::/120", false),
+            ("2001:db8::/48", false),
+        ] {
+            p.cidr6 = Some(c.parse().unwrap());
+            assert_eq!(validate_pool(&p, &[], &[]).is_ok(), ok, "{c}");
+        }
+        p.cidr6 = Some("2001:db8:1:241::/64".parse().unwrap());
+        let mut other = pool("ham", "198.51.100.240/28");
+        other.cidr6 = Some("2001:db8:1:241::/80".parse().unwrap());
+        assert!(validate_pool(&p, &[other], &[]).is_err());
     }
 }

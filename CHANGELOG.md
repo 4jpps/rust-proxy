@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.4] - 2026-11-02
+
+- **IPv6 hosting hardening (review of 0.6.3, before any pool used it).**
+  A VM's isolation is now matched on the VM-facing interfaces too (found
+  from where the pools' `cidr6` is on-link), so a VM cannot reach the proxy
+  or slip past the rules by forging its source address, and anything from
+  those interfaces with a source outside the pools is dropped. Only active
+  allocations may start outbound IPv6 connections (a disabled one loses
+  egress, as its IPv4 NAT does). Block lists are applied before the
+  established-connection accept, as in the IPv4 table. `cidr6` is limited
+  to /64-/112 and a VM address outside its prefix is never produced.
+
 ## [0.6.3] - 2026-11-02
 
 - **IPv6 for hosted VMs.** A hosting pool can now carry an IPv6 prefix

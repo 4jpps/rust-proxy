@@ -336,6 +336,21 @@ pub struct HostingV6 {
     pub global_blocks: Vec<Ipv6Net>,
     pub acl_blocks: HashMap<Uuid, Vec<Ipv6Net>>,
     pub internal: Vec<Ipv6Net>,
+    /// Interfaces the hosted VMs sit on (where the pools' `cidr6` is
+    /// on-link). Isolation is matched on these, not only on source
+    /// addresses, so a VM cannot dodge it by forging its source. Names are
+    /// checked against [`is_safe_ifname`] before they reach nft.
+    pub vm_interfaces: Vec<String>,
+}
+
+/// Interface names are interpolated into nft, so only the characters Linux
+/// interface names normally use are accepted.
+pub fn is_safe_ifname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn net6_set(nets: &[Ipv6Net]) -> String {
@@ -467,12 +482,38 @@ pub fn generate_ruleset_v6(
         out,
         "        type filter hook input priority -10; policy accept;"
     );
+    let ifaces: Vec<&String> = v6
+        .vm_interfaces
+        .iter()
+        .filter(|i| is_safe_ifname(i))
+        .collect();
+    let if_set = format!(
+        "{{ {} }}",
+        ifaces
+            .iter()
+            .map(|i| format!("\"{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     if !prefixes.is_empty() {
+        let pre = net6_set(&prefixes);
+        // Keyed on the source prefix and, where known, the VM interfaces:
+        // a VM may use the proxy as its router (ICMPv6) but not open
+        // connections to it, whatever source address it claims.
         let _ = writeln!(
             out,
-            "        ip6 saddr {} meta l4proto != ipv6-icmp ct state new drop",
-            net6_set(&prefixes)
+            "        ip6 saddr {pre} meta l4proto != ipv6-icmp ct state new drop"
         );
+        if !ifaces.is_empty() {
+            let _ = writeln!(
+                out,
+                "        iifname {if_set} ip6 saddr != {pre} ip6 saddr != fe80::/10 drop"
+            );
+            let _ = writeln!(
+                out,
+                "        iifname {if_set} meta l4proto != ipv6-icmp ct state new drop"
+            );
+        }
     }
     let _ = writeln!(out, "    }}");
 
@@ -483,6 +524,21 @@ pub fn generate_ruleset_v6(
     );
     if !prefixes.is_empty() {
         let pre = net6_set(&prefixes);
+        // Block lists first (as in the IPv4 table): they also cut existing flows.
+        if !v6.global_blocks.is_empty() {
+            let _ = writeln!(
+                out,
+                "        ip6 saddr {} ip6 daddr {pre} drop",
+                net6_set(&v6.global_blocks)
+            );
+        }
+        for line in &drops {
+            let _ = writeln!(out, "        {line}");
+        }
+        // Anti-spoofing: from the VM networks only the pools' own addresses.
+        if !ifaces.is_empty() {
+            let _ = writeln!(out, "        iifname {if_set} ip6 saddr != {pre} drop");
+        }
         let _ = writeln!(
             out,
             "        ip6 daddr {pre} ct state established,related accept"
@@ -491,18 +547,11 @@ pub fn generate_ruleset_v6(
             out,
             "        ip6 saddr {pre} ct state established,related accept"
         );
-        if !v6.global_blocks.is_empty() {
-            let _ = writeln!(
-                out,
-                "        ip6 saddr {} ip6 daddr {pre} drop",
-                net6_set(&v6.global_blocks)
-            );
-        }
         let _ = writeln!(
             out,
             "        ip6 daddr {pre} icmpv6 type {{ destination-unreachable, packet-too-big, time-exceeded, parameter-problem, echo-request }} accept"
         );
-        for line in drops.iter().chain(accepts.iter()) {
+        for line in &accepts {
             let _ = writeln!(out, "        {line}");
         }
         let _ = writeln!(out, "        ip6 daddr {pre} drop");
@@ -517,9 +566,39 @@ pub fn generate_ruleset_v6(
             "        ip6 saddr {pre} ip6 daddr {} ct state new drop",
             net6_set(&inside)
         );
+        // Only an active allocation's VM may start outbound connections; a
+        // disabled or unassigned one loses egress, as its IPv4 NAT does.
+        let vms: Vec<String> = active.iter().map(|(_, vm)| vm.to_string()).collect();
+        if !vms.is_empty() {
+            let _ = writeln!(out, "        ip6 saddr {{ {} }} accept", vms.join(", "));
+        }
+        let _ = writeln!(out, "        ip6 saddr {pre} drop");
     }
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "}}");
+    out
+}
+
+/// Interfaces (from `ip -6 -o addr show`) holding an address inside one of
+/// `prefixes`, deduplicated and sorted. Unsafe names are skipped.
+pub fn interfaces_holding(output: &str, prefixes: &[Ipv6Net]) -> Vec<String> {
+    let mut out: Vec<String> = output
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let _idx = f.next()?;
+            let ifname = f.next()?.split('@').next()?.to_string();
+            let family = f.next()?;
+            let addr = f.next()?;
+            if family != "inet6" {
+                return None;
+            }
+            let ip: Ipv6Addr = addr.split('/').next()?.parse().ok()?;
+            (prefixes.iter().any(|p| p.contains(&ip)) && is_safe_ifname(&ifname)).then_some(ifname)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -1074,5 +1153,73 @@ mod tests {
             out.contains("ip6 saddr { 2001:db8:9::/48 } tcp dport { 22 } accept"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn v6_isolation_uses_vm_interfaces_and_active_only_egress() {
+        let acl = Uuid::new_v4();
+        let mut ssh = spec(Protocol::Tcp, 22, 22);
+        ssh.acl_ids = vec![acl];
+        let a = alloc(
+            "198.51.100.226",
+            Some("100.64.241.226"),
+            ForwardMode::Ports,
+            vec![ssh],
+        );
+        let mut off = alloc(
+            "198.51.100.227",
+            Some("100.64.241.227"),
+            ForwardMode::All,
+            vec![],
+        );
+        off.enabled = false;
+        let mut v6 = HostingV6 {
+            vm_interfaces: vec!["eth1".into(), "bad\"; flush ruleset".into()],
+            global_blocks: vec!["2001:db8:bad::/48".parse().unwrap()],
+            ..Default::default()
+        };
+        v6.acl_sources
+            .insert(acl, vec!["2001:db8:9::/48".parse().unwrap()]);
+        v6.acl_blocks
+            .insert(acl, vec!["2001:db8:9:6::/64".parse().unwrap()]);
+        let out = generate_ruleset_v6(&[a, off], &[pool6(Some("2001:db8:1:241::/64"))], &v6);
+        assert!(
+            !out.contains("flush"),
+            "unsafe interface names never reach nft: {out}"
+        );
+        assert!(
+            out.contains("iifname { \"eth1\" } ip6 saddr != { 2001:db8:1:241::/64 } drop"),
+            "{out}"
+        );
+        assert!(
+            out.contains("iifname { \"eth1\" } meta l4proto != ipv6-icmp ct state new drop"),
+            "{out}"
+        );
+        // Block lists come before the established accept.
+        let est = out
+            .find("ip6 daddr { 2001:db8:1:241::/64 } ct state established")
+            .unwrap();
+        assert!(out.find("ip6 saddr { 2001:db8:bad::/48 }").unwrap() < est);
+        assert!(out.find("ip6 saddr { 2001:db8:9:6::/64 }").unwrap() < est);
+        // Only the active VM may start connections out.
+        assert!(
+            out.contains("ip6 saddr { 2001:db8:1:241::226 } accept"),
+            "{out}"
+        );
+        assert!(!out.contains("2001:db8:1:241::227"), "{out}");
+        assert!(
+            out.trim_end()
+                .contains("ip6 saddr { 2001:db8:1:241::/64 } drop")
+        );
+    }
+
+    #[test]
+    fn interfaces_holding_finds_vm_networks() {
+        let out = "1: lo    inet6 ::1/128 scope host\n\
+                   3: eth1@if160    inet6 2001:db8:1:241::1/64 scope global\n\
+                   3: eth1@if160    inet6 fe80::1/64 scope link\n\
+                   4: eth0@if153    inet6 2001:db8:1:62::177/64 scope global\n";
+        let got = interfaces_holding(out, &["2001:db8:1:241::/64".parse().unwrap()]);
+        assert_eq!(got, vec!["eth1".to_string()]);
     }
 }

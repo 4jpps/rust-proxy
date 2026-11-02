@@ -205,7 +205,16 @@ async fn sync_once(state: &AppState) -> anyhow::Result<HostingStatus> {
     sets.hosting = crate::nftables::passes::declared(&ruleset);
     crate::nftables::passes::refill(state, &sets).await;
     drop(sets);
-    // IPv6 for pools with a cidr6 (an empty table when none have one).
+    // IPv6 for pools with a cidr6 (an empty table when none have one). The
+    // VM-facing interfaces are the ones holding an address in a pool's cidr6
+    // (the proxy is ::1 there); isolation is matched on them.
+    let prefixes6: Vec<ipnet::Ipv6Net> = pools.iter().filter_map(|p| p.cidr6).collect();
+    if !prefixes6.is_empty() {
+        v6.vm_interfaces = generator::interfaces_holding(
+            &run_capture("ip", &["-6", "-o", "addr", "show"]).await?,
+            &prefixes6,
+        );
+    }
     apply_ruleset(&generator::generate_ruleset_v6(&allocations, &pools, &v6)).await?;
     EVER_APPLIED.store(true, Ordering::Relaxed);
     for ip in &remove {
