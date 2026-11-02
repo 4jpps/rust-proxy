@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.1] - 2026-11-02
+
+- **Client-IP header hardening (follow-up to 0.7.0's trusted proxies).**
+  The header is refused (the proxy's own address is used) when a request
+  carries it more than once, since a proxy that appends rather than
+  overwrites would leave the visitor's own copy first. It is also removed
+  from every request that did not come from a trusted proxy, so a backend
+  that reads `CF-Connecting-IP` itself can no longer be handed a value a
+  visitor made up. Found by a security review of 0.7.0. File:
+  `src/proxy/mod.rs`.
+
 ## [0.7.0] - 2026-11-02
 
 Review items RP-1, RP-3, RP-6, RP-7:

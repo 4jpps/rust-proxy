@@ -110,7 +110,10 @@ for example `["127.0.0.1/32"]` when `cloudflared` runs on the same box.
 Requests from those addresses are judged by the IP in `client_ip_header`
 (default `CF-Connecting-IP`) instead of the proxy's own address, for IP
 allow and block lists, mobile passes, rate limits and logs. The header is
-ignored from every other address, so visitors cannot spoof it. Rules
+ignored from every other address, and removed before the request reaches
+the backend, so visitors cannot spoof it. The proxy must set the header
+(overwrite, as Cloudflare does), not append: a request carrying it twice
+is judged by the proxy's own address. Rules
 enforced in the firewall still see the proxy's address. If requests
 arrive from loopback and this is empty, RustProxy logs a warning once.
 

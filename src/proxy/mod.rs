@@ -443,15 +443,15 @@ async fn should_request_client_cert(
 /// The address every per-request check should judge: the connection's own
 /// peer, unless that peer is one of `network.trusted_proxies`, in which case
 /// the single IP in its `client_ip_header`. Never reads the header from an
-/// untrusted peer, so a client cannot claim to be someone else.
+/// untrusted peer, so a client cannot claim to be someone else, and refuses
+/// it (keeping the peer) when it appears more than once, since a proxy that
+/// appends instead of overwriting would leave the visitor's own copy first.
 fn real_client_ip(
     network: &crate::config::NetworkConfig,
     peer_ip: IpAddr,
     headers: &hyper::HeaderMap,
 ) -> IpAddr {
-    if network.trusted_proxies.is_empty()
-        || !network.trusted_proxies.iter().any(|n| n.contains(&peer_ip))
-    {
+    if !is_trusted_proxy(network, peer_ip) {
         if peer_ip.is_loopback() {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
@@ -466,11 +466,19 @@ fn real_client_ip(
         }
         return peer_ip;
     }
-    headers
-        .get(network.client_ip_header.as_str())
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        .unwrap_or(peer_ip)
+    let mut values = headers.get_all(network.client_ip_header.as_str()).iter();
+    match (values.next(), values.next()) {
+        (Some(only), None) => only
+            .to_str()
+            .ok()
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            .unwrap_or(peer_ip),
+        _ => peer_ip,
+    }
+}
+
+fn is_trusted_proxy(network: &crate::config::NetworkConfig, peer_ip: IpAddr) -> bool {
+    network.trusted_proxies.iter().any(|n| n.contains(&peer_ip))
 }
 
 /// Thin wrapper that emits one SIEM `access` event per request (only when
@@ -484,7 +492,16 @@ async fn handle_https_request(
     client_cert_subject: Option<client_cert::ClientCertIdentity>,
     req: Request<Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
-    let peer_ip = real_client_ip(state.network(), peer_ip, req.headers());
+    let mut req = req;
+    let tcp_peer = peer_ip;
+    let peer_ip = real_client_ip(state.network(), tcp_peer, req.headers());
+    if !is_trusted_proxy(state.network(), tcp_peer) {
+        // Only a trusted proxy may name the client; from anyone else the
+        // header is a claim nothing vouches for, so it never reaches a
+        // backend that might believe it.
+        req.headers_mut()
+            .remove(state.network().client_ip_header.as_str());
+    }
     if !crate::siem::wants(crate::siem::Category::Access) {
         return route_https_request(
             state,
@@ -1552,6 +1569,10 @@ mod tests {
         );
         // The same header from an untrusted peer is a spoof attempt.
         assert_eq!(real_client_ip(&network, stranger, &headers), stranger);
+
+        // Two copies (a proxy that appended to the visitor's own): refuse.
+        headers.append("cf-connecting-ip", "198.51.100.200".parse().unwrap());
+        assert_eq!(real_client_ip(&network, tunnel, &headers), tunnel);
 
         // Garbage or a list is not a single address: keep the peer.
         headers.insert("cf-connecting-ip", "203.0.113.5, 10.0.0.1".parse().unwrap());
