@@ -27,7 +27,7 @@ pub fn match_host<'a>(
     let is_candidate = |h: &&ProxyHost, domain: &str| {
         h.enabled
             && h.bind_port == bind_port
-            && host_bind_ips(h).contains(&bind_ip)
+            && host_bind_ips(h).any(|ip| ip == bind_ip)
             && h.domain.eq_ignore_ascii_case(domain)
     };
 
@@ -95,7 +95,7 @@ pub fn https_listener_keys(hosts: &[ProxyHost]) -> Vec<(IpAddr, u16)> {
     let mut keys: Vec<(IpAddr, u16)> = hosts
         .iter()
         .filter(|h| h.enabled)
-        .flat_map(|h| host_bind_ips(h).into_iter().map(|ip| (ip, h.bind_port)))
+        .flat_map(|h| host_bind_ips(h).map(|ip| (ip, h.bind_port)))
         .collect();
     keys.sort();
     keys.dedup();
@@ -112,7 +112,7 @@ pub fn redirect_listener_keys(hosts: &[ProxyHost]) -> Vec<(IpAddr, u16)> {
     let mut keys: Vec<(IpAddr, u16)> = hosts
         .iter()
         .filter(|h| h.enabled && (h.force_https || crate::acme::opens_port_80_for_acme(h)))
-        .flat_map(|h| host_bind_ips(h).into_iter().map(|ip| (ip, 80u16)))
+        .flat_map(|h| host_bind_ips(h).map(|ip| (ip, 80u16)))
         .collect();
     keys.sort();
     keys.dedup();

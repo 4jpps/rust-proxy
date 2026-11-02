@@ -37,6 +37,7 @@ pub async fn run_tcp_passthrough(
                 continue;
             }
         };
+        let _ = inbound.set_nodelay(true); // as in the HTTP listeners
         let Some(slot) = limiter.try_acquire(peer.ip()) else {
             tracing::debug!(%peer, "tcp passthrough: per-client connection limit reached");
             super::limits::count(&super::limits::CONNECTIONS_REFUSED);

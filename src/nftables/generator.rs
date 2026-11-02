@@ -476,10 +476,7 @@ fn comment_text(text: &str) -> String {
 }
 
 fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) -> bool) {
-    let bind_ips: Vec<IpAddr> = host_bind_ips(host)
-        .into_iter()
-        .filter(|ip| keep(*ip))
-        .collect();
+    let bind_ips: Vec<IpAddr> = host_bind_ips(host).filter(|ip| keep(*ip)).collect();
     if bind_ips.is_empty() {
         return;
     }
@@ -511,10 +508,7 @@ fn write_port_rule(
     pass_logins: &[Uuid],
     keep: &dyn Fn(IpAddr) -> bool,
 ) {
-    let bind_ips: Vec<IpAddr> = port_rule_bind_ips(rule)
-        .into_iter()
-        .filter(|ip| keep(*ip))
-        .collect();
+    let bind_ips: Vec<IpAddr> = port_rule_bind_ips(rule).filter(|ip| keep(*ip)).collect();
     if bind_ips.is_empty() {
         return;
     }

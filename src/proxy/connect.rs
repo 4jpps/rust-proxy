@@ -32,6 +32,8 @@ async fn connect_with(
     for attempt in 1..=attempts {
         match tokio::time::timeout(attempt_timeout, TcpStream::connect(upstream)).await {
             Ok(Ok(stream)) => {
+                // No Nagle on upstream sockets either (see the listeners).
+                let _ = stream.set_nodelay(true);
                 if attempt > 1 {
                     tracing::info!(%upstream, attempt, "upstream connect succeeded on retry");
                 }

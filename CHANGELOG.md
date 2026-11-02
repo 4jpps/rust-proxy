@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.6] - 2026-11-02
+
+Per-request overhead (review items RP-4, RP-2, RP-5; structural fixes, not
+benchmarked -- there is no load harness yet):
+
+- **`TCP_NODELAY` on proxied sockets.** Accepted client connections (HTTPS,
+  HTTP redirect, TCP passthrough) and upstream connections now disable
+  Nagle, which with delayed ACK could add tens of milliseconds to small
+  request/response exchanges. Files: `src/proxy/mod.rs`,
+  `src/proxy/passthrough.rs`, `src/proxy/connect.rs`.
+- **Path-rewrite regexes are compiled once.** A site's rewrite pattern was
+  compiled on every request; compiled patterns are now cached by their text
+  (bounded; a changed pattern is a new entry, an invalid one stays a no-op).
+- **No allocation in host matching.** `host_bind_ips`/`port_rule_bind_ips`
+  return an iterator over at most two addresses instead of a `Vec`; they run
+  once per site on every host lookup.
+
 ## [0.6.5] - 2026-11-02
 
 - **Provisioning includes IPv6.** For a pool with a `cidr6`, an

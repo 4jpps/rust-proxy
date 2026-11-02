@@ -1346,24 +1346,20 @@ impl Config {
 /// Every family this host is actually configured to bind -- `IpAddr::V4`
 /// for `bind_ip_v4` when set, `IpAddr::V6` for `bind_ip_v6` when set, both
 /// if both are set. Used anywhere dedup/validation needs to walk each
-/// socket a host actually claims.
-pub fn host_bind_ips(host: &ProxyHost) -> Vec<IpAddr> {
+/// socket a host actually claims. An iterator over at most two addresses,
+/// so host matching on the request path allocates nothing.
+pub fn host_bind_ips(host: &ProxyHost) -> impl Iterator<Item = IpAddr> {
     dual_bind_ips(host.bind_ip_v4, host.bind_ip_v6)
 }
 
-pub fn port_rule_bind_ips(rule: &PortRule) -> Vec<IpAddr> {
+pub fn port_rule_bind_ips(rule: &PortRule) -> impl Iterator<Item = IpAddr> {
     dual_bind_ips(rule.bind_ip_v4, rule.bind_ip_v6)
 }
 
-fn dual_bind_ips(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> Vec<IpAddr> {
-    let mut ips = Vec::with_capacity(2);
-    if let Some(v4) = v4 {
-        ips.push(IpAddr::V4(v4));
-    }
-    if let Some(v6) = v6 {
-        ips.push(IpAddr::V6(v6));
-    }
-    ips
+fn dual_bind_ips(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> impl Iterator<Item = IpAddr> {
+    [v4.map(IpAddr::V4), v6.map(IpAddr::V6)]
+        .into_iter()
+        .flatten()
 }
 
 /// Empty domains are rejected outright; `*.` is only accepted as a single

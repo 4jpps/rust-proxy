@@ -180,6 +180,9 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                     continue;
                 }
             };
+            // Small request/response exchanges are this proxy's whole job;
+            // Nagle + delayed ACK would add tens of ms to each. Best effort.
+            let _ = stream.set_nodelay(true);
             if wildcard_listener_got_dedicated_ip(&state, bind_ip, &stream) {
                 continue;
             }
@@ -909,6 +912,30 @@ async fn route_https_request_inner(
     }
 }
 
+/// Compiled path-rewrite patterns, keyed by the pattern text, so a site's
+/// regex is compiled once instead of on every request. A changed pattern is a
+/// new key; the cache is cleared if it ever holds more than
+/// `REGEX_CACHE_MAX` patterns (they come only from site configuration).
+/// `None` caches a pattern that does not compile.
+const REGEX_CACHE_MAX: usize = 256;
+
+fn cached_regex(pattern: &str) -> Option<Arc<regex::Regex>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<Arc<regex::Regex>>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = map.get(pattern) {
+        return hit.clone();
+    }
+    if map.len() >= REGEX_CACHE_MAX {
+        map.clear();
+    }
+    let compiled = regex::Regex::new(pattern).ok().map(Arc::new);
+    map.insert(pattern.to_string(), compiled.clone());
+    compiled
+}
+
 /// Rewrites `req`'s path (leaving the query string intact) per
 /// `rewrite`'s pattern/replacement -- see `config::ProxyHost::path_rewrite`'s
 /// doc comment for the exact semantics. A no-op if the pattern doesn't
@@ -916,7 +943,7 @@ async fn route_https_request_inner(
 /// `api::routes::validate_host_request`, so this should never actually
 /// happen in practice) or doesn't match this request's path at all.
 fn apply_path_rewrite<B>(req: &mut Request<B>, rewrite: &crate::config::PathRewrite) {
-    let Ok(re) = regex::Regex::new(&rewrite.pattern) else {
+    let Some(re) = cached_regex(&rewrite.pattern) else {
         return;
     };
     let original_path = req.uri().path();
@@ -1117,6 +1144,9 @@ fn spawn_redirect_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> 
                     continue;
                 }
             };
+            // Small request/response exchanges are this proxy's whole job;
+            // Nagle + delayed ACK would add tens of ms to each. Best effort.
+            let _ = stream.set_nodelay(true);
             if wildcard_listener_got_dedicated_ip(&state, bind_ip, &stream) {
                 continue;
             }
@@ -1187,7 +1217,7 @@ fn spawn_passthrough_listener(
         .iter()
         .find(|r| {
             r.enabled
-                && crate::config::port_rule_bind_ips(r).contains(&bind_ip)
+                && crate::config::port_rule_bind_ips(r).any(|ip| ip == bind_ip)
                 && (r.port_start..=r.port_end).contains(&port)
                 && r.protocol == protocol
         })
@@ -1457,6 +1487,21 @@ fn service_unavailable() -> Response<BoxBody<Bytes, hyper::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rewrite_regex_is_compiled_once_and_bad_patterns_stay_off() {
+        let a = cached_regex("^/old/(.*)$").expect("valid pattern");
+        let b = cached_regex("^/old/(.*)$").expect("valid pattern");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second lookup must reuse the compiled regex"
+        );
+        assert!(cached_regex("(unclosed").is_none());
+        assert!(
+            cached_regex("(unclosed").is_none(),
+            "cached as invalid, still a no-op"
+        );
+    }
+
     #[test]
     fn too_many_requests_says_when_to_retry() {
         let resp = too_many_requests(std::time::Duration::from_millis(1200));
