@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.2] - 2026-11-02
+
+- **Security: the client-IP header no longer reaches the backend after a
+  duplicated or invalid value from a trusted proxy (review RP-8).** 0.7.1
+  refused to believe such a header for its own checks but still forwarded
+  it untouched whenever the connection came from a trusted proxy, so a
+  backend reading `CF-Connecting-IP` itself got the visitor's forged first
+  copy. Now every copy is removed and one value is put back only when the
+  address really came from a trusted proxy's single valid header. The
+  forwarded header is therefore absent or exactly the address RustProxy
+  used. `X-Forwarded-For` was already seeded with the resolved address
+  and is unchanged. New request-level test
+  `forwarded_client_ip_header_is_absent_or_the_resolved_address` (records
+  what a fake backend receives; fails on 0.7.1 with both forged values
+  forwarded). Files: `src/proxy/mod.rs` (`client_ip_from_header`,
+  `sanitize_client_ip_header`), `docs/configuration.md`.
+
 ## [0.7.1] - 2026-11-02
 
 - **Client-IP header hardening (follow-up to 0.7.0's trusted proxies).**

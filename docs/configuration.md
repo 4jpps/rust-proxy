@@ -113,7 +113,10 @@ allow and block lists, mobile passes, rate limits and logs. The header is
 ignored from every other address, and removed before the request reaches
 the backend, so visitors cannot spoof it. The proxy must set the header
 (overwrite, as Cloudflare does), not append: a request carrying it twice
-is judged by the proxy's own address. Rules
+is judged by the proxy's own address. Any value RustProxy cannot attribute
+(from an untrusted address, duplicated, or not a single IP) is removed
+before the request is forwarded, not merely ignored: the backend sees
+either no such header or exactly the address RustProxy used. Rules
 enforced in the firewall still see the proxy's address. If requests
 arrive from loopback and this is empty, RustProxy logs a warning once.
 

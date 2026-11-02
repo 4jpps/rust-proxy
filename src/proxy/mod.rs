@@ -441,39 +441,66 @@ async fn should_request_client_cert(
 }
 
 /// The address every per-request check should judge: the connection's own
-/// peer, unless that peer is one of `network.trusted_proxies`, in which case
-/// the single IP in its `client_ip_header`. Never reads the header from an
-/// untrusted peer, so a client cannot claim to be someone else, and refuses
-/// it (keeping the peer) when it appears more than once, since a proxy that
-/// appends instead of overwriting would leave the visitor's own copy first.
+/// peer, unless that peer is one of `network.trusted_proxies` and its
+/// `client_ip_header` names the client (see `client_ip_from_header`).
 fn real_client_ip(
     network: &crate::config::NetworkConfig,
     peer_ip: IpAddr,
     headers: &hyper::HeaderMap,
 ) -> IpAddr {
-    if !is_trusted_proxy(network, peer_ip) {
-        if peer_ip.is_loopback() {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    %peer_ip,
-                    "requests are arriving from loopback (a local tunnel such as cloudflared?): \
-                     IP allow/block lists and rate limits see this address, not the real client. \
-                     Add it to network.trusted_proxies to use the tunnel's client-IP header."
-                );
-            }
+    if !is_trusted_proxy(network, peer_ip) && peer_ip.is_loopback() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                %peer_ip,
+                "requests are arriving from loopback (a local tunnel such as cloudflared?): \
+                 IP allow/block lists and rate limits see this address, not the real client. \
+                 Add it to network.trusted_proxies to use the tunnel's client-IP header."
+            );
         }
-        return peer_ip;
+    }
+    client_ip_from_header(network, peer_ip, headers).unwrap_or(peer_ip)
+}
+
+/// The client address a trusted proxy vouched for, or `None`. Never read
+/// from an untrusted peer, so a client cannot claim to be someone else;
+/// refused when the header appears more than once (a proxy that appends
+/// instead of overwriting leaves the visitor's own copy first) or is not a
+/// single IP address.
+fn client_ip_from_header(
+    network: &crate::config::NetworkConfig,
+    peer_ip: IpAddr,
+    headers: &hyper::HeaderMap,
+) -> Option<IpAddr> {
+    if !is_trusted_proxy(network, peer_ip) {
+        return None;
     }
     let mut values = headers.get_all(network.client_ip_header.as_str()).iter();
     match (values.next(), values.next()) {
-        (Some(only), None) => only
-            .to_str()
-            .ok()
-            .and_then(|v| v.trim().parse::<IpAddr>().ok())
-            .unwrap_or(peer_ip),
-        _ => peer_ip,
+        (Some(only), None) => only.to_str().ok()?.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Makes the forwarded request's client-IP header agree with what this
+/// proxy decided. Invariant: on the forwarded request the header is either
+/// absent or exactly the address this proxy resolved from it. Every copy is
+/// removed, then one value is put back only when the client address really
+/// came from a trusted proxy's single valid header; an untrusted peer's
+/// header, a duplicate or an unparseable value never reaches the backend.
+fn sanitize_client_ip_header(
+    network: &crate::config::NetworkConfig,
+    tcp_peer: IpAddr,
+    headers: &mut hyper::HeaderMap,
+) {
+    let vouched = client_ip_from_header(network, tcp_peer, headers);
+    let name = network.client_ip_header.as_str();
+    headers.remove(name);
+    if let Some(ip) = vouched
+        && let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes())
+        && let Ok(value) = hyper::header::HeaderValue::from_str(&ip.to_string())
+    {
+        headers.insert(name, value);
     }
 }
 
@@ -495,13 +522,7 @@ async fn handle_https_request(
     let mut req = req;
     let tcp_peer = peer_ip;
     let peer_ip = real_client_ip(state.network(), tcp_peer, req.headers());
-    if !is_trusted_proxy(state.network(), tcp_peer) {
-        // Only a trusted proxy may name the client; from anyone else the
-        // header is a claim nothing vouches for, so it never reaches a
-        // backend that might believe it.
-        req.headers_mut()
-            .remove(state.network().client_ip_header.as_str());
-    }
+    sanitize_client_ip_header(state.network(), tcp_peer, req.headers_mut());
     if !crate::siem::wants(crate::siem::Category::Access) {
         return route_https_request(
             state,
@@ -1826,6 +1847,14 @@ mod tests {
     }
 
     async fn test_state_with_cert(domain: &str) -> AppState {
+        test_state_with_cert_trusting(domain, vec![]).await
+    }
+
+    /// `test_state_with_cert` with `network.trusted_proxies` set.
+    async fn test_state_with_cert_trusting(
+        domain: &str,
+        trusted_proxies: Vec<ipnet::IpNet>,
+    ) -> AppState {
         let cfg = Config {
             network: NetworkConfig {
                 bind_ranges: vec![],
@@ -1835,7 +1864,7 @@ mod tests {
                 max_connections_per_ip: crate::config::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 udp_idle_timeout_seconds: crate::config::DEFAULT_UDP_IDLE_TIMEOUT_SECONDS,
                 upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
-                trusted_proxies: vec![],
+                trusted_proxies,
                 client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             admin: AdminConfig {
@@ -2035,6 +2064,120 @@ mod tests {
             .body(http_body_util::Full::new(Bytes::from(body_bytes)))
             .unwrap();
         sender.send_request(req).await.unwrap()
+    }
+
+    /// RP-8: what reaches the backend must agree with what the proxy
+    /// resolved. From a trusted proxy, a duplicated or unparseable
+    /// client-IP header is never forwarded as-is; a single valid one is
+    /// forwarded exactly once. From an untrusted peer it never arrives.
+    #[tokio::test]
+    async fn forwarded_client_ip_header_is_absent_or_the_resolved_address() {
+        use std::sync::{Arc, Mutex};
+        // Upstream that records every cf-connecting-ip value it receives.
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let record = record.clone();
+                        async move {
+                            record.lock().unwrap().push(
+                                req.headers()
+                                    .get_all("cf-connecting-ip")
+                                    .iter()
+                                    .map(|v| v.to_str().unwrap().to_string())
+                                    .collect(),
+                            );
+                            Ok::<_, std::convert::Infallible>(Response::new(
+                                http_body_util::Full::new(Bytes::from_static(b"ok")),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let trusted: IpAddr = "127.0.0.1".parse().unwrap();
+        let state =
+            test_state_with_cert_trusting("example.com", vec!["127.0.0.1/32".parse().unwrap()])
+                .await;
+        let mut host = access_host(state.db(), "example.com", vec![], None).await;
+        host.upstream = upstream_addr.to_string();
+        state.set_hosts(vec![host]);
+
+        async fn send(state: AppState, peer_ip: IpAddr, values: &[&str]) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                    let state = state.clone();
+                    async move {
+                        handle_https_request(
+                            state,
+                            "10.0.0.2".parse().unwrap(),
+                            443,
+                            peer_ip,
+                            Some("example.com".into()),
+                            None,
+                            req,
+                        )
+                        .await
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+            tokio::spawn(conn);
+            let mut builder = Request::builder()
+                .uri("/")
+                .header(hyper::header::HOST, "example.com");
+            for v in values {
+                builder = builder.header("cf-connecting-ip", *v);
+            }
+            let req = builder
+                .body(http_body_util::Full::new(Bytes::new()))
+                .unwrap();
+            sender.send_request(req).await.unwrap().status().as_u16()
+        }
+
+        // 1. Two headers from a trusted proxy, the first forged: refused, so
+        //    nothing is forwarded (the proxy judged by its own address).
+        assert_eq!(
+            send(state.clone(), trusted, &["6.6.6.6", "203.0.113.5"]).await,
+            200
+        );
+        // 2. One unparseable value: same.
+        assert_eq!(send(state.clone(), trusted, &["not-an-ip"]).await, 200);
+        // 3. One valid value: forwarded exactly once, normalised.
+        assert_eq!(send(state.clone(), trusted, &[" 203.0.113.5 "]).await, 200);
+        // 4. An untrusted peer's header never arrives.
+        let stranger: IpAddr = "198.51.100.9".parse().unwrap();
+        assert_eq!(send(state.clone(), stranger, &["203.0.113.5"]).await, 200);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                Vec::<String>::new(),
+                Vec::new(),
+                vec!["203.0.113.5".to_string()],
+                Vec::new(),
+            ]
+        );
     }
 
     /// Same shape as `send_test_request`, but drives a connection that
