@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.2] - 2026-11-10
+
+- **Security: a site whose only access list is a client-certificate list
+  now refuses visitors without an allowed certificate.** The gate only
+  denied when the site also had an IP-allow or login list; with just a
+  client-cert list, a request with no certificate (or one not on the list)
+  fell through and was served (fail open). It now gets a 403 and a
+  `acl_client_cert_denied` SIEM event. Found on a new static landing page
+  (portal.jpps.us) before it held anything sensitive; no other live site
+  had only a client-cert list. Test:
+  `a_client_cert_only_host_refuses_a_request_without_a_certificate`.
+  File: `src/proxy/mod.rs`.
+
 ## [0.8.1] - 2026-11-10
 
 - **Fix: adding a second DNS credential no longer breaks existing renewals.**

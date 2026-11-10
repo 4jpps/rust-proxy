@@ -917,6 +917,25 @@ async fn route_https_request_inner(
             if decision == access::DenyDecision::Forbidden {
                 return Ok(forbidden_page(&host.domain));
             }
+        } else if resolved_acls.has_client_cert_acl {
+            // Only a client-cert list and no certificate on its list: refuse. Before 0.8.2 this
+            // fell through and served the page to anyone (fail open).
+            if crate::siem::wants(crate::siem::Category::Denied) {
+                let client_ip = peer_ip.to_string();
+                crate::siem::emit(
+                    crate::siem::Category::Denied,
+                    crate::siem::Severity::Warning,
+                    "acl_client_cert_denied",
+                    "request refused: no allowed client certificate",
+                    &[
+                        ("client_ip", client_ip.as_str()),
+                        ("domain", host.domain.as_str()),
+                        ("method", req.method().as_str()),
+                        ("path", req.uri().path()),
+                    ],
+                );
+            }
+            return Ok(forbidden_page(&host.domain));
         }
     }
 
@@ -2994,6 +3013,18 @@ mod tests {
 
     /// The fallback half of the same spec: no cert presented falls
     /// through to the Login ACL exactly as today, not a hard block.
+    #[tokio::test]
+    async fn a_client_cert_only_host_refuses_a_request_without_a_certificate() {
+        // A host whose only ACL is a client-cert list (no IP allow, no login) must fail closed:
+        // before 0.8.2 it served the page to anyone (found on portal.jpps.us, 2026-11-10).
+        let state = test_state_with_cert("example.com").await;
+        let mut host = client_cert_host_with_login_fallback(state.db(), "example.com").await;
+        host.acl_ids.truncate(1);
+        state.set_hosts(vec![host]);
+        let resp = send_test_request_with_cert(state, "203.0.113.7".parse().unwrap(), None).await;
+        assert_eq!(resp.status(), hyper::StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn no_client_cert_falls_through_to_the_login_gate_fallback() {
         let state = test_state_with_cert("example.com").await;
