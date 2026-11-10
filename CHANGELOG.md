@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.1] - 2026-11-10
+
+- **Fix: adding a second DNS credential no longer breaks existing renewals.**
+  With exactly one credential, sites and standalone (wildcard) certificates
+  that name none use it implicitly; a second credential left them
+  ambiguous, and each one's next renewal would have failed with "multiple
+  are configured". Creating the second credential now first pins every such
+  site and standalone certificate to the existing one. Found when the RFC
+  2136 credential was added on the live proxy (24 sites, 4 wildcard certs,
+  pinned by hand there). Test:
+  `a_second_dns_credential_pins_hosts_that_used_the_first_implicitly`.
+  Files: `src/api/routes.rs`, `src/db.rs`.
+
 ## [0.8.0] - 2026-11-10
 
 - **New dns-01 provider: RFC 2136 (your own DNS server).** Certificates can

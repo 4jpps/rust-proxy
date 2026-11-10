@@ -1057,6 +1057,18 @@ pub async fn seed_default_dns_credential(
     Ok(())
 }
 
+/// Gives every standalone cert with no credential of its own this one. Used when a second
+/// credential is added, so certs that used the only one implicitly keep using it.
+pub async fn pin_standalone_certs_to(pool: &SqlitePool, id: Uuid) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE standalone_certs SET dns_credential_id = ? WHERE dns_credential_id IS NULL OR dns_credential_id = ''",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 pub async fn list_dns_credentials(
     pool: &SqlitePool,
 ) -> Result<Vec<DnsCredentialMeta>, sqlx::Error> {

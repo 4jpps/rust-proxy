@@ -2771,6 +2771,31 @@ async fn create_dns_credential(
             "a DNS credential named \"{name}\" already exists"
         )));
     }
+    // With exactly one credential, hosts and standalone certs that name none use it implicitly.
+    // A second one would leave them ambiguous and their next renewal would fail ("multiple are
+    // configured"), so pin them to the existing one first (found live 2026-11-10: 24 hosts and
+    // 4 wildcard certs).
+    let existing = crate::db::list_dns_credentials(state.db()).await?;
+    if let [only] = existing.as_slice() {
+        let only = only.id;
+        mutate_hosts(&state, move |hosts| {
+            let mut changed = false;
+            for h in hosts.iter_mut().filter(|h| {
+                h.acme_enabled
+                    && h.dns_credential_id.is_none()
+                    && !matches!(
+                        h.acme_challenge_type,
+                        crate::config::AcmeChallengeType::Http01
+                    )
+            }) {
+                h.dns_credential_id = Some(only);
+                changed = true;
+            }
+            changed
+        })
+        .await?;
+        crate::db::pin_standalone_certs_to(state.db(), only).await?;
+    }
     let id = Uuid::new_v4();
     let created_at = chrono::Utc::now();
     crate::db::create_dns_credential(state.db(), id, name, body.provider, &body.token, created_at)
@@ -3874,6 +3899,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_second_dns_credential_pins_hosts_that_used_the_first_implicitly() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let cookie = logged_in_cookie(&router).await;
+        let post = |uri: &'static str, body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, cookie.clone())
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let first = body_json(
+            router
+                .clone()
+                .oneshot(post(
+                    "/api/dns-credentials",
+                    r#"{"name":"cf","provider":"cloudflare","token":"t1"}"#,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        // A dns-01 host that names no credential: it uses the only one.
+        let resp = router
+            .clone()
+            .oneshot(post(
+                "/api/hosts",
+                r#"{"domain":"a.example.com","bind_ip_v4":"10.0.0.2","bind_port":443,"upstream":"127.0.0.1:8000","acme_enabled":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.hosts()[0].dns_credential_id.is_none());
+
+        let resp = router
+            .clone()
+            .oneshot(post(
+                "/api/dns-credentials",
+                r#"{"name":"knot","provider":"rfc2136","token":"ns|k|hmac-sha256|c2VjcmV0|example.org"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.hosts()[0].dns_credential_id.map(|u| u.to_string()),
+            first["id"].as_str().map(String::from),
+            "the existing host keeps the credential it was using"
+        );
     }
 
     #[tokio::test]
