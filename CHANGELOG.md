@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.8.3] - 2026-11-10
+
+- Dependency updates (security sweep 2026-11-10): `cargo update`; tests pass.
+
 ## [0.8.2] - 2026-11-10
 
 - **Security: a site whose only access list is a client-certificate list
