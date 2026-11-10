@@ -14,7 +14,7 @@ manages the host's nftables firewall to match. It has a small embedded
 web UI and a REST API, and it installs from a signed `.deb`.
 
 - **HTTP/1.1, HTTP/2 and WebSocket** reverse proxying with SNI-based TLS (rustls, no OpenSSL).
-- **Native ACME client** (RFC 8555): dns-01 through Cloudflare, DigitalOcean, Hetzner, DuckDNS, GoDaddy, Namecheap or Route53, or http-01 with no DNS credentials. Wildcards supported.
+- **Native ACME client** (RFC 8555): dns-01 through Cloudflare, DigitalOcean, Hetzner, DuckDNS, GoDaddy, Namecheap, Route53 or your own DNS server (RFC 2136: Knot, BIND, PowerDNS), or http-01 with no DNS credentials. Wildcards supported.
 - **Default-DROP nftables firewall** generated from your hosts and port rules. Only what you configure is reachable.
 - **TCP/UDP port passthrough** for non-HTTP services.
 - **Per-host access control**: IP allow lists, a built-in login page, and client-certificate auth, combined with OR.

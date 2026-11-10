@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.0] - 2026-11-10
+
+- **New dns-01 provider: RFC 2136 (your own DNS server).** Certificates can
+  now be issued for zones you host yourself on Knot, BIND, PowerDNS or any
+  server that accepts TSIG-signed DNS UPDATE (RFC 2136, RFC 8945). The
+  credential is five fields in the admin UI: server, TSIG key name,
+  algorithm (hmac-sha256/384/512), secret, and an optional zone (otherwise
+  found from the server's SOA). Updates go over TCP, are signed, and the
+  server's signed reply is verified before a success is believed, so a
+  forged answer can't fake one. No new dependencies (HMAC from `ring`).
+  Tested live against Knot 3.4 with a key limited to `_acme-challenge` TXT
+  records. Files: `src/acme/dns01/rfc2136.rs` (new), `src/acme/dns01/mod.rs`,
+  `src/config.rs`, `src/db.rs`, `web/index.html`, `docs/configuration.md`.
+
 ## [0.7.2] - 2026-11-02
 
 - **Security: the client-IP header no longer reaches the backend after a

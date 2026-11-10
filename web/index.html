@@ -366,7 +366,7 @@ footer.foot{margin-top:var(--s-7);color:var(--text-faint);font-size:var(--fs-xs)
       <label class="chk"><input type="checkbox" id="setup-add-dns" name="add_dns"> Add a DNS-01 credential now</label>
       <div id="setup-dns-fields" class="fgrid" hidden>
         <div class="field"><label for="setup-dns-name">Credential name</label><input id="setup-dns-name" type="text" name="dns_name" placeholder="default"></div>
-        <div class="field"><label for="setup-dns-provider">Provider</label><select id="setup-dns-provider" name="dns_provider" class="dns-provider-select" data-fields-for="setup"><option value="cloudflare">Cloudflare</option><option value="digitalocean">DigitalOcean</option><option value="hetzner">Hetzner</option><option value="duckdns">DuckDNS</option><option value="godaddy">GoDaddy</option><option value="namecheap">Namecheap</option><option value="route53">Route53 (AWS)</option></select></div>
+        <div class="field"><label for="setup-dns-provider">Provider</label><select id="setup-dns-provider" name="dns_provider" class="dns-provider-select" data-fields-for="setup"><option value="cloudflare">Cloudflare</option><option value="digitalocean">DigitalOcean</option><option value="hetzner">Hetzner</option><option value="duckdns">DuckDNS</option><option value="godaddy">GoDaddy</option><option value="namecheap">Namecheap</option><option value="route53">Route53 (AWS)</option><option value="rfc2136">RFC 2136 (Knot, BIND, own server)</option></select></div>
         <div class="fgrid wide" id="setup-dns-cred-fields" data-prefix="setup"></div>
       </div>
       <p class="form-error" id="setup-error" role="alert" hidden></p>
@@ -1307,7 +1307,7 @@ const openCertIssue = () => openDrawer({
 });
 
 /* ---------------------------------------------------------- DNS credentials */
-const DNS_PROVIDERS = [['cloudflare', 'Cloudflare'], ['digitalocean', 'DigitalOcean'], ['hetzner', 'Hetzner'], ['duckdns', 'DuckDNS'], ['godaddy', 'GoDaddy'], ['namecheap', 'Namecheap'], ['route53', 'Route53 (AWS)']];
+const DNS_PROVIDERS = [['cloudflare', 'Cloudflare'], ['digitalocean', 'DigitalOcean'], ['hetzner', 'Hetzner'], ['duckdns', 'DuckDNS'], ['godaddy', 'GoDaddy'], ['namecheap', 'Namecheap'], ['route53', 'Route53 (AWS)'], ['rfc2136', 'RFC 2136 (Knot, BIND, own server)']];
 // Cloudflare/DigitalOcean/Hetzner/DuckDNS/GoDaddy take one opaque token;
 // Namecheap and Route53 pack several parts into that same single `token`
 // string the backend splits (acme::dns01::{namecheap,route53}).
@@ -1326,6 +1326,13 @@ const DNS_PROVIDER_FIELDS = {
     { key: 'access_key_id', label: 'Access key ID', placeholder: 'AKIA...', type: 'text' },
     { key: 'secret_access_key', label: 'Secret access key', placeholder: '', type: 'password' },
   ],
+  rfc2136: [
+    { key: 'server', label: 'DNS server', placeholder: 'ns1.example.com, 192.0.2.53:53 or [2001:db8::53]:53', type: 'text' },
+    { key: 'key_name', label: 'TSIG key name', placeholder: 'rust-proxy', type: 'text' },
+    { key: 'algorithm', label: 'TSIG algorithm', placeholder: 'hmac-sha256', type: 'text' },
+    { key: 'secret', label: 'TSIG secret (base64)', placeholder: '', type: 'password' },
+    { key: 'zone', label: 'Zone (optional)', placeholder: 'found from the server if blank', type: 'text' },
+  ],
 };
 function renderDnsCredentialFields(container, provider) {
   const fields = DNS_PROVIDER_FIELDS[provider] || DNS_PROVIDER_FIELDS.cloudflare;
@@ -1337,6 +1344,7 @@ function packDnsCredentialToken(container, provider) {
   const get = (key) => (container.querySelector(`[data-dns-field="${key}"]`) || {}).value || '';
   if (provider === 'namecheap') return `${get('api_user')}:${get('api_key')}:${get('client_ip')}`;
   if (provider === 'route53') return `${get('access_key_id')}:${get('secret_access_key')}`;
+  if (provider === 'rfc2136') return [get('server'), get('key_name'), get('algorithm') || 'hmac-sha256', get('secret'), get('zone')].map((v) => v.trim()).join('|');
   return get('token');
 }
 function pDns() {

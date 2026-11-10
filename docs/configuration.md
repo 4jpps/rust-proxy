@@ -378,6 +378,7 @@ their fields joined with colons in the order shown.
 | GoDaddy | `godaddy` | One Personal Access Token (Bearer). The older `sso-key` key/secret scheme is not supported. |
 | Namecheap | `namecheap` | Three fields: API user, API key, and the client IP you have allowlisted in Namecheap's API settings. Stored as `user:key:clientip`. |
 | Route53 (AWS) | `route53` | Two fields: access key ID and secret access key. Stored as `access_key_id:secret_access_key`, signed for us-east-1. |
+| RFC 2136 (own server) | `rfc2136` | Five fields: DNS server (`host`, `host:port` or `[v6]:port`, port 53 by default), TSIG key name, algorithm (`hmac-sha256`, `hmac-sha384` or `hmac-sha512`), base64 secret, and an optional zone (found from the server's SOA if blank). Stored as `server\|key\|algorithm\|secret\|zone`. Updates go over TCP, are TSIG-signed, and the server's signed reply is verified. Give the key only TXT updates at `_acme-challenge` names (Knot: `update-type: [ TXT ]`, `update-owner: name`, `update-owner-match: pattern`, `update-owner-name: [ _acme-challenge, _acme-challenge.* ]`). |
 
 A host with a dns-01 challenge picks a credential by `dns_credential_id`.
 If exactly one credential exists, hosts that do not name one use it.

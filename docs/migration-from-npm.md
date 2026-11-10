@@ -46,7 +46,7 @@ rust-proxy also does things NPM does not: [ASN blocking and global block lists](
 ## Before you move
 
 1. **Check you do not depend on the Advanced tab's custom Nginx config.** Custom Locations are supported (`locations`), but raw Nginx directives are not and will not be. Keep a site that needs them on NPM.
-2. **List your DNS provider.** dns-01 supports Cloudflare, DigitalOcean, Hetzner, DuckDNS, GoDaddy, Namecheap and Route53. If you use another provider, use http-01 or upload certificates yourself.
+2. **List your DNS provider.** dns-01 supports Cloudflare, DigitalOcean, Hetzner, DuckDNS, GoDaddy, Namecheap, Route53 and any server that accepts TSIG-signed RFC 2136 updates (Knot, BIND, PowerDNS). If you use another provider, use http-01 or upload certificates yourself.
 3. **Plan the cutover for ports 80 and 443.** Only one thing can listen on them. Move one host at a time using a second IP or a test hostname, or schedule a short window.
 
 ## A migration path

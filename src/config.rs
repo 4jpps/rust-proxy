@@ -494,6 +494,8 @@ pub enum DnsProviderKind {
     GoDaddy,
     Namecheap,
     Route53,
+    /// Your own authoritative server via TSIG-signed RFC 2136 UPDATE.
+    Rfc2136,
 }
 
 impl Default for DnsProviderKind {

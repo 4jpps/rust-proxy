@@ -999,6 +999,7 @@ fn dns_provider_to_str(provider: DnsProviderKind) -> &'static str {
         DnsProviderKind::GoDaddy => "godaddy",
         DnsProviderKind::Namecheap => "namecheap",
         DnsProviderKind::Route53 => "route53",
+        DnsProviderKind::Rfc2136 => "rfc2136",
     }
 }
 
@@ -1010,6 +1011,7 @@ fn dns_provider_from_str(s: &str) -> DnsProviderKind {
         "godaddy" => DnsProviderKind::GoDaddy,
         "namecheap" => DnsProviderKind::Namecheap,
         "route53" => DnsProviderKind::Route53,
+        "rfc2136" => DnsProviderKind::Rfc2136,
         _ => DnsProviderKind::Cloudflare,
     }
 }

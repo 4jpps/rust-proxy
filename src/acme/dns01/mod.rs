@@ -5,7 +5,8 @@
 //! agnostic, lives here rather than in any one provider module).
 //!
 //! Providers: [`cloudflare`], [`digitalocean`], [`duckdns`], [`godaddy`],
-//! [`hetzner`], [`namecheap`]. Each is a thin, direct-`reqwest` client
+//! [`hetzner`], [`namecheap`], [`route53`], and [`rfc2136`] (TSIG-signed
+//! DNS UPDATE to your own server, e.g. Knot or BIND). Each is a thin, direct-`reqwest` client
 //! against that provider's own REST API (no provider SDK crates)
 //! implementing the same three-call shape: find the zone that owns a
 //! domain, create a TXT record in it, delete a TXT record from it.
@@ -16,6 +17,7 @@ pub mod duckdns;
 pub mod godaddy;
 pub mod hetzner;
 pub mod namecheap;
+pub mod rfc2136;
 pub mod route53;
 mod sigv4;
 
@@ -31,6 +33,7 @@ pub use duckdns::DuckDnsDns01;
 pub use godaddy::GoDaddyDns01;
 pub use hetzner::HetznerDns01;
 pub use namecheap::NamecheapDns01;
+pub use rfc2136::Rfc2136Dns01;
 pub use route53::Route53Dns01;
 
 #[derive(Debug, Error)]
@@ -170,6 +173,7 @@ pub fn build_provider(
         DnsProviderKind::GoDaddy => Box::new(GoDaddyDns01::new(http, token)),
         DnsProviderKind::Namecheap => Box::new(NamecheapDns01::new(http, token)),
         DnsProviderKind::Route53 => Box::new(Route53Dns01::new(http, token)),
+        DnsProviderKind::Rfc2136 => Box::new(Rfc2136Dns01::new(token)),
     }
 }
 
@@ -190,6 +194,7 @@ mod tests {
             GoDaddy,
             Namecheap,
             Route53,
+            Rfc2136,
         ] {
             let _: Box<dyn DnsProvider> = build_provider(kind, http.clone(), "token".to_string());
         }
