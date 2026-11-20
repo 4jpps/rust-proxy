@@ -30,8 +30,11 @@ systemctl status rust-proxy
 
 If it is not running, `sudo systemctl enable --now rust-proxy`.
 
-You can also download a release `.deb` from the project's Releases page
-and `dpkg -i` it, or [build from source](deployment.md).
+You can also download a release `.deb` from the
+[Releases page](https://gitlab.jpps.us/jpps/rust-proxy/-/releases) and `dpkg -i` it, or
+[build from source](deployment.md#building-from-source). The source is at
+https://gitlab.jpps.us/jpps/rust-proxy (the primary home), with a
+read-only mirror at https://github.com/4jpps/rust-proxy.
 
 ## 2. Run the first-run wizard
 
@@ -96,7 +99,8 @@ matching page of the RustProxy wiki. **Copy** on a site's row starts a new
 site with the same settings.
 
 The certificate is requested in the background and renewed
-automatically. The same thing through the API, with a token (see
+automatically. To renew one early (after fixing a DNS credential, say),
+press **Renew now** next to it on the Certificates page. The same thing through the API, with a token (see
 [API](api.md)):
 
 ```sh

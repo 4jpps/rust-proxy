@@ -157,7 +157,7 @@ least one of `bind_ip_v4`/`bind_ip_v6`, and one destination (`upstream`,
 | `force_https` | `true` | Redirect plain HTTP on port 80 to HTTPS. |
 | `acme_enabled` | `true` | Issue and renew a certificate automatically. |
 | `acme_challenge_type` | `auto` | `auto`, `http01` or `dns01`. See below. |
-| `dns_credential_id` | unset | Which DNS credential to use for dns-01. Optional if exactly one exists. |
+| `dns_credential_id` | unset | Which DNS credential to use for dns-01. Optional if exactly one exists; adding a second credential first pins every site and standalone certificate that relied on the first, so their renewals keep working. |
 | `acl_ids` | `[]` | Named [ACLs](access-control.md) this host selects. |
 | `deny_fallback` | unset | See [deny_fallback](deny-fallback.md). |
 | `locations` | `[]` | Route path prefixes to other upstreams. See [Custom locations](#custom-locations). |

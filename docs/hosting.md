@@ -50,7 +50,36 @@ used. `notes` is free text.
 
 The response's `provision` object carries what to configure on the VM:
 `private_ip`, `gateway`, `netmask`, `cidr` and `ipconfig0` (a ready-made
-Proxmox cloud-init value).
+Proxmox cloud-init value). For a pool with IPv6 it also has `ip6`,
+`gateway6`, and `ipconfig0` gains `,ip6=...,gw6=...`, so a cloud-init VM
+comes up dual-stack with no extra steps.
+
+## IPv6
+
+A pool can also carry an IPv6 prefix, `cidr6` (a /64 to /112, routed to
+this host and on-link on the VM network, with the proxy at `::1`). Each VM
+then gets a real IPv6 address with no NAT: the prefix plus the last octet
+of its public IPv4 address, so `.226` becomes `<prefix>::226`.
+
+```sh
+curl -X POST http://127.0.0.1:8084/api/hosting/pools \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"standard","cidr":"192.0.2.224/28","cidr6":"2001:db8:1:248::/64",
+       "vm_cidr":"172.16.63.0/24","gateway":"172.16.63.1"}'
+```
+
+To add a prefix to an existing pool, edit it on the Hosting page, or
+`PUT /api/hosting/pools/<name>` with the whole pool plus `cidr6` (a PUT
+replaces the pool).
+
+The same policy as IPv4 applies, in a generated `ip6 rust_proxy_hosting6`
+table: only allocated ports reach the VM (with the same remaps, access-list
+sources and block lists), and VMs can't open connections to the proxy, to
+unique-local or link-local space, to other hosting prefixes, or to the
+ranges in `network.hosting_v6_internal_nets`. A VM can't forge its source
+address, and only active allocations can start outbound IPv6 connections.
+Mobile passes are IPv4-only, so a port reachable only through a pass is
+closed over IPv6.
 
 ## Port forwards and port translation
 
@@ -85,7 +114,8 @@ dropped.
 
 - A `/32` on `lo` per active allocation.
 - A blackhole route per pool, so unallocated addresses stay silent.
-- An `ip rust_proxy_hosting` nftables table with DNAT inbound and SNAT outbound.
+- An `ip rust_proxy_hosting` nftables table with DNAT inbound and SNAT outbound,
+  and for pools with a `cidr6`, an `ip6 rust_proxy_hosting6` table (no NAT).
 - A guard that drops non-ICMP traffic still addressed to a hosted IP, and a rule that keeps VMs off private networks.
 
 The `inet rust_proxy` table and any router table are never modified, so

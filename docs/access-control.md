@@ -230,6 +230,7 @@ What a visitor who fails every gate sees depends on what is selected:
 |----------|------------------------------|
 | IP allow only | The "Access denied" page (HTTP 403), or the host's [`deny_fallback`](deny-fallback.md) if one is set |
 | Login (with or without IP allow) | The login page. Login always takes precedence over `deny_fallback` |
+| Client certificate only (no IP allow, no login) | The "Access denied" page (HTTP 403) and an `acl_client_cert_denied` SIEM event. A request with no certificate, or one not on the list, never reaches the site (since 0.8.2; earlier versions let it through) |
 
 Several lists of the same kind combine by union: any selected IP list's
 range is enough, and any selected login list's credentials work.

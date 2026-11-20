@@ -68,9 +68,23 @@ Use the output as `admin.admin_password_hash`. See
 
 ## Releases
 
-Every `vX.Y.Z` tag is built and published by CI to the project's Releases
-page and to the signed apt repository. You can also download a release
-`.deb` and install it with `dpkg -i`.
+Every `vX.Y.Z` tag is built and published by CI to the
+[Releases page](https://gitlab.jpps.us/jpps/rust-proxy/-/releases) on GitLab and to the signed apt repository
+(`https://repo.jpps.us/stable`, see [Getting started](getting-started.md#1-install)).
+You can also download a release `.deb` and install it with `dpkg -i`.
+The GitHub copy (https://github.com/4jpps/rust-proxy) is a read-only
+mirror and has no releases of its own.
+
+## Building from source
+
+Rust (stable) is all it needs; TLS is rustls, so there is no OpenSSL or
+pkg-config to install.
+
+```sh
+git clone https://gitlab.jpps.us/jpps/rust-proxy.git   # or the GitHub mirror
+cd rust-proxy
+cargo build --release
+```
 
 ## Manual install
 
