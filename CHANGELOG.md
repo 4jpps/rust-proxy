@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.1] - 2026-11-22
+
+- **Security (HTTP/3): forged UDP can no longer use up a visitor's connection
+  slots.** A QUIC connection took a per-client slot (shared with HTTPS) on its
+  first packet, whose source address can be forged, and held it through the
+  handshake (up to 10 s). The slot is now taken only after the handshake,
+  which proves the address; unfinished handshakes are capped at 2048 per
+  listener. Found by review before anyone relied on it (0.9.0 was live for
+  under an hour). Test:
+  `the_connection_limit_is_charged_after_the_handshake_proves_the_address`.
+  File: `src/proxy/quic.rs`.
+
 ## [0.9.0] - 2026-11-22
 
 - **HTTP/3.** With `http3 = true` under `[network]`, every HTTPS listener on

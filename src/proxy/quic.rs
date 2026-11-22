@@ -27,6 +27,8 @@ use crate::state::AppState;
 const H3_NO_ERROR: u32 = 0x100;
 /// How long browsers may remember that a host speaks HTTP/3.
 const ALT_SVC_MAX_AGE: u32 = 86_400;
+/// Handshakes one listener holds open at once; more are refused until some finish.
+const MAX_UNFINISHED_HANDSHAKES: usize = 2048;
 /// Room for the in-memory HTTP/2 link between the QUIC side and the shared service.
 const BRIDGE_BUFFER: usize = 256 * 1024;
 
@@ -57,6 +59,8 @@ pub(super) fn server_config(state: AppState) -> Option<quinn::ServerConfig> {
         }
     };
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    // At most this many handshakes in progress per listener (quinn's default is 65536).
+    cfg.max_incoming(MAX_UNFINISHED_HANDSHAKES);
     let mut transport = quinn::TransportConfig::default();
     transport
         .max_concurrent_bidi_streams(100u32.into())
@@ -118,15 +122,8 @@ pub(super) async fn serve(state: AppState, endpoint: quinn::Endpoint, bind_ip: I
             incoming.refuse();
             continue;
         }
-        let Some(slot) = state.conn_limiter().try_acquire(peer_ip) else {
-            tracing::debug!(%peer_ip, "http/3 connection refused: per-client connection limit");
-            limits::count(&limits::CONNECTIONS_REFUSED);
-            incoming.refuse();
-            continue;
-        };
         let state = state.clone();
         tokio::spawn(async move {
-            let _slot = slot;
             let conn = match tokio::time::timeout(limits::TLS_HANDSHAKE_TIMEOUT, incoming).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(err)) => {
@@ -138,6 +135,15 @@ pub(super) async fn serve(state: AppState, endpoint: quinn::Endpoint, bind_ip: I
                     limits::count(&limits::TLS_HANDSHAKE_TIMEOUTS);
                     return;
                 }
+            };
+            // The per-client slot is taken only now: the opening UDP packet's address can be forged,
+            // and a finished handshake proves it, so forged packets can't use up a visitor's slots
+            // (shared with HTTPS). Unfinished handshakes are capped by `max_incoming` instead.
+            let Some(_slot) = state.conn_limiter().try_acquire(peer_ip) else {
+                tracing::debug!(%peer_ip, "http/3 connection closed: per-client connection limit");
+                limits::count(&limits::CONNECTIONS_REFUSED);
+                conn.close(H3_NO_ERROR.into(), b"too many connections");
+                return;
             };
             let sni = conn
                 .handshake_data()
@@ -404,6 +410,25 @@ mod tests {
             matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if c.error_code == H3_NO_ERROR.into()),
             "{reason:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_connection_limit_is_charged_after_the_handshake_proves_the_address() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let upstream = echo_upstream().await;
+        let state = super::super::tests::test_state_with_cert_for_h3("example.com").await;
+        state.set_hosts(vec![host("example.com", upstream, false)]);
+        // Use up every slot 127.0.0.1 has (as its HTTPS connections would).
+        let mut held = Vec::new();
+        while let Some(slot) = state.conn_limiter().try_acquire("127.0.0.1".parse().unwrap()) {
+            held.push(slot);
+        }
+        let addr = start(state).await;
+        // The handshake still completes (nothing is charged before it), then the connection is closed.
+        let conn = client_conn(addr, "example.com").await.expect("handshake completes");
+        let reason = conn.closed().await;
+        assert!(matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if &c.reason[..] == b"too many connections"), "{reason:?}");
+        drop(held);
     }
 
     #[test]
