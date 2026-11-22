@@ -19,6 +19,7 @@ pub mod login;
 pub mod mobile_pass;
 pub mod passthrough;
 pub mod pool;
+pub mod quic;
 pub mod revocation;
 pub mod router;
 pub mod tls;
@@ -50,6 +51,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut https: HashMap<(IpAddr, u16), JoinHandle<()>> = HashMap::new();
+    let mut h3: HashMap<(IpAddr, u16), JoinHandle<()>> = HashMap::new();
     let mut redirects: HashMap<(IpAddr, u16), JoinHandle<()>> = HashMap::new();
     let mut passthroughs: HashMap<(IpAddr, u16, Protocol), JoinHandle<()>> = HashMap::new();
 
@@ -62,7 +64,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     const FALLBACK_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
     loop {
-        reconcile(&state, &mut https, &mut redirects, &mut passthroughs);
+        reconcile(&state, &mut https, &mut h3, &mut redirects, &mut passthroughs);
         tokio::select! {
             _ = state.wait_for_change() => {}
             _ = tokio::time::sleep(FALLBACK_RECONCILE_INTERVAL) => {}
@@ -73,6 +75,7 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 fn reconcile(
     state: &AppState,
     https: &mut HashMap<(IpAddr, u16), JoinHandle<()>>,
+    h3: &mut HashMap<(IpAddr, u16), JoinHandle<()>>,
     redirects: &mut HashMap<(IpAddr, u16), JoinHandle<()>>,
     passthroughs: &mut HashMap<(IpAddr, u16, Protocol), JoinHandle<()>>,
 ) {
@@ -81,6 +84,15 @@ fn reconcile(
 
     reconcile_map(https, &router::https_listener_keys(&hosts), |key| {
         spawn_https_listener(state.clone(), key.0, key.1)
+    });
+    // HTTP/3 beside each HTTPS listener (specific addresses only), while `network.http3` is on.
+    let h3_keys: Vec<(IpAddr, u16)> = if state.network().http3 {
+        router::https_listener_keys(&hosts).into_iter().filter(|(ip, _)| !ip.is_unspecified()).collect()
+    } else {
+        Vec::new()
+    };
+    reconcile_map(h3, &h3_keys, |key| {
+        quic::spawn_listener(state.clone(), key.0, key.1).unwrap_or_else(|| tokio::spawn(async {}))
     });
     reconcile_map(redirects, &router::redirect_listener_keys(&hosts), |key| {
         spawn_redirect_listener(state.clone(), key.0, key.1)
@@ -236,6 +248,8 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                 let want_client_cert =
                     should_request_client_cert(&state, bind_ip, bind_port, peer_ip, sni.as_deref())
                         .await;
+                // HTTP/3 is advertised only where it can serve this connection (see `quic`).
+                let h3_ok = state.network().http3 && !want_client_cert && !bind_ip.is_unspecified();
                 let config = if want_client_cert {
                     config_with_client_auth
                 } else {
@@ -289,7 +303,10 @@ fn spawn_https_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Joi
                         )
                         .await
                         {
-                            Ok(resp) => deliver(resp),
+                            Ok(resp) => deliver(resp).map(|mut r| {
+                                quic::advertise(&mut r, h3_ok, bind_port);
+                                r
+                            }),
                             Err(never) => match never {},
                         }
                     }
@@ -1593,6 +1610,7 @@ mod tests {
             upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
             trusted_proxies: vec![],
             client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
+            http3: false,
         };
         let tunnel: IpAddr = "127.0.0.1".parse().unwrap();
         let stranger: IpAddr = "198.51.100.9".parse().unwrap();
@@ -1865,6 +1883,16 @@ mod tests {
         assert!(resolve_upstream("not-a-host-port").is_err());
     }
 
+    pub(crate) async fn test_state_with_cert_for_h3(domain: &str) -> AppState {
+        test_state_with_cert(domain).await
+    }
+
+    pub(crate) fn plain_host_for_h3(domain: &str) -> ProxyHost {
+        let mut h = pass_header_host(domain);
+        h.pass_client_cert_header = false;
+        h
+    }
+
     async fn test_state_with_cert(domain: &str) -> AppState {
         test_state_with_cert_trusting(domain, vec![]).await
     }
@@ -1885,6 +1913,7 @@ mod tests {
                 upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
                 trusted_proxies,
                 client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
+                http3: false,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("127.0.0.1".parse().unwrap()),
@@ -3410,7 +3439,7 @@ mod tests {
     /// (that's an orthogonal, already-real concern once a real CA
     /// issues the cert via ACME).
     #[derive(Debug)]
-    struct AcceptAnyCert;
+    pub(crate) struct AcceptAnyCert;
     impl ServerCertVerifier for AcceptAnyCert {
         fn verify_server_cert(
             &self,

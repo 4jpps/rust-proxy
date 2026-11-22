@@ -206,7 +206,7 @@ pub async fn build_ruleset_with(state: &AppState, overrides: &Overrides) -> anyh
         .admin_allowed_ips
         .clone()
         .unwrap_or_else(|| state.admin_allowed_ips());
-    let ruleset = generator::generate_ruleset(
+    let ruleset = generator::generate_ruleset_with_http3(
         &hosts,
         &port_rules,
         &admin,
@@ -217,6 +217,7 @@ pub async fn build_ruleset_with(state: &AppState, overrides: &Overrides) -> anyh
         &state.network().dedicated_ips,
         &state.network().dhcp_interfaces,
         &blocks,
+        state.network().http3,
     );
     Ok(ruleset)
 }

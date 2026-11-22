@@ -134,6 +134,7 @@ pub const TABLE_NAME: &str = "rust_proxy";
 // Every input is a distinct piece of live state the ruleset depends on;
 // bundling them into a struct would only rename the same list.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn generate_ruleset(
     hosts: &[ProxyHost],
     port_rules: &[PortRule],
@@ -143,6 +144,22 @@ pub fn generate_ruleset(
     dedicated_ips: &[IpAddr],
     dhcp_interfaces: &[String],
     blocks: &NftBlocks,
+) -> String {
+    generate_ruleset_with_http3(hosts, port_rules, admin, expose_admin_port, rule_allow_ips, dedicated_ips, dhcp_interfaces, blocks, false)
+}
+
+/// `generate_ruleset`, also opening each HTTPS host's port for UDP when HTTP/3 (`network.http3`) is on.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_ruleset_with_http3(
+    hosts: &[ProxyHost],
+    port_rules: &[PortRule],
+    admin: &AdminConfig,
+    expose_admin_port: bool,
+    rule_allow_ips: &HashMap<Uuid, Vec<IpNet>>,
+    dedicated_ips: &[IpAddr],
+    dhcp_interfaces: &[String],
+    blocks: &NftBlocks,
+    http3: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -205,7 +222,7 @@ pub fn generate_ruleset(
     if !dedicated_ips.is_empty() {
         let _ = writeln!(out, "        # explicitly bound to a dedicated address");
         for host in hosts.iter().filter(|h| h.enabled) {
-            write_host_rules(&mut out, host, &on_dedicated);
+            write_host_rules(&mut out, host, &on_dedicated, http3);
         }
         for rule in port_rules.iter().filter(|r| r.enabled) {
             write_port_rule(
@@ -224,7 +241,7 @@ pub fn generate_ruleset(
     write_admin_rule(&mut out, admin, expose_admin_port);
 
     for host in hosts.iter().filter(|h| h.enabled) {
-        write_host_rules(&mut out, host, &elsewhere);
+        write_host_rules(&mut out, host, &elsewhere, http3);
     }
 
     for rule in port_rules.iter().filter(|r| r.enabled) {
@@ -475,7 +492,7 @@ fn comment_text(text: &str) -> String {
         .collect()
 }
 
-fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) -> bool) {
+fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) -> bool, http3: bool) {
     let bind_ips: Vec<IpAddr> = host_bind_ips(host).filter(|ip| keep(*ip)).collect();
     if bind_ips.is_empty() {
         return;
@@ -484,6 +501,9 @@ fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) ->
     for bind_ip in bind_ips {
         let daddr = daddr_clause(bind_ip);
         let _ = writeln!(out, "        tcp dport {} {daddr}accept", host.bind_port);
+        if http3 && !host.pass_client_cert_header && host.redirect.is_none() {
+            let _ = writeln!(out, "        udp dport {} {daddr}accept", host.bind_port);
+        }
         if host.force_https || crate::acme::opens_port_80_for_acme(host) {
             // Redundant with write_always_open_rules's unconditional port 80
             // accept above, but kept: this rule's own bind_ip-scoped comment
@@ -1680,4 +1700,21 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn http3_opens_the_https_port_for_udp_only_when_on() {
+        let h = host("example.com", "10.0.0.2", 443, false);
+        let admin = admin();
+        let none = HashMap::new();
+        let blocks = NftBlocks::default();
+        let off = generate_ruleset_with_http3(std::slice::from_ref(&h), &[], &admin, false, &none, &[], &[], &blocks, false);
+        assert!(!off.contains("udp dport 443"), "{off}");
+        let on = generate_ruleset_with_http3(std::slice::from_ref(&h), &[], &admin, false, &none, &[], &[], &blocks, true);
+        assert!(on.contains("udp dport 443 ip daddr 10.0.0.2 accept"), "{on}");
+        // A client-certificate host stays on TCP only.
+        let mut cert = h;
+        cert.pass_client_cert_header = true;
+        let on = generate_ruleset_with_http3(&[cert], &[], &admin, false, &none, &[], &[], &blocks, true);
+        assert!(!on.contains("udp dport 443"), "{on}");
+    }
+
 }

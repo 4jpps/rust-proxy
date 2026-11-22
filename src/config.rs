@@ -339,6 +339,11 @@ pub struct NetworkConfig {
     /// address; anything else is ignored.
     #[serde(default = "default_client_ip_header")]
     pub client_ip_header: String,
+    /// Also serve HTTP/3 (QUIC, UDP) on every HTTPS listener, and tell browsers about it with an
+    /// `Alt-Svc` header (default off). Hosts that sign in with a client certificate stay on
+    /// HTTP/1.1 and HTTP/2: QUIC can't choose per host whether to ask for a certificate.
+    #[serde(default)]
+    pub http3: bool,
 }
 
 fn default_client_ip_header() -> String {

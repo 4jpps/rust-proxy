@@ -555,6 +555,7 @@ mod tests {
                 upstream_keepalive_seconds: crate::proxy::pool::DEFAULT_UPSTREAM_KEEPALIVE_SECONDS,
                 trusted_proxies: vec![],
                 client_ip_header: crate::config::DEFAULT_CLIENT_IP_HEADER.to_string(),
+                http3: false,
             },
             admin: AdminConfig {
                 bind_ip_v4: Some("10.0.0.1".parse().unwrap()),

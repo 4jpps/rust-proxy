@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.9.0] - 2026-11-22
+
+- **HTTP/3.** With `http3 = true` under `[network]`, every HTTPS listener on
+  a specific address also serves HTTP/3 (QUIC over UDP, `quinn` + `h3`,
+  rustls with ring as before), advertised with `Alt-Svc: h3=":443"; ma=86400`.
+  Each QUIC connection is bridged over an in-memory HTTP/2 link into the same
+  `handle_https_request` the TCP listener uses, so access lists, logins, rate
+  limits, the per-client connection cap, global blocks, SIEM logging and
+  forwarding are shared, not duplicated. Client-certificate sites stay on
+  HTTPS (closed after the QUIC handshake, never advertised). The firewall
+  opens UDP on each HTTPS host's port while it's on. Off by default.
+  Tests: `a_request_over_http3_reaches_the_backend_through_the_shared_path`,
+  `a_client_certificate_host_is_sent_back_to_https`,
+  `alt_svc_is_only_added_when_allowed_and_absent`,
+  `http3_opens_the_https_port_for_udp_only_when_on`.
+  Files: `src/proxy/quic.rs` (new), `src/proxy/mod.rs`,
+  `src/nftables/generator.rs`, `src/nftables/mod.rs`, `src/config.rs`.
+- Encrypted Client Hello (ECH) is not included: rustls has no server-side ECH
+  yet (rustls issue #1980); it will follow when it does.
+
 ## [0.8.3] - 2026-11-10
 
 - Dependency updates (security sweep 2026-11-10): `cargo update`; tests pass.

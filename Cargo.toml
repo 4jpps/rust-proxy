@@ -1,6 +1,6 @@
 [package]
 name = "rust-proxy"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2024"
 description = "Lightweight L7 reverse proxy daemon with native ACME, dynamic nftables orchestration, and a web admin UI"
 license = "AGPL-3.0-only OR LicenseRef-Commercial"
@@ -69,6 +69,9 @@ chrono = { version = "0.4", features = ["serde"] }
 ipnet = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

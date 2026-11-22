@@ -127,6 +127,24 @@ trusted_proxies = ["127.0.0.1/32"]
 client_ip_header = "CF-Connecting-IP"
 ```
 
+`http3` (default `false`) also serves HTTP/3 (QUIC, over UDP) on every
+HTTPS listener bound to a specific address, using the same certificates.
+Browsers learn about it from an `Alt-Svc` header on HTTPS responses and
+switch on their next request; anything that can't use UDP keeps using
+HTTPS as before. Requests over HTTP/3 go through exactly the same access
+lists, logins, rate limits, logging and forwarding as HTTPS. Sites that ask
+for a client certificate stay on HTTPS only (QUIC can't decide per site
+whether to ask), so they never advertise HTTP/3 and a QUIC connection to
+them is closed right away, sending the browser back to HTTPS. With
+`http3` on, the firewall also opens each site's HTTPS port for UDP; any
+firewall or router in front of RustProxy must let UDP 443 through too.
+WebSockets stay on HTTP/1.1 over TCP.
+
+```toml
+[network]
+http3 = true
+```
+
 ### `[siem]`
 
 See [Logging and SIEM](logging-and-siem.md).
