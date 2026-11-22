@@ -59,7 +59,7 @@ pub(super) fn server_config(state: AppState) -> Option<quinn::ServerConfig> {
         }
     };
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    // At most this many handshakes in progress per listener (quinn's default is 65536).
+    // Connections waiting to be picked up (quinn's default is 65536); `serve` caps those in handshake.
     cfg.max_incoming(MAX_UNFINISHED_HANDSHAKES);
     let mut transport = quinn::TransportConfig::default();
     transport
@@ -114,7 +114,29 @@ fn bind_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
 
 /// Accepts QUIC connections until the endpoint closes. `bind_ip`/`bind_port` are the listener's
 /// configured address (what hosts are matched against), whatever the socket is actually bound to.
+/// What to do with a new QUIC connection, given how many handshakes are already in progress.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Admit {
+    Accept,
+    /// Ask the client to prove its address first (stateless: nothing is kept for it meanwhile).
+    Retry,
+    Refuse,
+}
+
+/// Handshakes in progress are capped at `max`; past half of that, a client whose address isn't
+/// proven yet must prove it with a Retry before it may take one of the remaining places.
+pub(super) fn admit(address_validated: bool, in_progress: usize, max: usize) -> Admit {
+    if in_progress >= max {
+        Admit::Refuse
+    } else if !address_validated && in_progress >= max / 2 {
+        Admit::Retry
+    } else {
+        Admit::Accept
+    }
+}
+
 pub(super) async fn serve(state: AppState, endpoint: quinn::Endpoint, bind_ip: IpAddr, bind_port: u16) {
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_UNFINISHED_HANDSHAKES));
     while let Some(incoming) = endpoint.accept().await {
         let peer_ip = incoming.remote_address().ip();
         if state.block_index().is_globally_blocked(peer_ip) {
@@ -122,9 +144,31 @@ pub(super) async fn serve(state: AppState, endpoint: quinn::Endpoint, bind_ip: I
             incoming.refuse();
             continue;
         }
+        let in_progress = MAX_UNFINISHED_HANDSHAKES - handshakes.available_permits();
+        match admit(incoming.remote_address_validated(), in_progress, MAX_UNFINISHED_HANDSHAKES) {
+            Admit::Accept => {}
+            Admit::Retry => {
+                if let Err(err) = incoming.retry() {
+                    err.into_incoming().refuse();
+                }
+                continue;
+            }
+            Admit::Refuse => {
+                tracing::debug!(%peer_ip, "http/3 connection refused: too many handshakes in progress");
+                limits::count(&limits::CONNECTIONS_REFUSED);
+                incoming.refuse();
+                continue;
+            }
+        }
+        let Ok(handshake) = handshakes.clone().try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
         let state = state.clone();
         tokio::spawn(async move {
-            let conn = match tokio::time::timeout(limits::TLS_HANDSHAKE_TIMEOUT, incoming).await {
+            let finished = tokio::time::timeout(limits::TLS_HANDSHAKE_TIMEOUT, incoming).await;
+            drop(handshake);
+            let conn = match finished {
                 Ok(Ok(c)) => c,
                 Ok(Err(err)) => {
                     tracing::debug!(%peer_ip, error = %err, "http/3 handshake failed");
@@ -429,6 +473,16 @@ mod tests {
         let reason = conn.closed().await;
         assert!(matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if &c.reason[..] == b"too many connections"), "{reason:?}");
         drop(held);
+    }
+
+    #[test]
+    fn handshakes_are_capped_and_unproven_addresses_retry_once_busy() {
+        assert_eq!(admit(false, 0, 2048), Admit::Accept, "quiet: no extra round trip");
+        assert_eq!(admit(false, 1023, 2048), Admit::Accept);
+        assert_eq!(admit(false, 1024, 2048), Admit::Retry, "busy: prove the address first");
+        assert_eq!(admit(true, 1024, 2048), Admit::Accept, "a proven address may proceed");
+        assert_eq!(admit(true, 2048, 2048), Admit::Refuse, "full: nobody");
+        assert_eq!(admit(false, 4000, 2048), Admit::Refuse);
     }
 
     #[test]

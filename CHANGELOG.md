@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.2] - 2026-11-22
+
+- **Security (HTTP/3): QUIC handshakes in progress are really capped now.**
+  0.9.1's cap (`max_incoming`) only counted connections waiting to be picked
+  up; once picked up, a handshake no longer counted, so they were unbounded.
+  Each listener now counts its own (at most 2048 at once, then refused), and
+  past half of that a client whose address isn't proven must prove it first
+  with a stateless QUIC Retry, so forged packets cost nothing. Test:
+  `handshakes_are_capped_and_unproven_addresses_retry_once_busy`.
+  File: `src/proxy/quic.rs`.
+
 ## [0.9.1] - 2026-11-22
 
 - **Security (HTTP/3): forged UDP can no longer use up a visitor's connection
