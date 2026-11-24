@@ -100,7 +100,7 @@ pub async fn report(state: &AppState) -> HealthReport {
         } else {
             "fail"
         },
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("APP_VERSION"),
         checks,
     }
 }

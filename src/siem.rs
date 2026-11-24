@@ -557,7 +557,7 @@ fn format_body(
             let mut out = format!(
                 "CEF:0|rust-proxy|{}|{}|{}|{}|{}|cat={}",
                 cef_header_escape(&fmt.app_name),
-                env!("CARGO_PKG_VERSION"),
+                env!("APP_VERSION"),
                 cef_header_escape(event),
                 cef_header_escape(&message),
                 sev.cef(),

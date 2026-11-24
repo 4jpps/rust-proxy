@@ -698,12 +698,12 @@ struct VersionResponse {
 }
 
 /// Unauthenticated, same reasoning as `/api/setup-status` -- the footer
-/// showing this needs to render before login too. `CARGO_PKG_VERSION` is
+/// showing this needs to render before login too. `APP_VERSION` (the date version, from Cargo.toml) is
 /// baked in at compile time from Cargo.toml, so this is always exactly
 /// the version actually running, not something that can drift.
 async fn get_version() -> Json<VersionResponse> {
     Json(VersionResponse {
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("APP_VERSION"),
     })
 }
 
@@ -3624,7 +3624,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
-        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["version"], env!("APP_VERSION"));
     }
 
     #[tokio::test]

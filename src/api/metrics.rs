@@ -146,7 +146,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let _ = writeln!(
         out,
         "rustproxy_build_info{{version=\"{}\"}} 1",
-        label_value(env!("CARGO_PKG_VERSION"))
+        label_value(env!("APP_VERSION"))
     );
 
     (

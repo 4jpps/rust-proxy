@@ -102,7 +102,7 @@ async fn start_siem(state: &AppState) {
                 crate::siem::Severity::Notice,
                 "daemon_start",
                 "rust-proxy started",
-                &[("version", env!("CARGO_PKG_VERSION"))],
+                &[("version", env!("APP_VERSION"))],
             );
         }
         Ok(()) => {}

@@ -1,5 +1,9 @@
 # Changelog
 
+## [26.11.23.1837] - 2026-11-23
+
+- Versions are now the release's date and time (YY.MM.DD.hhmm), shown in the web UI, /api/version, health and metrics. Packages use the Cargo form (26.1123.1837), which sorts above 0.9.2, so apt upgrades as usual.
+
 ## [0.9.2] - 2026-11-22
 
 - **Security (HTTP/3): QUIC handshakes in progress are really capped now.**
