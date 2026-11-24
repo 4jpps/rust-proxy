@@ -15,12 +15,14 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes};
 use http_body_util::BodyExt;
 use hyper::body::{Frame, Incoming};
-use hyper::header::{HeaderValue, ALT_SVC};
+use hyper::header::{ALT_SVC, HeaderValue};
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::task::JoinHandle;
 
-use super::{deliver, handle_https_request, limits, server_builder, should_request_client_cert, tls};
+use super::{
+    deliver, handle_https_request, limits, server_builder, should_request_client_cert, tls,
+};
 use crate::state::AppState;
 
 /// H3_NO_ERROR (RFC 9114 8.1): a normal close.
@@ -65,14 +67,22 @@ pub(super) fn server_config(state: AppState) -> Option<quinn::ServerConfig> {
     transport
         .max_concurrent_bidi_streams(100u32.into())
         .max_concurrent_uni_streams(16u32.into())
-        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().expect("30 s fits")));
+        .max_idle_timeout(Some(
+            std::time::Duration::from_secs(30)
+                .try_into()
+                .expect("30 s fits"),
+        ));
     cfg.transport_config(Arc::new(transport));
     Some(cfg)
 }
 
 /// Starts HTTP/3 on `bind_ip:bind_port` (UDP). Only for a specific address: a wildcard UDP socket
 /// would answer from whichever address the kernel picks, and production binds exact addresses.
-pub(super) fn spawn_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -> Option<JoinHandle<()>> {
+pub(super) fn spawn_listener(
+    state: AppState,
+    bind_ip: IpAddr,
+    bind_port: u16,
+) -> Option<JoinHandle<()>> {
     if bind_ip.is_unspecified() {
         return None;
     }
@@ -102,7 +112,11 @@ pub(super) fn spawn_listener(state: AppState, bind_ip: IpAddr, bind_port: u16) -
 }
 
 fn bind_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
-    let domain = if addr.is_ipv6() { socket2::Domain::IPV6 } else { socket2::Domain::IPV4 };
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
@@ -135,7 +149,12 @@ pub(super) fn admit(address_validated: bool, in_progress: usize, max: usize) -> 
     }
 }
 
-pub(super) async fn serve(state: AppState, endpoint: quinn::Endpoint, bind_ip: IpAddr, bind_port: u16) {
+pub(super) async fn serve(
+    state: AppState,
+    endpoint: quinn::Endpoint,
+    bind_ip: IpAddr,
+    bind_port: u16,
+) {
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_UNFINISHED_HANDSHAKES));
     while let Some(incoming) = endpoint.accept().await {
         let peer_ip = incoming.remote_address().ip();
@@ -145,7 +164,11 @@ pub(super) async fn serve(state: AppState, endpoint: quinn::Endpoint, bind_ip: I
             continue;
         }
         let in_progress = MAX_UNFINISHED_HANDSHAKES - handshakes.available_permits();
-        match admit(incoming.remote_address_validated(), in_progress, MAX_UNFINISHED_HANDSHAKES) {
+        match admit(
+            incoming.remote_address_validated(),
+            in_progress,
+            MAX_UNFINISHED_HANDSHAKES,
+        ) {
             Admit::Accept => {}
             Admit::Retry => {
                 if let Err(err) = incoming.retry() {
@@ -193,7 +216,8 @@ pub(super) async fn serve(state: AppState, endpoint: quinn::Endpoint, bind_ip: I
                 .handshake_data()
                 .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
                 .and_then(|d| d.server_name);
-            if should_request_client_cert(&state, bind_ip, bind_port, peer_ip, sni.as_deref()).await {
+            if should_request_client_cert(&state, bind_ip, bind_port, peer_ip, sni.as_deref()).await
+            {
                 // A client-certificate host: the browser falls back to HTTPS, which can ask for one.
                 conn.close(H3_NO_ERROR.into(), b"use HTTPS over TCP for this host");
                 return;
@@ -220,34 +244,40 @@ async fn serve_connection(
             let state = state.clone();
             let sni = sni.clone();
             async move {
-                match handle_https_request(state, bind_ip, bind_port, peer_ip, sni, None, req).await {
+                match handle_https_request(state, bind_ip, bind_port, peer_ip, sni, None, req).await
+                {
                     Ok(resp) => deliver(resp),
                     Err(never) => match never {},
                 }
             }
         });
         tokio::spawn(async move {
-            let _ = server_builder().serve_connection(TokioIo::new(far), service).await;
+            let _ = server_builder()
+                .serve_connection(TokioIo::new(far), service)
+                .await;
         });
     }
-    let sender = match hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(near)).await {
-        Ok((sender, link)) => {
-            tokio::spawn(link);
-            sender
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "http/3: internal link failed");
-            return;
-        }
-    };
+    let sender =
+        match hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(near)).await
+        {
+            Ok((sender, link)) => {
+                tokio::spawn(link);
+                sender
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "http/3: internal link failed");
+                return;
+            }
+        };
 
-    let mut h3_conn = match h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn)).await {
-        Ok(c) => c,
-        Err(err) => {
-            tracing::debug!(%peer_ip, error = %err, "http/3 connection setup failed");
-            return;
-        }
-    };
+    let mut h3_conn =
+        match h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn)).await {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::debug!(%peer_ip, error = %err, "http/3 connection setup failed");
+                return;
+            }
+        };
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
@@ -329,7 +359,13 @@ where
         Ok(r) => r,
         Err(err) => {
             tracing::debug!(error = %err, "http/3: shared service didn't answer");
-            send.send_response(Response::builder().status(502).body(()).expect("static response")).await?;
+            send.send_response(
+                Response::builder()
+                    .status(502)
+                    .body(())
+                    .expect("static response"),
+            )
+            .await?;
             send.finish().await?;
             return Ok(());
         }
@@ -370,15 +406,24 @@ mod tests {
                 tokio::spawn(async move {
                     let service = service_fn(|req: Request<Incoming>| async move {
                         let line = format!("{} {} ", req.method(), req.uri().path());
-                        let host = req.headers().get("host").map(|h| h.to_str().unwrap().to_string()).unwrap_or_default();
+                        let host = req
+                            .headers()
+                            .get("host")
+                            .map(|h| h.to_str().unwrap().to_string())
+                            .unwrap_or_default();
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         let text = format!("{line}{}", String::from_utf8_lossy(&body));
                         Ok::<_, Infallible>(
-                            Response::builder().header("x-backend", "yes").header("x-seen-host", host)
-                                .body(http_body_util::Full::new(Bytes::from(text))).unwrap(),
+                            Response::builder()
+                                .header("x-backend", "yes")
+                                .header("x-seen-host", host)
+                                .body(http_body_util::Full::new(Bytes::from(text)))
+                                .unwrap(),
                         )
                     });
-                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
                 });
             }
         });
@@ -401,7 +446,10 @@ mod tests {
         addr
     }
 
-    async fn client_conn(addr: SocketAddr, sni: &str) -> Result<quinn::Connection, quinn::ConnectionError> {
+    async fn client_conn(
+        addr: SocketAddr,
+        sni: &str,
+    ) -> Result<quinn::Connection, quinn::ConnectionError> {
         let mut tls = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(super::super::tests::AcceptAnyCert))
@@ -422,17 +470,39 @@ mod tests {
         let addr = start(state).await;
 
         let conn = client_conn(addr, "example.com").await.unwrap();
-        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
-        tokio::spawn(async move { let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await; });
-        let req = Request::builder().method("POST").uri("https://example.com/hello").body(()).unwrap();
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://example.com/hello")
+            .body(())
+            .unwrap();
         let mut stream = send.send_request(req).await.unwrap();
-        stream.send_data(Bytes::from_static(b"over quic")).await.unwrap();
+        stream
+            .send_data(Bytes::from_static(b"over quic"))
+            .await
+            .unwrap();
         stream.finish().await.unwrap();
         let resp = stream.recv_response().await.unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("x-backend").unwrap(), "yes", "came from the backend");
-        assert_eq!(resp.headers().get("x-seen-host").unwrap(), "example.com", "host passed through");
-        assert_eq!(resp.headers().get(ALT_SVC).unwrap(), "h3=\":443\"; ma=86400");
+        assert_eq!(
+            resp.headers().get("x-backend").unwrap(),
+            "yes",
+            "came from the backend"
+        );
+        assert_eq!(
+            resp.headers().get("x-seen-host").unwrap(),
+            "example.com",
+            "host passed through"
+        );
+        assert_eq!(
+            resp.headers().get(ALT_SVC).unwrap(),
+            "h3=\":443\"; ma=86400"
+        );
         let mut body = Vec::new();
         while let Some(mut chunk) = stream.recv_data().await.unwrap() {
             body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
@@ -464,23 +534,43 @@ mod tests {
         state.set_hosts(vec![host("example.com", upstream, false)]);
         // Use up every slot 127.0.0.1 has (as its HTTPS connections would).
         let mut held = Vec::new();
-        while let Some(slot) = state.conn_limiter().try_acquire("127.0.0.1".parse().unwrap()) {
+        while let Some(slot) = state
+            .conn_limiter()
+            .try_acquire("127.0.0.1".parse().unwrap())
+        {
             held.push(slot);
         }
         let addr = start(state).await;
         // The handshake still completes (nothing is charged before it), then the connection is closed.
-        let conn = client_conn(addr, "example.com").await.expect("handshake completes");
+        let conn = client_conn(addr, "example.com")
+            .await
+            .expect("handshake completes");
         let reason = conn.closed().await;
-        assert!(matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if &c.reason[..] == b"too many connections"), "{reason:?}");
+        assert!(
+            matches!(&reason, quinn::ConnectionError::ApplicationClosed(c) if &c.reason[..] == b"too many connections"),
+            "{reason:?}"
+        );
         drop(held);
     }
 
     #[test]
     fn handshakes_are_capped_and_unproven_addresses_retry_once_busy() {
-        assert_eq!(admit(false, 0, 2048), Admit::Accept, "quiet: no extra round trip");
+        assert_eq!(
+            admit(false, 0, 2048),
+            Admit::Accept,
+            "quiet: no extra round trip"
+        );
         assert_eq!(admit(false, 1023, 2048), Admit::Accept);
-        assert_eq!(admit(false, 1024, 2048), Admit::Retry, "busy: prove the address first");
-        assert_eq!(admit(true, 1024, 2048), Admit::Accept, "a proven address may proceed");
+        assert_eq!(
+            admit(false, 1024, 2048),
+            Admit::Retry,
+            "busy: prove the address first"
+        );
+        assert_eq!(
+            admit(true, 1024, 2048),
+            Admit::Accept,
+            "a proven address may proceed"
+        );
         assert_eq!(admit(true, 2048, 2048), Admit::Refuse, "full: nobody");
         assert_eq!(admit(false, 4000, 2048), Admit::Refuse);
     }
@@ -492,8 +582,13 @@ mod tests {
         assert!(r.headers().get(ALT_SVC).is_none());
         advertise(&mut r, true, 443);
         assert_eq!(r.headers().get(ALT_SVC).unwrap(), "h3=\":443\"; ma=86400");
-        r.headers_mut().insert(ALT_SVC, HeaderValue::from_static("clear"));
+        r.headers_mut()
+            .insert(ALT_SVC, HeaderValue::from_static("clear"));
         advertise(&mut r, true, 8443);
-        assert_eq!(r.headers().get(ALT_SVC).unwrap(), "clear", "a backend's own Alt-Svc is kept");
+        assert_eq!(
+            r.headers().get(ALT_SVC).unwrap(),
+            "clear",
+            "a backend's own Alt-Svc is kept"
+        );
     }
 }

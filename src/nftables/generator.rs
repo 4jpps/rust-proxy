@@ -145,7 +145,17 @@ pub fn generate_ruleset(
     dhcp_interfaces: &[String],
     blocks: &NftBlocks,
 ) -> String {
-    generate_ruleset_with_http3(hosts, port_rules, admin, expose_admin_port, rule_allow_ips, dedicated_ips, dhcp_interfaces, blocks, false)
+    generate_ruleset_with_http3(
+        hosts,
+        port_rules,
+        admin,
+        expose_admin_port,
+        rule_allow_ips,
+        dedicated_ips,
+        dhcp_interfaces,
+        blocks,
+        false,
+    )
 }
 
 /// `generate_ruleset`, also opening each HTTPS host's port for UDP when HTTP/3 (`network.http3`) is on.
@@ -492,7 +502,12 @@ fn comment_text(text: &str) -> String {
         .collect()
 }
 
-fn write_host_rules(out: &mut String, host: &ProxyHost, keep: &dyn Fn(IpAddr) -> bool, http3: bool) {
+fn write_host_rules(
+    out: &mut String,
+    host: &ProxyHost,
+    keep: &dyn Fn(IpAddr) -> bool,
+    http3: bool,
+) {
     let bind_ips: Vec<IpAddr> = host_bind_ips(host).filter(|ip| keep(*ip)).collect();
     if bind_ips.is_empty() {
         return;
@@ -1706,15 +1721,47 @@ mod tests {
         let admin = admin();
         let none = HashMap::new();
         let blocks = NftBlocks::default();
-        let off = generate_ruleset_with_http3(std::slice::from_ref(&h), &[], &admin, false, &none, &[], &[], &blocks, false);
+        let off = generate_ruleset_with_http3(
+            std::slice::from_ref(&h),
+            &[],
+            &admin,
+            false,
+            &none,
+            &[],
+            &[],
+            &blocks,
+            false,
+        );
         assert!(!off.contains("udp dport 443"), "{off}");
-        let on = generate_ruleset_with_http3(std::slice::from_ref(&h), &[], &admin, false, &none, &[], &[], &blocks, true);
-        assert!(on.contains("udp dport 443 ip daddr 10.0.0.2 accept"), "{on}");
+        let on = generate_ruleset_with_http3(
+            std::slice::from_ref(&h),
+            &[],
+            &admin,
+            false,
+            &none,
+            &[],
+            &[],
+            &blocks,
+            true,
+        );
+        assert!(
+            on.contains("udp dport 443 ip daddr 10.0.0.2 accept"),
+            "{on}"
+        );
         // A client-certificate host stays on TCP only.
         let mut cert = h;
         cert.pass_client_cert_header = true;
-        let on = generate_ruleset_with_http3(&[cert], &[], &admin, false, &none, &[], &[], &blocks, true);
+        let on = generate_ruleset_with_http3(
+            &[cert],
+            &[],
+            &admin,
+            false,
+            &none,
+            &[],
+            &[],
+            &blocks,
+            true,
+        );
         assert!(!on.contains("udp dport 443"), "{on}");
     }
-
 }

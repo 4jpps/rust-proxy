@@ -64,7 +64,13 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
     const FALLBACK_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
     loop {
-        reconcile(&state, &mut https, &mut h3, &mut redirects, &mut passthroughs);
+        reconcile(
+            &state,
+            &mut https,
+            &mut h3,
+            &mut redirects,
+            &mut passthroughs,
+        );
         tokio::select! {
             _ = state.wait_for_change() => {}
             _ = tokio::time::sleep(FALLBACK_RECONCILE_INTERVAL) => {}
@@ -87,7 +93,10 @@ fn reconcile(
     });
     // HTTP/3 beside each HTTPS listener (specific addresses only), while `network.http3` is on.
     let h3_keys: Vec<(IpAddr, u16)> = if state.network().http3 {
-        router::https_listener_keys(&hosts).into_iter().filter(|(ip, _)| !ip.is_unspecified()).collect()
+        router::https_listener_keys(&hosts)
+            .into_iter()
+            .filter(|(ip, _)| !ip.is_unspecified())
+            .collect()
     } else {
         Vec::new()
     };
